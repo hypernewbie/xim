@@ -1,0 +1,10 @@
+/* pathdef.c */
+/* This file is automatically created by the CMake build
+ * DO NOT EDIT!  Change CMakeLists.txt / VimGenerated.cmake instead. */
+#include "vim.h"
+char_u *default_vim_dir = (char_u *)"@XIM_VIMRCLOC@";
+char_u *default_vimruntime_dir = (char_u *)"@XIM_VIMRUNTIMEDIR@";
+char_u *all_cflags = (char_u *)"@XIM_ALL_CFLAGS_STRING@";
+char_u *all_lflags = (char_u *)"@XIM_ALL_LFLAGS_STRING@";
+char_u *compiled_user = (char_u *)"@XIM_COMPILEDBY@";
+char_u *compiled_sys = (char_u *)"@XIM_COMPILED_SYS@";

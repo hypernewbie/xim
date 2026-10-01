@@ -33,6 +33,7 @@ message(STATUS "Xim ${PROJECT_VERSION} — Clang ${CMAKE_C_COMPILER_VERSION}")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 include(VimCompilerFlags)
+include(VimGenerated)
 
 # Phase 1 builds only xxd. Phase 2 replaces this stub with the full vim
 # target. Phase 4 adds CTest integration.

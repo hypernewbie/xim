@@ -9,43 +9,26 @@
 # add_custom_command() rules so a clean checkout still builds.
 
 # ----------------------------------------------------------------------------
-# Auto-generated inputs (copied into the build tree at configure time).
+# Auto-generated inputs.
 # ----------------------------------------------------------------------------
-# Phase 2 treats these as pre-existing. Phase 3 will generate them in-tree.
-# Each output goes under ${CMAKE_BINARY_DIR}/auto/ so the build tree is
-# self-contained.
+# Phase 2 copied these from src/auto/. Phase 3 generates them in-tree from
+# their inputs: cmake/pathdef.c.in, src/osdef.sh + osdef1.h.in + osdef2.h.in,
+# and the vendored Wayland protocol XMLs.
 set(XIM_AUTO_DIR ${CMAKE_BINARY_DIR}/auto)
 file(MAKE_DIRECTORY ${XIM_AUTO_DIR})
 file(MAKE_DIRECTORY ${XIM_AUTO_DIR}/wayland)
 
+# config.h is committed in the source tree in Phase 2 (a side-effect of
+# the reference build's `make config` step having run before). Phase 6
+# will replace this with a CMake-generated config.h.
 configure_file(
     ${CMAKE_SOURCE_DIR}/src/auto/config.h
     ${XIM_AUTO_DIR}/config.h
     COPYONLY)
-configure_file(
-    ${CMAKE_SOURCE_DIR}/src/auto/osdef.h
-    ${XIM_AUTO_DIR}/osdef.h
-    COPYONLY)
-configure_file(
-    ${CMAKE_SOURCE_DIR}/src/auto/pathdef.c
-    ${XIM_AUTO_DIR}/pathdef.c
-    COPYONLY)
-configure_file(
-    ${CMAKE_SOURCE_DIR}/src/auto/wayland/ext-data-control-v1.c
-    ${XIM_AUTO_DIR}/wayland/ext-data-control-v1.c
-    COPYONLY)
-configure_file(
-    ${CMAKE_SOURCE_DIR}/src/auto/wayland/ext-data-control-v1.h
-    ${XIM_AUTO_DIR}/wayland/ext-data-control-v1.h
-    COPYONLY)
-configure_file(
-    ${CMAKE_SOURCE_DIR}/src/auto/wayland/wlr-data-control-unstable-v1.c
-    ${XIM_AUTO_DIR}/wayland/wlr-data-control-unstable-v1.c
-    COPYONLY)
-configure_file(
-    ${CMAKE_SOURCE_DIR}/src/auto/wayland/wlr-data-control-unstable-v1.h
-    ${XIM_AUTO_DIR}/wayland/wlr-data-control-unstable-v1.h
-    COPYONLY)
+
+vim_generate_pathdef(${XIM_AUTO_DIR})
+vim_generate_osdef(${XIM_AUTO_DIR} ${CMAKE_SOURCE_DIR}/src)
+vim_generate_wayland(${XIM_AUTO_DIR}/wayland ${CMAKE_SOURCE_DIR}/src/auto/wayland)
 
 # ----------------------------------------------------------------------------
 # Source lists.
@@ -232,6 +215,11 @@ add_executable(vim
     ${VIM_LIBVTERM_SRC}
     ${VIM_WAYLAND_GEN_SRC}
     ${VIM_AUTO_SRC})
+
+# osdef.h is generated but not a compile input — it provides system header
+# declarations the rest of vim #includes via vim.h. Force its generation
+# before vim compiles.
+add_dependencies(vim generate_xim_osdef generate_xim_wayland)
 
 # libvterm needs a few macros redefined so its internal names don't collide
 # with the global ones vim provides. The Makefile does this in CCCTERM at

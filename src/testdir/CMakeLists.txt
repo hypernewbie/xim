@@ -3,12 +3,13 @@
 # suite takes several minutes.
 #
 # Layout:
-#   vim_smoke:      runs test_normal.vim — fast single-file sanity check
-#   vim_scripts:    runs every test_*.vim via cmake/run_vim_tests.sh --all
+#   vim_smoke:      runs test_assert.vim — fast single-file sanity check
+#   vim_scripts_*:  run NEW_TESTS_RES from Make_all.mak in bounded batches
 #
-# Each test gets its own working directory under the build's Testing/
-# directory so per-test files (test.out, test.ok, X*, viminfo) don't race
-# across runs. xvfb-run is used because some tests assume an X server.
+# The driver copies src/testdir into a private build-tree working directory
+# before running. This keeps generated test artifacts out of the source tree
+# and prevents concurrent CTest/Makefile runs from racing. xvfb-run is used
+# because some tests assume an X server.
 
 find_program(XVFB_RUN xvfb-run)
 if(NOT XVFB_RUN)
@@ -25,23 +26,33 @@ add_test(
     COMMAND
         ${CMAKE_SOURCE_DIR}/cmake/run_vim_tests.sh
         $<TARGET_FILE:vim>
-        ${CMAKE_SOURCE_DIR}/../runtime
+        ${CMAKE_SOURCE_DIR}/runtime
         ${CMAKE_CURRENT_SOURCE_DIR}
-        test_normal
+        test_assert
+        ${CMAKE_BINARY_DIR}/Testing
+        $<TARGET_FILE:xxd>
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Testing)
-set_tests_properties(vim_smoke PROPERTIES LABELS "vim_script")
+set_tests_properties(vim_smoke PROPERTIES LABELS "vim_script" TIMEOUT 120)
 
 # ----------------------------------------------------------------------------
-# Full script suite — slow (~5-10 min). Drives runtest.vim against every
-# test_*.vim file in this directory under xvfb-run. Requires BUILD_FULL_TEST=ON.
+# Full script suite — run the inherited NEW_TESTS_RES list in bounded
+# alphabetic batches. Each batch has a 6-minute timeout. Requires
+# BUILD_FULL_TEST=ON.
 # ----------------------------------------------------------------------------
-add_test(
-    NAME vim_scripts
-    COMMAND
-        ${CMAKE_SOURCE_DIR}/cmake/run_vim_tests.sh
-        $<TARGET_FILE:vim>
-        ${CMAKE_SOURCE_DIR}/../runtime
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        --all
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Testing)
-set_tests_properties(vim_scripts PROPERTIES LABELS "vim_script" TIMEOUT 1800)
+foreach(test_range IN ITEMS a-c d-h i-m n-s t-z)
+    string(REPLACE "-" "_" range_id "${test_range}")
+    add_test(
+        NAME vim_scripts_${range_id}
+        COMMAND
+            ${CMAKE_SOURCE_DIR}/cmake/run_vim_tests.sh
+            $<TARGET_FILE:vim>
+            ${CMAKE_SOURCE_DIR}/runtime
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            --range=${test_range}
+            ${CMAKE_BINARY_DIR}/Testing
+            $<TARGET_FILE:xxd>
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Testing)
+    set_tests_properties(vim_scripts_${range_id} PROPERTIES
+        LABELS "vim_script"
+        TIMEOUT 360)
+endforeach()

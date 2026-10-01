@@ -1,16 +1,10 @@
 # Top-level CMake project for Xim.
 #
-# This file establishes the modern build foundation for Xim, replacing the
-# inherited autotools/Makefile build described in temp/XIM_PLAN0.md.
+# This file establishes the out-of-tree Clang/Ninja build foundation for Xim.
 #
-# Plan 0 Step 1 Phase 1 (this phase):
-#   - Clang-enforced out-of-tree Ninja build
-#   - Builds the `xxd` subproject only
-#   - Generates compile_commands.json
-#
-# Subsequent phases (see the plan file) will add the `vim` target, generated
-# file handling, CTest integration, feature configuration, and finally replace
-# the autoconf-generated `auto/config.h`.
+# Plan 0 Step 1: build the inherited editor out of tree with Clang and Ninja.
+# VimFeatures.cmake and VimConfigChecks.cmake select the feature level and
+# optional dependencies while retaining the default reference configuration.
 
 cmake_minimum_required(VERSION 3.25)
 
@@ -38,7 +32,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 include(VimCompilerFlags)
 include(VimGenerated)
+include(VimConfigChecks)
+include(VimFeatures)
 
-# Phase 1 builds only xxd. Phase 2 replaces this stub with the full vim
-# target. Phase 4 adds CTest integration.
 add_subdirectory(src)

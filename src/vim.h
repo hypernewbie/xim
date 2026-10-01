@@ -26,6 +26,8 @@
 #ifdef HAVE_CONFIG_H	// GNU autoconf (or something else) was here
 # ifdef VMS
 #  include "config.h"   /* Rely on /INCLUDE to find it. */
+# elif defined(XIM_CMAKE_CONFIG)
+#  include "config.h"
 # else
 #  include "auto/config.h"
 # endif /* def VMS [else] */

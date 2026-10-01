@@ -15,13 +15,17 @@ enable_testing()
 project(xim
     VERSION 9.2.0
     DESCRIPTION "Xim — terminal editor forked from Vim"
-    LANGUAGES C)
+    LANGUAGES C CXX)
 
 # AGENTS.md mandates Clang. Refuse any other compiler at configure time so
 # the policy cannot be bypassed by an IDE or environment variable.
 if(NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
     message(FATAL_ERROR
         "Xim requires Clang. Detected: ${CMAKE_C_COMPILER_ID} (${CMAKE_C_COMPILER}).")
+endif()
+if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    message(FATAL_ERROR
+        "Xim requires Clang for C++. Detected: ${CMAKE_CXX_COMPILER_ID} (${CMAKE_CXX_COMPILER}).")
 endif()
 
 message(STATUS "Xim ${PROJECT_VERSION} — Clang ${CMAKE_C_COMPILER_VERSION}")
@@ -32,6 +36,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 include(VimCompilerFlags)
 include(VimGenerated)
+include(VimCpp)
 include(VimConfigChecks)
 include(VimFeatures)
 

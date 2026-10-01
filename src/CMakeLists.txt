@@ -413,6 +413,16 @@ target_link_libraries(message_test PRIVATE vim_core)
 add_test(NAME vim_unit_message COMMAND message_test)
 set_tests_properties(vim_unit_message PROPERTIES LABELS "vim_unit")
 
+# Mixed-language smoke test: a C function calls into C++, then the C++ main
+# calls back into C. The .c source remains compiled as C.
+add_executable(vim_cxx_link_smoke
+    testdir/cxx_link_smoke.c
+    testdir/cxx_link_smoke.cpp)
+xim_apply_default_flags(vim_cxx_link_smoke)
+xim_apply_cxx_settings(vim_cxx_link_smoke)
+add_test(NAME vim_cxx_link_smoke COMMAND vim_cxx_link_smoke)
+set_tests_properties(vim_cxx_link_smoke PROPERTIES LABELS "vim_build")
+
 add_subdirectory(xxd)
 
 option(BUILD_FULL_TEST "Run the full src/testdir/ script suite (slow)" OFF)

@@ -1,26 +1,22 @@
 # src/CMakeLists.txt — top of the Xim source tree.
 #
-# Phase 2 (this file): the main `vim` target. Mirrors the reference build
-# at src/Makefile: lines 1504-1838, with FEAT_HUGE hardcoded and the
-# auto-generated artifacts read as pre-existing inputs that we copy into
-# the build tree at configure time.
-#
-# Phase 3 will replace the configure_file(... COPYONLY) calls with
-# add_custom_command() rules so a clean checkout still builds.
+# Phase 4 (this file): add unit-test executables to CTest, and add a
+# `vim_scripts` test entry that drives the full src/testdir/ suite under
+# xvfb-run. The main `vim` target and generated-file wiring from Phases
+# 2-3 stay intact.
 
 # ----------------------------------------------------------------------------
 # Auto-generated inputs.
 # ----------------------------------------------------------------------------
-# Phase 2 copied these from src/auto/. Phase 3 generates them in-tree from
-# their inputs: cmake/pathdef.c.in, src/osdef.sh + osdef1.h.in + osdef2.h.in,
-# and the vendored Wayland protocol XMLs.
+# Phase 3 generates them in-tree from cmake/pathdef.c.in, src/osdef.sh, and
+# the vendored Wayland protocol XMLs.
 set(XIM_AUTO_DIR ${CMAKE_BINARY_DIR}/auto)
 file(MAKE_DIRECTORY ${XIM_AUTO_DIR})
 file(MAKE_DIRECTORY ${XIM_AUTO_DIR}/wayland)
 
 # config.h is committed in the source tree in Phase 2 (a side-effect of
 # the reference build's `make config` step having run before). Phase 6
-# will replace this with a CMake-generated config.h.
+# will replace it with a CMake-generated config.h.
 configure_file(
     ${CMAKE_SOURCE_DIR}/src/auto/config.h
     ${XIM_AUTO_DIR}/config.h
@@ -40,6 +36,11 @@ vim_generate_wayland(${XIM_AUTO_DIR}/wayland ${CMAKE_SOURCE_DIR}/src/auto/waylan
 # Main vim sources — alphabetical. The Makefile order in BASIC_SRC is
 # essentially alphabetical, with version.c kept near the end. We keep that
 # convention here for diff-ability with the Makefile source lists.
+#
+# Note: `main.c`, `charset.c`, `json.c`, `memfile.c`, and `message.c` are
+# excluded from this list. They form OBJ_MAIN in the Makefile. `main.c`
+# is added to the `vim` executable only; the other four are added to
+# vim_core so the unit tests can reuse them.
 set(VIM_BASIC_SRC
     alloc.c
     arabic.c
@@ -52,7 +53,6 @@ set(VIM_BASIC_SRC
     bufwrite.c
     change.c
     channel.c
-    charset.c
     cindent.c
     clientserver.c
     clipboard.c
@@ -100,20 +100,16 @@ set(VIM_BASIC_SRC
     indent.c
     insexpand.c
     job.c
-    json.c
     linematch.c
     list.c
     locale.c
     logfile.c
-    main.c
     map.c
     mark.c
     match.c
     mbyte.c
-    memfile.c
     memline.c
     menu.c
-    message.c
     misc1.c
     misc2.c
     mouse.c
@@ -173,6 +169,20 @@ set(VIM_BASIC_SRC
     wayland.c
     window.c)
 
+# OBJ_MAIN — the four .c files (plus main.c) that are added to each
+# executable that needs them. They are NOT in vim_core: each unit test
+# driver redefines some of the functions in its namesake file, so adding
+# both would cause duplicate symbol errors at link time.
+#
+# The Makefile defines these in OBJ_MAIN (lines 1833-1838 of src/Makefile)
+# and includes 4 of the 5 in each test's object list, omitting the .o whose
+# name matches the test driver.
+set(VIM_OBJ_MAIN_SRC
+    charset.c
+    json.c
+    memfile.c
+    message.c)
+
 # xdiff — vendored under src/xdiff/. Compiled into vim directly, no library.
 # Phase 2 hardcodes FEAT_XDIFF; Phase 5 will gate it.
 set(VIM_XDIFF_SRC
@@ -197,7 +207,6 @@ set(VIM_LIBVTERM_SRC
     libvterm/src/vterm.c)
 
 # Wayland protocol stubs — generated from XML by wayland-scanner in Phase 3.
-# For now, copied as-is from src/auto/wayland/.
 set(VIM_WAYLAND_GEN_SRC
     ${XIM_AUTO_DIR}/wayland/ext-data-control-v1.c
     ${XIM_AUTO_DIR}/wayland/wlr-data-control-unstable-v1.c)
@@ -207,20 +216,8 @@ set(VIM_WAYLAND_GEN_SRC
 set(VIM_AUTO_SRC ${XIM_AUTO_DIR}/pathdef.c)
 
 # ----------------------------------------------------------------------------
-# Build the vim executable.
+# Shared per-source compile options.
 # ----------------------------------------------------------------------------
-add_executable(vim
-    ${VIM_BASIC_SRC}
-    ${VIM_XDIFF_SRC}
-    ${VIM_LIBVTERM_SRC}
-    ${VIM_WAYLAND_GEN_SRC}
-    ${VIM_AUTO_SRC})
-
-# osdef.h is generated but not a compile input — it provides system header
-# declarations the rest of vim #includes via vim.h. Force its generation
-# before vim compiles.
-add_dependencies(vim generate_xim_osdef generate_xim_wayland)
-
 # libvterm needs a few macros redefined so its internal names don't collide
 # with the global ones vim provides. The Makefile does this in CCCTERM at
 # lines 3779-3783.
@@ -235,7 +232,19 @@ set_source_files_properties(${VIM_XDIFF_SRC}
         COMPILE_OPTIONS
             "-DXINCLUDE=")
 
-target_include_directories(vim PRIVATE
+# ----------------------------------------------------------------------------
+# vim_core OBJECT library — every C object file that participates in either
+# the main `vim` executable or one of the unit tests. Linking both against
+# this avoids recompiling the bulk of the source per unit test.
+# ----------------------------------------------------------------------------
+add_library(vim_core OBJECT
+    ${VIM_BASIC_SRC}
+    ${VIM_XDIFF_SRC}
+    ${VIM_LIBVTERM_SRC}
+    ${VIM_WAYLAND_GEN_SRC}
+    ${VIM_AUTO_SRC})
+
+target_include_directories(vim_core PUBLIC
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/proto
     ${XIM_AUTO_DIR}
@@ -243,14 +252,20 @@ target_include_directories(vim PRIVATE
     ${CMAKE_SOURCE_DIR}/src/libvterm/include
     /usr/include/pixman-1)
 
-target_compile_definitions(vim PRIVATE
+target_compile_definitions(vim_core PUBLIC
     HAVE_CONFIG_H
     FEAT_HUGE)
 
-# Reference link line was:
-#   clang -L/usr/local/lib -Wl,--as-needed -o vim <objects>
-#     -lSM -lICE -lXpm -lXt -lX11 -lwayland-client -lpixman-1 -lXdmcp
-#     -lSM -lICE -lm -ltinfo -lnsl -lselinux
+# osdef.h is generated but not a compile input — it provides system header
+# declarations the rest of vim #includes via vim.h. Force its generation
+# before vim_core compiles.
+add_dependencies(vim_core generate_xim_osdef generate_xim_wayland)
+
+# ----------------------------------------------------------------------------
+# Main `vim` executable.
+# ----------------------------------------------------------------------------
+add_executable(vim main.c ${VIM_OBJ_MAIN_SRC})
+target_link_libraries(vim PRIVATE vim_core)
 target_link_libraries(vim PRIVATE
     SM
     ICE
@@ -264,13 +279,54 @@ target_link_libraries(vim PRIVATE
     tinfo
     nsl
     selinux)
-
 xim_apply_default_flags(vim)
 
-# Install alongside the binary. The full runtime install (runtime/ tree,
-# man pages, lang) comes in a later phase — Phase 6 installs vim here as a
-# sanity check.
 include(GNUInstallDirs)
 install(TARGETS vim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+# ----------------------------------------------------------------------------
+# C unit tests — small executables that link vim_core plus a driver .c
+# and 3 of the 4 OBJ_MAIN files (omitting the one whose name matches the
+# driver, since the driver redefines some of those functions).
+#
+# Makefile reference (src/Makefile lines 1842-1873):
+#   json_test:    charset.o, memfile.o, message.o + json_test.o
+#   kword_test:   json.o,    memfile.o, message.o + kword_test.o
+#   memfile_test: charset.o, json.o,    message.o + memfile_test.o
+#   message_test: charset.o, json.o,    memfile.o + message_test.o
+# ----------------------------------------------------------------------------
+
+add_executable(json_test json_test.c charset.c memfile.c message.c)
+target_link_libraries(json_test PRIVATE vim_core)
+target_link_libraries(json_test PRIVATE
+    SM ICE Xpm Xt X11 wayland-client pixman-1 Xdmcp m tinfo nsl selinux)
+add_test(NAME vim_unit_json COMMAND json_test)
+set_tests_properties(vim_unit_json PROPERTIES LABELS "vim_unit")
+
+add_executable(kword_test kword_test.c json.c memfile.c message.c)
+target_link_libraries(kword_test PRIVATE vim_core)
+target_link_libraries(kword_test PRIVATE
+    SM ICE Xpm Xt X11 wayland-client pixman-1 Xdmcp m tinfo nsl selinux)
+add_test(NAME vim_unit_kword COMMAND kword_test)
+set_tests_properties(vim_unit_kword PROPERTIES LABELS "vim_unit")
+
+add_executable(memfile_test memfile_test.c charset.c json.c message.c)
+target_link_libraries(memfile_test PRIVATE vim_core)
+target_link_libraries(memfile_test PRIVATE
+    SM ICE Xpm Xt X11 wayland-client pixman-1 Xdmcp m tinfo nsl selinux)
+add_test(NAME vim_unit_memfile COMMAND memfile_test)
+set_tests_properties(vim_unit_memfile PROPERTIES LABELS "vim_unit")
+
+add_executable(message_test message_test.c charset.c json.c memfile.c)
+target_link_libraries(message_test PRIVATE vim_core)
+target_link_libraries(message_test PRIVATE
+    SM ICE Xpm Xt X11 wayland-client pixman-1 Xdmcp m tinfo nsl selinux)
+add_test(NAME vim_unit_message COMMAND message_test)
+set_tests_properties(vim_unit_message PROPERTIES LABELS "vim_unit")
+
 add_subdirectory(xxd)
+
+option(BUILD_FULL_TEST "Run the full src/testdir/ script suite (slow)" OFF)
+if(BUILD_FULL_TEST)
+    add_subdirectory(testdir)
+endif()

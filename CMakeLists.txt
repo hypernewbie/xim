@@ -14,6 +14,10 @@
 
 cmake_minimum_required(VERSION 3.25)
 
+# Enable CTest. Without this, add_test() calls in src/CMakeLists.txt are
+# ignored and no CTestTestfile.cmake is generated.
+enable_testing()
+
 project(xim
     VERSION 9.2.0
     DESCRIPTION "Xim — terminal editor forked from Vim"

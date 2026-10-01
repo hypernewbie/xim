@@ -4,6 +4,7 @@
 # Usage:
 #   run_vim_tests.sh <vim_binary> <runtime_dir> <testdir_dir> <test_name> <work_root> [xxd_binary]
 #   run_vim_tests.sh <vim_binary> <runtime_dir> <testdir_dir> --all <work_root> [xxd_binary]
+#   run_vim_tests.sh <vim_binary> <runtime_dir> <testdir_dir> --tiny <work_root> [xxd_binary]
 #   run_vim_tests.sh <vim_binary> <runtime_dir> <testdir_dir> --range=a-c <work_root> [xxd_binary]
 #   run_vim_tests.sh <vim_binary> <runtime_dir> <testdir_dir> --range=t <work_root> [xxd_binary]
 #   run_vim_tests.sh <vim_binary> <runtime_dir> <testdir_dir> --range=u-z <work_root> [xxd_binary]
@@ -33,6 +34,7 @@ fi
 
 case "$MODE" in
     --all) WORK_NAME=all ;;
+    --tiny) WORK_NAME=tiny ;;
     --range=a-c) WORK_NAME=range_a_c ;;
     --range=d-h) WORK_NAME=range_d_h ;;
     --range=i-m) WORK_NAME=range_i_m ;;
@@ -72,12 +74,14 @@ cd "$WORKDIR"
 
 set --
 case "$MODE" in
-    --all|--range=*)
+    --all|--tiny|--range=*)
     test_vim9_list=
+    tiny_tests=
     script_tests=
     list_section=
     while IFS= read -r list_line; do
         case "$list_line" in
+            "SCRIPTS_TINY_OUT ="*) list_section=tiny; continue ;;
             "TEST_VIM9_RES ="*) list_section=vim9; continue ;;
             "NEW_TESTS_RES ="*) list_section=new; continue ;;
         esac
@@ -92,29 +96,46 @@ case "$MODE" in
                 continue
                 ;;
         esac
-        list_item=$(printf '%s\n' "$list_line" | sed -n 's/^[[:space:]]*\(test_[[:alnum:]_]*\)\.res.*/\1/p')
-        [ -n "$list_item" ] || continue
         case "$list_section" in
-            vim9) test_vim9_list="$test_vim9_list $list_item" ;;
-            new) script_tests="$script_tests $list_item" ;;
+            tiny)
+                list_item=$(printf '%s\n' "$list_line" | sed -n 's/^[[:space:]]*\(test[[:alnum:]_]*\)\.out.*/\1/p')
+                [ -n "$list_item" ] && tiny_tests="$tiny_tests $list_item"
+                ;;
+            vim9|new)
+                list_item=$(printf '%s\n' "$list_line" | sed -n 's/^[[:space:]]*\(test_[[:alnum:]_]*\)\.res.*/\1/p')
+                [ -n "$list_item" ] || continue
+                if [ "$list_section" = vim9 ]; then
+                    test_vim9_list="$test_vim9_list $list_item"
+                else
+                    script_tests="$script_tests $list_item"
+                fi
+                ;;
         esac
     done < "$TESTDIR/Make_all.mak"
 
     total=0
-    for test in $script_tests; do
-        case "$MODE:$test" in
-            --all:*) ;;
-            --range=a-c:test_[a-c]*) ;;
-            --range=d-h:test_[d-h]*) ;;
-            --range=i-m:test_[i-m]*) ;;
-            --range=n-s:test_[n-s]*) ;;
-            --range=t:test_t*) ;;
-            --range=u-z:test_[u-z]*) ;;
-            *) continue ;;
-        esac
-        total=$((total + 1))
-        set -- "$@" "$test.res"
-    done
+    if [ "$MODE" = --tiny ] || [ "$MODE" = --all ]; then
+        for test in $tiny_tests; do
+            total=$((total + 1))
+            set -- "$@" "$test.out"
+        done
+    fi
+    if [ "$MODE" != --tiny ]; then
+        for test in $script_tests; do
+            case "$MODE:$test" in
+                --all:*) ;;
+                --range=a-c:test_[a-c]*) ;;
+                --range=d-h:test_[d-h]*) ;;
+                --range=i-m:test_[i-m]*) ;;
+                --range=n-s:test_[n-s]*) ;;
+                --range=t:test_t*) ;;
+                --range=u-z:test_[u-z]*) ;;
+                *) continue ;;
+            esac
+            total=$((total + 1))
+            set -- "$@" "$test.res"
+        done
+    fi
     ;;
     *)
     total=1

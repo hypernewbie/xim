@@ -23,9 +23,15 @@ cmake --build --preset default --parallel
 ctest --preset default
 ```
 
-CTest runs the suite from a private build-tree copy. The inherited script list
-is split into alphabetic batches, each with a six-minute timeout. Tests use
-the CMake-built Vim, its matching runtime, and the CMake-built `xxd`.
+CTest runs the suite from a private build-tree copy. It includes the eleven
+legacy input/output tests and all 274 `NEW_TESTS_RES` targets, including the
+Vim9 tests. The new-style tests are split into alphabetic batches, each with a
+six-minute timeout. Tests use the CMake-built Vim, its matching runtime, and
+the CMake-built `xxd`.
+
+When GNU libtool is installed, CTest also runs libvterm's inherited test
+harness from a private build-tree copy. This matches the reference build's
+conditional libvterm test target.
 
 The `debug`, `release`, `asan`, and `tsan` configure/build presets are also
 available. For example:

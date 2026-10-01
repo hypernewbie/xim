@@ -413,6 +413,32 @@ target_link_libraries(message_test PRIVATE vim_core)
 add_test(NAME vim_unit_message COMMAND message_test)
 set_tests_properties(vim_unit_message PROPERTIES LABELS "vim_unit")
 
+# The vendored libvterm suite uses its Makefile/libtool harness. Run it from a
+# private build-tree copy when libtool is available, matching the reference
+# build's conditional TERM_TEST.
+if(APPLE)
+    find_program(XIM_LIBTOOL_EXECUTABLE NAMES glibtool)
+else()
+    find_program(XIM_LIBTOOL_EXECUTABLE NAMES libtool)
+endif()
+if(XIM_LIBTOOL_EXECUTABLE)
+    add_test(
+        NAME vim_unit_libvterm
+        COMMAND
+            ${CMAKE_SOURCE_DIR}/cmake/run_libvterm_tests.sh
+            ${CMAKE_SOURCE_DIR}/src/libvterm
+            ${CMAKE_BINARY_DIR}/Testing/libvterm
+            ${CMAKE_C_COMPILER}
+            ${XIM_LIBTOOL_EXECUTABLE}
+            "${CMAKE_C_FLAGS}"
+            "${CMAKE_EXE_LINKER_FLAGS}")
+    set_tests_properties(vim_unit_libvterm PROPERTIES
+        LABELS "vim_unit"
+        TIMEOUT 210)
+else()
+    message(STATUS "Skipping libvterm unit tests: libtool was not found")
+endif()
+
 # Mixed-language smoke test: a C function calls into C++, then the C++ main
 # calls back into C. The .c source remains compiled as C.
 add_executable(vim_cxx_link_smoke

@@ -4,7 +4,8 @@
 #
 # Layout:
 #   vim_smoke:      runs test_assert.vim — fast single-file sanity check
-#   vim_scripts_*:  run NEW_TESTS_RES from Make_all.mak in bounded batches
+#   vim_scripts_tiny: run legacy SCRIPTS_TINY_OUT targets
+#   vim_scripts_*:    run NEW_TESTS_RES from Make_all.mak in bounded batches
 #
 # The driver copies src/testdir into a private build-tree working directory
 # before running. This keeps generated test artifacts out of the source tree
@@ -33,6 +34,22 @@ add_test(
         $<TARGET_FILE:xxd>
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Testing)
 set_tests_properties(vim_smoke PROPERTIES LABELS "vim_script" TIMEOUT 120)
+
+# Legacy input/output test scripts are part of the inherited nongui target.
+add_test(
+    NAME vim_scripts_tiny
+    COMMAND
+        ${CMAKE_SOURCE_DIR}/cmake/run_vim_tests.sh
+        $<TARGET_FILE:vim>
+        ${CMAKE_SOURCE_DIR}/runtime
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        --tiny
+        ${CMAKE_BINARY_DIR}/Testing
+        $<TARGET_FILE:xxd>
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Testing)
+set_tests_properties(vim_scripts_tiny PROPERTIES
+    LABELS "vim_script"
+    TIMEOUT 120)
 
 # ----------------------------------------------------------------------------
 # Full script suite — run the inherited NEW_TESTS_RES list in bounded

@@ -5,6 +5,8 @@
 #   run_vim_tests.sh <vim_binary> <runtime_dir> <testdir_dir> <test_name> <work_root> [xxd_binary]
 #   run_vim_tests.sh <vim_binary> <runtime_dir> <testdir_dir> --all <work_root> [xxd_binary]
 #   run_vim_tests.sh <vim_binary> <runtime_dir> <testdir_dir> --range=a-c <work_root> [xxd_binary]
+#   run_vim_tests.sh <vim_binary> <runtime_dir> <testdir_dir> --range=t <work_root> [xxd_binary]
+#   run_vim_tests.sh <vim_binary> <runtime_dir> <testdir_dir> --range=u-z <work_root> [xxd_binary]
 #
 # The Makefile-driven test runner uses testdir as its working directory
 # because test_*.vim files and their helpers (util/setup.vim) reference
@@ -35,7 +37,8 @@ case "$MODE" in
     --range=d-h) WORK_NAME=range_d_h ;;
     --range=i-m) WORK_NAME=range_i_m ;;
     --range=n-s) WORK_NAME=range_n_s ;;
-    --range=t-z) WORK_NAME=range_t_z ;;
+    --range=t) WORK_NAME=range_t ;;
+    --range=u-z) WORK_NAME=range_u_z ;;
     ''|*[!A-Za-z0-9_]*)
         echo "invalid test name: $MODE" >&2
         exit 2
@@ -105,7 +108,8 @@ case "$MODE" in
             --range=d-h:test_[d-h]*) ;;
             --range=i-m:test_[i-m]*) ;;
             --range=n-s:test_[n-s]*) ;;
-            --range=t-z:test_[t-z]*) ;;
+            --range=t:test_t*) ;;
+            --range=u-z:test_[u-z]*) ;;
             *) continue ;;
         esac
         total=$((total + 1))

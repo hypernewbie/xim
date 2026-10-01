@@ -39,7 +39,7 @@ set_tests_properties(vim_smoke PROPERTIES LABELS "vim_script" TIMEOUT 120)
 # alphabetic batches. Each batch has a 6-minute timeout. Requires
 # BUILD_FULL_TEST=ON.
 # ----------------------------------------------------------------------------
-foreach(test_range IN ITEMS a-c d-h i-m n-s t-z)
+foreach(test_range IN ITEMS a-c d-h i-m n-s t u-z)
     string(REPLACE "-" "_" range_id "${test_range}")
     add_test(
         NAME vim_scripts_${range_id}

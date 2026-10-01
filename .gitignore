@@ -111,7 +111,18 @@ src/README.txt
 # other files possibly created by tools
 src/cscope.out
 
+# Local design notes and scratch files
+/temp/
+
 # Linter/language server files
 /.cache/clangd/
 /.ccls-cache/
 /compile_commands.json
+
+# CMake build directories and artifacts
+# Anything Ninja or CMake emits lives under build/<preset>/ by default.
+build/
+build-*/
+
+# User-local presets override the committed CMakePresets.json.
+CMakeUserPresets.json

@@ -19,7 +19,7 @@ func s:StartXim(theme = 'default', readonly = 0)
 endfunc
 
 func s:StopXim(buf)
-  call term_sendkeys(a:buf, "\<C-P>Ex command\<CR>")
+  call term_sendkeys(a:buf, "\<F1>Ex command\<CR>")
   call WaitForAssert({-> assert_match('Ex:', term_getline(a:buf, 10))})
   call term_sendkeys(a:buf, "qall!\<CR>")
   call WaitForAssert({-> assert_equal('finished', term_getstatus(a:buf))})
@@ -63,7 +63,7 @@ func Test_xim_native_screens()
   call s:Dump(buf, 'Test_xim_find')
   call term_sendkeys(buf, "\<Esc>")
   call TermWait(buf, 50)
-  call term_sendkeys(buf, "\<C-P>Save")
+  call term_sendkeys(buf, "\<F1>Save")
   call WaitForAssert({-> assert_match('Command: Save', term_getline(buf, 10))})
   call s:Dump(buf, 'Test_xim_palette')
   call term_sendkeys(buf, "\<Esc>")
@@ -79,7 +79,7 @@ endfunc
 func Test_xim_native_theme_screens()
   for theme in ['desert', 'catppuccin']
     let buf = s:StartXim(theme)
-    call term_sendkeys(buf, "\<C-P>Save")
+    call term_sendkeys(buf, "\<F1>Save")
     call WaitForAssert({-> assert_match('Command: Save', term_getline(buf, 10))})
     call s:Dump(buf, 'Test_xim_theme_' .. theme)
     call term_sendkeys(buf, "\<Esc>")
@@ -90,7 +90,7 @@ endfunc
 
 func Test_xim_palette_scroll()
   let buf = s:StartXim()
-  call term_sendkeys(buf, "\<C-P>" .. repeat("\<Down>", 14))
+  call term_sendkeys(buf, "\<F1>" .. repeat("\<Down>", 14))
   call WaitForAssert({-> assert_match('> Ex command', term_getline(buf, 8))}, 1000)
   call s:Dump(buf, 'Test_xim_palette_scroll')
   call term_sendkeys(buf, "\<Esc>")
@@ -114,6 +114,37 @@ func Test_xim_failed_unnamed_save()
   call term_sendkeys(buf, 'd')
   call WaitForAssert({-> assert_equal('finished', term_getstatus(buf))})
   execute buf .. 'bwipe!'
+endfunc
+
+func s:Screen(buf)
+  return join(map(range(1, 10), {-> term_getline(a:buf, v:val)}), "\n")
+endfunc
+
+func Test_xim_project_pickers()
+  call mkdir('Xximproj/src', 'p')
+  call writefile(['alpha', ''], 'Xximproj/src/alpha.cpp')
+  call writefile(['beta', ''], 'Xximproj/beta.cpp')
+  let command = [$XIM_BINARY, '-n', '-X', '--cmd', 'set t_u7= t_RB= t_RF= t_RV= t_RK=',
+        \ '-c', 'set background=light', '-c', 'colorscheme default', 'Xximproj']
+  let buf = RunVimInTerminal('', #{cmd: command, rows: 10, cols: 75, wait_for_ruler: 0})
+  call WaitForAssert({-> assert_match('Xim', term_getline(buf, 9))})
+  " Quick open lists project-relative paths once the background index lands.
+  call term_sendkeys(buf, "\<C-P>")
+  call WaitForAssert({-> assert_match('Files:', s:Screen(buf))})
+  call WaitForAssert({-> assert_match('src/alpha\.cpp', s:Screen(buf))})
+  call s:Dump(buf, 'Test_xim_quick_open')
+  call term_sendkeys(buf, "\<Esc>")
+  " The explorer expands a directory lazily.
+  call term_sendkeys(buf, "\<C-E>")
+  call WaitForAssert({-> assert_match('Explorer:', s:Screen(buf))})
+  call WaitForAssert({-> assert_match('+ src/', s:Screen(buf))})
+  call term_sendkeys(buf, "\<CR>")
+  call WaitForAssert({-> assert_match('- src/', s:Screen(buf))})
+  call WaitForAssert({-> assert_match('src/alpha\.cpp', s:Screen(buf))})
+  call s:Dump(buf, 'Test_xim_explorer')
+  call term_sendkeys(buf, "\<Esc>")
+  call s:StopXim(buf)
+  call delete('Xximproj', 'rf')
 endfunc
 
 func Test_xim_failed_confirmation_save()

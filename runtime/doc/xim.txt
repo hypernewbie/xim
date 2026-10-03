@@ -50,13 +50,35 @@ Redo		Ctrl-Y		F10 or palette: Redo
 Find		Ctrl-F		F11 or palette: Find
 Next match	Ctrl-N		F3 or palette: Next match
 Previous match	Ctrl-B		Shift-F3 or palette: Previous match
-Command palette	Ctrl-P		F1 or F2
+Quick open	Ctrl-P		palette: Files
+Explorer	Ctrl-E		palette: Explorer
+Buffers	Ctrl-Shift-B	palette: Buffers
+Command palette	Ctrl-Shift-P	F1 or F2
 
 The palette filters command names by case-insensitive substring.  Up/Down
 select a command; Enter runs it.  The list scrolls to keep the selection in
 view.  Open, Save as, and Find accept text at the bottom of the screen.  Enter
 accepts; Escape cancels.  Find uses literal text and follows the buffer's
 existing case and wrap-search options.
+
+Files
+								*xim-files*
+Quick open lists the indexed files of the project root.  The root is the
+directory argument, the parent of a file argument, or the working directory.
+It does not change implicitly, and an out-of-root file never starts a wider
+scan.  Version-control internals, 'build' directories and 'node_modules' are
+excluded.  Results show project-relative paths, so duplicate basenames stay
+distinct.  Matching is case-insensitive; an exact basename match ranks first,
+then a basename prefix, then a path substring.  Only paths are indexed, never
+file contents.
+
+Enumeration runs on a bounded background job, so it never delays first edit.
+The picker shows "Indexing project..." until the first snapshot arrives.
+Results stay capped, and a newer root change discards an older scan.
+
+The explorer shows one directory level at a time.  Enter expands or collapses
+a directory and opens a file.  Buffers lists the open buffers and switches to
+the selection without a Save/Discard prompt.
 
 Save on an unnamed buffer opens Save as.  Open, Close, and Quit protect
 modified buffers with Save, Discard, and Cancel choices.  Quit checks all

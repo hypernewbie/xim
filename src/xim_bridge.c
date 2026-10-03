@@ -1,6 +1,7 @@
 /* Native Xim engine adapters. All functions run on the editor's main thread. */
 #include "vim.h"
 #include "xim_input.h"
+#include "xim_project.h"
 
 static pos_T selection_anchor;
 static int selection_buffer = 0;
@@ -24,6 +25,43 @@ xim_engine_unsaved(int all_buffers)
 xim_engine_named(void)
 {
     return curbuf->b_ffname != NULL;
+}
+
+/*
+ * Return a newline-separated list of listed buffer names for the native
+ * buffer picker.  The caller frees the result with xim_engine_free().
+ */
+    char *
+xim_engine_buffers(void)
+{
+    buf_T *buf;
+    size_t size = 1;
+    size_t used = 0;
+
+    for (buf = firstbuf; buf != NULL; buf = buf->b_next)
+    {
+	if (buf->b_flags & BF_DUMMY)
+	    continue;
+	size += STRLEN(buf->b_ffname != NULL
+					       ? buf->b_ffname : (char_u *)"[No Name]") + 1;
+    }
+
+    char_u *names = alloc(size);
+    if (names == NULL)
+	return NULL;
+    names[0] = '\0';
+    for (buf = firstbuf; buf != NULL; buf = buf->b_next)
+    {
+	if (buf->b_flags & BF_DUMMY)
+	    continue;
+	char_u *name = buf->b_ffname != NULL ? buf->b_ffname : (char_u *)"[No Name]";
+	size_t len = STRLEN(name);
+	mch_memmove(names + used, name, len);
+	used += len;
+	names[used++] = '\n';
+    }
+    names[used] = '\0';
+    return (char *)names;
 }
 
     void
@@ -422,6 +460,37 @@ xim_engine_overlay(const char *prompt, const char *items, int error)
     void
 xim_initialize(void)
 {
+    // A directory argument starts a project at that directory.  A file
+    // argument roots the project at its parent so indexing stays local.
+    char_u *root = NULL;
+    if (GARGCOUNT > 0)
+    {
+	char_u *name = GARGLIST[0].ae_fname;
+	if (name != NULL && *name != NUL)
+	{
+	    if (mch_isdir(name))
+		root = vim_strsave(name);
+	    else
+	    {
+		char_u *parent = vim_strsave(name);
+		if (parent != NULL)
+		{
+		    if (mch_isdir(parent))
+			root = parent;
+		    else
+		    {
+			char_u *slash = gettail(parent);
+			if (slash != NULL)
+			    *slash = NUL;
+			root = parent;
+		    }
+		}
+	    }
+	}
+    }
+    xim_project_init(root == NULL ? NULL : (char *)root);
+    if (root != NULL)
+	vim_free(root);
     do_cmdline_cmd((char_u *)"set nocompatible laststatus=2 noshowmode noshowcmd noruler noinsertmode selection=exclusive backspace=indent,eol,start ttimeout ttimeoutlen=20");
     do_highlight((char_u *)"default link XimStatus StatusLine", FALSE, FALSE);
     do_highlight((char_u *)"default link XimPrompt Pmenu", FALSE, FALSE);

@@ -12,8 +12,11 @@ Action resolve(int key, int modifiers)
     if (key == XIM_DELETE) return Action::erase;
     if (key == XIM_BACKSPACE || key == 8 || key == 127) return Action::backspace;
     if (key == 27) return Action::cancel;
-    if (key == XIM_F1 || key == XIM_F2 || key == 16) return Action::palette;
+    if (key == XIM_F1 || key == XIM_F2) return Action::palette;
+    if (key == 16) return modifiers & XIM_SHIFT ? Action::palette : Action::files;
     if (key == XIM_F3) return modifiers & XIM_SHIFT ? Action::previous : Action::next;
+    if (key == 5) return Action::explorer;
+    if (key == 2 && (modifiers & XIM_SHIFT) != 0) return Action::buffers;
     if (key == XIM_F4 || key == 19) return modifiers & XIM_SHIFT ? Action::save_as : Action::save;
     if (key == XIM_F5 || key == 15) return Action::open;
     if (key == XIM_F6 || key == 3) return Action::copy;

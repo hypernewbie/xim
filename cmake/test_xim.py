@@ -64,10 +64,23 @@ class Session:
                     raise AssertionError(f"editor exited: {self.process.poll()}, {bytes(output)!r}") from error
         return bytes(output)
 
+    def drain(self, timeout=.5):
+        """Read whatever arrives within the timeout without requiring a marker."""
+        output = bytearray()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([self.master], [], [], min(.1, max(0, deadline - time.monotonic())))
+            if ready:
+                try:
+                    output.extend(os.read(self.master, 65536))
+                except OSError:
+                    break
+        return bytes(output)
+
     def ex(self, command):
         self.serial += 1
         marker = f"XIM_ACK_{self.serial}".encode()
-        self.send(b"\x10Ex command\r")
+        self.send(b"\x1bOPEx command\r")
         self.wait(b"Ex:")
         self.send(command + f"|echo 'XIM_' . 'ACK_{self.serial}'\r")
         return self.wait(marker)
@@ -134,7 +147,7 @@ def run(binary, root, themes=()):
             assert (directory / "position").read_text() == "3\n"
             # Save-as handles spaces and command metacharacters as filename text.
             name = "saved file|literal.txt"
-            session.send(b"\x10Save as\r")
+            session.send(b"\x1bOPSave as\r")
             session.wait(b"Save as:")
             session.send(name + "\r")
             session.ex("echo 'barrier'")
@@ -151,7 +164,7 @@ def run(binary, root, themes=()):
             assert "unsavedQ" in session.snapshot()
             # Cancel native prompts; neither text nor focus should be lost.
             before = session.snapshot()
-            session.send(b"\x0fignored\x1b\x06ignored\x1b\x10ignored\x1b")
+            session.send(b"\x0fignored\x1b\x06ignored\x1b\x1bOPignored\x1b")
             assert session.snapshot() == before
             # Theme and Vimscript evaluation remain available.
             for theme in ("default", "desert", "slate", "habamax"):
@@ -246,7 +259,7 @@ def run(binary, root, themes=()):
             session.wait(b"E45")
             session.send(b"\x1b")
             assert session.snapshot() == "changedoriginal\n"
-            session.send(b"\x10Save as\r")
+            session.send(b"\x1bOPSave as\r")
             session.wait(b"Save as:")
             session.send("absent/parent/file.txt\r")
             session.wait(b"E212")
@@ -409,7 +422,7 @@ def run(binary, root, themes=()):
             session.send(b"\x1b")
             time.sleep(.05)
             assert session.snapshot() == "closeme\n"
-            session.send(b"\x10Save as\r")
+            session.send(b"\x1bOPSave as\r")
             session.wait(b"Save as:")
             session.send("closed-ok.txt\r")
             session.ex("echo 'saved'")
@@ -422,6 +435,67 @@ def run(binary, root, themes=()):
         print("Read-only, failed save, configuration and compatibility checks passed")
 
 
+def project_run(binary, root):
+    """Plan 2: project root, quick open, explorer and buffer picker."""
+    with tempfile.TemporaryDirectory(prefix="xim-project-", dir=root) as temporary:
+        project = Path(temporary)
+        (project / "src" / "deep").mkdir(parents=True)
+        (project / "src" / "alpha.cpp").write_text("alpha\n")
+        (project / "src" / "deep" / "beta.cpp").write_text("beta\n")
+        (project / "top.md").write_text("top\n")
+        # Ignored trees must never appear in quick open.
+        (project / ".git").mkdir()
+        (project / ".git" / "hidden.cpp").write_text("hidden\n")
+        (project / "node_modules").mkdir()
+        (project / "node_modules" / "dep.cpp").write_text("dep\n")
+
+        # A directory argument roots the project instead of editing ".".
+        session = Session(binary, project, arguments=(".",))
+        try:
+            session.send(b"\x10")            # Ctrl-P -> quick open
+            session.wait(b"Files:")
+            session.send(b"alpha")
+            session.wait(b"alpha.cpp")
+            session.send(b"\r")
+            session.ex("echo 'opened'")
+            assert session.snapshot() == "alpha\n"
+            assert session.snapshot() == "alpha\n", "quick open must not edit text"
+            # Explicit path activation is checked against the real file.
+            assert (project / "src" / "alpha.cpp").read_text() == "alpha\n"
+            # Ignored trees stay out of the index.
+            session.send(b"\x10")
+            session.wait(b"Files:")
+            session.send(b"hidden")
+            time.sleep(.3)
+            assert b"hidden.cpp" not in session.drain(), "ignored tree leaked"
+            session.send(b"\x1b")
+        finally:
+            session.close()
+
+        # Explorer expands a directory and opens a nested file.
+        session = Session(binary, project, arguments=(".",))
+        try:
+            session.send(b"\x05")            # Ctrl-E -> explorer
+            screen = session.wait(b"src/")
+            assert b"Explorer:" in screen, "explorer prompt missing"
+            session.send(b"\r")              # expand the selected directory
+            session.wait(b"alpha.cpp")
+            session.send(b"alpha\r")
+            session.ex("echo 'explored'")
+            assert session.snapshot() == "alpha\n"
+            # Buffer picker lists the files opened so far.
+            session.send(b"\x10beta\r")
+            session.ex("echo 'beta'")
+            assert session.snapshot() == "beta\n"
+            session.send(b"\x1bOPBuffers\r")
+            screen = session.wait(b"Buffers:")
+            assert b"alpha.cpp" in screen, "buffer picker lost an open file"
+            session.send(b"\x1b")
+        finally:
+            session.close()
+        print("Project root, quick open, explorer and buffer checks passed")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -430,3 +504,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args.work.mkdir(parents=True, exist_ok=True)
     run(args.binary.resolve(), args.work.resolve(), args.theme)
+    project_run(args.binary.resolve(), args.work.resolve())

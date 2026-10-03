@@ -90,7 +90,7 @@ def sample(binary, root, native, startup_log=None, profile=None, delay=0, runtim
             result["paste_10k"] = timed("PASTE", data if native else b"i" + data)
             assert session.snapshot().splitlines()[0] == "P" * 10240 + "YX" + fixture[0]
             if native:
-                result["command_ui"] = timed("PALETTE", b"\x10", b"Command:")
+                result["command_ui"] = timed("PALETTE", b"\x1bOP", b"Command:")
                 session.send(b"Ex command\r")
                 session.wait(b"Ex:")
                 session.send("echo 'XIM_' . 'PALETTE_OK'\r")
@@ -100,7 +100,7 @@ def sample(binary, root, native, startup_log=None, profile=None, delay=0, runtim
                 session.send("echo 'XIM_' . 'COMMAND_OK'\r")
                 session.wait(b"XIM_COMMAND_OK")
             if profile:
-                session.send(b"\x10Ex command\r")
+                session.send(b"\x1bOPEx command\r")
                 session.wait(b"Ex:")
                 session.send(b"qall!\r")
                 session.process.wait(timeout=5)

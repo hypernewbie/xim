@@ -57,8 +57,11 @@ successful writes and retaining visible Save-as failure state for unnamed
 confirmation continuations. Regression cases are in `cmake/test_xim.py` and
 `src/testdir/test_xim_native.vim`.
 
-Plan 2 proposes native project/file navigation. Its implementation awaits
-operator authorization.
+Plan 2 native project and file navigation is authorized as of 2026-10-03.
+The first slice ships the project root, background index, quick open, explorer
+and buffer picker; evidence is in `cmake/PLAN2_VALIDATION.md`. It still follows
+the gates and per-slice validation below. The save-workflow fixes remain
+required before navigation features.
 Keep these gates in effect for subsequent changes:
 
 - Build from tracked sources without Make-generated source-tree headers.

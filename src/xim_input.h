@@ -40,6 +40,7 @@ int xim_engine_menu_rows(void);
 void xim_engine_boundary(void);
 int xim_engine_unsaved(int all_buffers);
 int xim_engine_named(void);
+char *xim_engine_buffers(void);
 #ifdef __cplusplus
 }
 #endif

@@ -1,4 +1,5 @@
 #include "xim_commands.h"
+#include "xim_project.h"
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -82,6 +83,42 @@ std::vector<const xim::Command *> filtered()
     return result;
 }
 
+std::vector<std::string> project_items(Action action, const std::string &text)
+{
+    char *sources = nullptr;
+    switch (action)
+    {
+        case Action::files: sources = xim_project_files(text.c_str()); break;
+        case Action::explorer: sources = xim_project_explorer(text.c_str()); break;
+        case Action::buffers: sources = xim_engine_buffers(); break;
+        default: break;
+    }
+    std::vector<std::string> items;
+    if (sources == nullptr)
+        return items;
+    std::string text_all;
+    if (action == Action::buffers)
+    {
+        std::unique_ptr<char, decltype(&xim_engine_free)> guard(sources, xim_engine_free);
+        text_all = guard.get();
+    }
+    else
+    {
+        std::unique_ptr<char, decltype(&xim_project_free)> guard(sources, xim_project_free);
+        text_all = guard.get();
+    }
+    std::size_t start = 0;
+    for (;;)
+    {
+        auto end = text_all.find('\n', start);
+        if (end == std::string::npos)
+            break;
+        items.push_back(text_all.substr(start, end - start));
+        start = end + 1;
+    }
+    return items;
+}
+
 void begin(Action action)
 {
     xim_engine_boundary();
@@ -99,7 +136,8 @@ void execute(Action action)
             else begin(Action::save_as);
             break;
         case Action::save_as: case Action::open: case Action::find:
-        case Action::palette: case Action::ex: begin(action); break;
+        case Action::palette: case Action::ex: case Action::files:
+        case Action::buffers: case Action::explorer: begin(action); break;
         case Action::quit: case Action::close: protect(action); break;
         case Action::select_all: xim_engine_select_all(); break;
         case Action::cancel: xim_engine_cancel(); break;
@@ -228,6 +266,36 @@ extern "C" void xim_dispatch(int key, int modifiers)
                 query = input;
                 xim_engine_find(query.c_str(), false);
             }
+            else if (current == Action::files || current == Action::buffers
+                    || current == Action::explorer)
+            {
+                auto list = project_items(current, input);
+                if (!list.empty())
+                {
+                    auto item = list[selected % list.size()];
+                    if (current == Action::buffers)
+                        xim_engine_command("buffer", item.c_str(), 0);
+                    else if (current == Action::explorer)
+                    {
+                        char *path = nullptr;
+                        xim_project_explorer_activate(item.c_str(), &path);
+                        if (path != nullptr)
+                        {
+                            std::unique_ptr<char, decltype(&xim_project_free)> guard(
+                                    path, xim_project_free);
+                            protect(Action::open, path);
+                        }
+                        else
+                            prompt = current;
+                    }
+                    else
+                        protect(Action::open, item);
+                }
+                else
+                    prompt = current;
+                input.clear();
+                return;
+            }
             else if (current == Action::save_as && input.empty())
             {
                 if (pending != Action::ignore && save_then_continue)
@@ -325,7 +393,9 @@ extern "C" void xim_render()
         return;
     }
     std::string label = prompt == Action::open ? "Open: " : prompt == Action::save_as ? "Save as: "
-        : prompt == Action::find ? "Find: " : prompt == Action::ex ? "Ex: " : "Command: ";
+        : prompt == Action::find ? "Find: " : prompt == Action::ex ? "Ex: "
+        : prompt == Action::files ? "Files: " : prompt == Action::buffers ? "Buffers: "
+        : prompt == Action::explorer ? "Explorer: " : "Command: ";
     std::string items;
     if (prompt == Action::palette)
     {
@@ -338,6 +408,27 @@ extern "C" void xim_render()
         {
             items += i == selected ? "> " : "  ";
             items += list[i]->name;
+            items += '\n';
+        }
+    }
+    else if (prompt == Action::files || prompt == Action::buffers
+            || prompt == Action::explorer)
+    {
+        auto list = project_items(prompt, input);
+        if (list.empty())
+        {
+            const char *status = prompt == Action::files ? xim_project_status() : nullptr;
+            if (status != nullptr && *status != '\0')
+                items = std::string("  ") + status + "\n";
+        }
+        selected = list.empty() ? 0 : selected % list.size();
+        auto rows = static_cast<std::size_t>(xim_engine_menu_rows());
+        auto first = selected >= rows ? selected - rows + 1 : 0;
+        auto last = std::min(list.size(), first + rows);
+        for (std::size_t i = first; i < last; ++i)
+        {
+            items += i == selected ? "> " : "  ";
+            items += list[i];
             items += '\n';
         }
     }

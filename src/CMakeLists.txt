@@ -14,7 +14,6 @@ file(MAKE_DIRECTORY ${XIM_AUTO_DIR}/wayland)
 
 vim_generate_config_header(${XIM_AUTO_DIR} ${CMAKE_SOURCE_DIR}/src)
 
-vim_generate_pathdef(${XIM_AUTO_DIR})
 vim_generate_osdef(${XIM_AUTO_DIR} ${CMAKE_SOURCE_DIR}/src)
 if(XIM_WITH_WAYLAND)
     vim_generate_wayland(${XIM_AUTO_DIR}/wayland ${CMAKE_SOURCE_DIR}/src/auto/wayland)
@@ -310,6 +309,7 @@ if(XIM_WITH_PERL)
 endif()
 # Auto-generated pathdef.c — defines default_vim_dir, default_vimruntime_dir,
 # compiled_user/sys, and the link command string baked into the binary.
+vim_generate_pathdef(${XIM_AUTO_DIR})
 set(VIM_AUTO_SRC ${XIM_AUTO_DIR}/pathdef.c)
 
 # ----------------------------------------------------------------------------
@@ -347,9 +347,9 @@ add_library(vim_core OBJECT
     ${VIM_AUTO_SRC})
 
 target_include_directories(vim_core PUBLIC
+    ${XIM_AUTO_DIR}
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/proto
-    ${XIM_AUTO_DIR}
     ${XIM_AUTO_DIR}/wayland
     ${VIM_FEATURE_INCLUDE_DIRS})
 
@@ -361,7 +361,7 @@ target_compile_definitions(vim_core PUBLIC
     HAVE_CONFIG_H
     XIM_CMAKE_CONFIG)
 
-target_link_libraries(vim_core PUBLIC ${XIM_SYSTEM_LIBRARIES})
+target_link_libraries(vim_core PUBLIC xim_compile_policy ${XIM_SYSTEM_LIBRARIES})
 
 # osdef.h is generated but not a compile input — it provides system header
 # declarations the rest of vim #includes via vim.h. Force its generation

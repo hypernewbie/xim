@@ -117,23 +117,20 @@ function(vim_generate_pathdef auto_dir)
     set(XIM_VIMRCLOC       "${CMAKE_INSTALL_PREFIX}/share/vim"     CACHE STRING "default_vim_dir")
     set(XIM_VIMRUNTIMEDIR  ""                                      CACHE STRING "default_vimruntime_dir")
 
-    # The string baked into all_cflags / all_lflags is the literal compile and
-    # link command lines. They are surfaced by `:version` for debugging, so
-    # the values are chosen for readability, not as inputs to the build.
-    #
-    # To match the reference Makefile output exactly:
-    #   all_cflags: clang -c -I. -Iproto -DHAVE_CONFIG_H -O2
-    #               -Wall -Wno-deprecated-declarations -D_REENTRANT
-    #               -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=1
-    #               -I/usr/include/pixman-1
-    #
-    # The path-style components (proto/, pixman-1) come from
-    # target_include_directories; the rest come from XIM_COMPILE_FLAGS or
-    # CMAKE_C_FLAGS_<CONFIG>.
+    # Report the selected configuration, not a fictitious reference command.
+    # The generated Ninja rules and compilation database are authoritative for
+    # per-source options, imported targets, and the final link invocation.
+    string(TOUPPER "${CMAKE_BUILD_TYPE}" config)
+    string(JOIN " " policy ${XIM_COMPILE_FLAGS})
+    string(JOIN " " libraries ${XIM_SYSTEM_LIBRARIES})
     set(XIM_ALL_CFLAGS_STRING
-        "clang -c -I${CMAKE_SOURCE_DIR}/src -Iproto -DHAVE_CONFIG_H -O2 -Wall -Wno-deprecated-declarations -D_REENTRANT -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=1 -I/usr/include/pixman-1")
+        "CMake ${CMAKE_BUILD_TYPE}: ${CMAKE_C_COMPILER} ${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_${config}} ${policy}; per-source commands: ${CMAKE_BINARY_DIR}/compile_commands.json")
     set(XIM_ALL_LFLAGS_STRING
-        "clang -L/usr/local/lib -Wl,--as-needed -o vim -lSM -lICE -lXpm -lXt -lX11 -lwayland-client -lpixman-1 -lXdmcp -lSM -lICE -lm -ltinfo -lnsl -lselinux ")
+        "CMake ${CMAKE_BUILD_TYPE}: ${CMAKE_EXE_LINKER_FLAGS} ${CMAKE_EXE_LINKER_FLAGS_${config}}; dependencies: ${libraries}; actual link: ninja -C ${CMAKE_BINARY_DIR} -t commands vim")
+    foreach(value IN ITEMS XIM_ALL_CFLAGS_STRING XIM_ALL_LFLAGS_STRING)
+        string(REPLACE "\\" "\\\\" ${value} "${${value}}")
+        string(REPLACE "\"" "\\\"" ${value} "${${value}}")
+    endforeach()
 
     configure_file(
         ${CMAKE_SOURCE_DIR}/cmake/pathdef.c.in

@@ -24,7 +24,9 @@
 
 // defines HAVE_ATTRIBUTE_UNUSED
 #ifdef HAVE_CONFIG_H
-# ifdef VMS
+# if defined(XIM_CMAKE_CONFIG)
+#  include <config.h>
+# elif defined(VMS)
 #  include "config.h"
 # else
 #  include "../auto/config.h"

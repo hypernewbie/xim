@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 
-def parse_binaries(specs):
+def parse_binaries(specs, minimum=2):
     binaries = []
     labels = set()
     for spec in specs:
@@ -31,8 +31,8 @@ def parse_binaries(specs):
             raise ValueError(f"duplicate binary label: {label}")
         labels.add(label)
         binaries.append((label, path))
-    if len(binaries) < 2:
-        raise ValueError("provide at least two --binary NAME=PATH values to compare")
+    if len(binaries) < minimum:
+        raise ValueError(f"provide at least {minimum} --binary NAME=PATH values")
     return binaries
 
 
@@ -120,7 +120,7 @@ def wait_for_output(master, process, marker, timeout):
             del output[: 4 * 1024 * 1024]
 
 
-def measure_interactive(binary, env, fixture, line_count, rows, columns):
+def measure_interactive(binary, env, fixture, line_count, rows, columns, self_test=False):
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
     command = [
@@ -154,16 +154,30 @@ def measure_interactive(binary, env, fixture, line_count, rows, columns):
 
         first_line = b"XIM-BENCH-LINE-000000"
         wait_for_output(master, process, first_line, 10)
-        open_ready = (time.perf_counter_ns() - start) / 1_000_000
+        first_paint = (time.perf_counter_ns() - start) / 1_000_000
+
+        # Markers are assembled by Vim, never present in the submitted command.
+        # Validate buffer contents as well as reaching command dispatch/redraw.
+        os.write(master, b"iREADY\x1b:redraw!|if getline(1) =~ '^READYXIM-'|echo 'XIM_' . 'READY_DONE'|endif\r")
+        wait_for_output(master, process, b"XIM_READY_DONE", 10)
+        ready_edit = (time.perf_counter_ns() - start) / 1_000_000
+
+        if self_test:
+            delayed_start = time.perf_counter_ns()
+            os.write(master, b":sleep 1000m|redraw!|echo 'XIM_' . 'DELAY_DONE'\r")
+            wait_for_output(master, process, b"XIM_DELAY_DONE", 10)
+            elapsed = (time.perf_counter_ns() - delayed_start) / 1_000_000
+            if elapsed < 1000:
+                raise AssertionError(f"completion accepted before delay: {elapsed:.3f} ms")
 
         scroll_marker = f"{line_count} XIM_SCROLL_DONE".encode("ascii")
-        os.write(master, b"G:redraw!|echo line('.') . ' XIM_SCROLL_DONE'\r")
         scroll_start = time.perf_counter_ns()
+        os.write(master, b"G:redraw!|echo line('.') . ' XIM_' . 'SCROLL_DONE'\r")
         wait_for_output(master, process, scroll_marker, 10)
         scroll = (time.perf_counter_ns() - scroll_start) / 1_000_000
 
-        os.write(master, b"iXIM_BENCH_EDIT\x1b:redraw!|echo 'XIM_EDIT_DONE'\r")
         edit_start = time.perf_counter_ns()
+        os.write(master, b"iXIM_BENCH_EDIT\x1b:redraw!|if getline('.') =~ '^XIM_BENCH_EDITXIM-'|echo 'XIM_' . 'EDIT_DONE'|endif\r")
         wait_for_output(master, process, b"XIM_EDIT_DONE", 10)
         edit = (time.perf_counter_ns() - edit_start) / 1_000_000
 
@@ -171,7 +185,7 @@ def measure_interactive(binary, env, fixture, line_count, rows, columns):
         process.wait(timeout=5)
         if process.returncode != 0:
             raise RuntimeError(f"Vim exited with status {process.returncode}")
-        return open_ready, scroll, edit
+        return first_paint, ready_edit, scroll, edit
     finally:
         if slave >= 0:
             os.close(slave)
@@ -212,10 +226,11 @@ def main():
     parser.add_argument("--rows", type=int, default=24, help="PTY height (default: 24)")
     parser.add_argument("--columns", type=int, default=100, help="PTY width (default: 100)")
     parser.add_argument("--output", type=Path, help="optional JSON output path")
+    parser.add_argument("--self-test", action="store_true", help="verify completion rejects echoed input using a one-second delay")
     args = parser.parse_args()
 
     try:
-        binaries = parse_binaries(args.binary)
+        binaries = parse_binaries(args.binary, minimum=1 if args.self_test else 2)
     except (OSError, ValueError) as error:
         parser.error(str(error))
     runtime = args.runtime.resolve(strict=True)
@@ -227,7 +242,7 @@ def main():
         parser.error("use --lines greater than --rows, at least 5 rows, and at least 40 columns")
 
     results = {
-        label: {name: [] for name in ("startup_exit", "open_ready", "scroll_to_end", "insert_visible")}
+        label: {name: [] for name in ("startup_exit", "first_paint", "ready_edit", "scroll_to_end", "insert_visible")}
         for label, _ in binaries
     }
     with tempfile.TemporaryDirectory(prefix="xim-bench-") as temporary:
@@ -241,10 +256,11 @@ def main():
                 home.mkdir()
                 env = make_environment(runtime, home)
                 results[label]["startup_exit"].append(measure_startup(binary, env))
-                opened, scrolled, edited = measure_interactive(
-                    binary, env, fixture, args.lines, args.rows, args.columns
+                painted, ready, scrolled, edited = measure_interactive(
+                    binary, env, fixture, args.lines, args.rows, args.columns, args.self_test
                 )
-                results[label]["open_ready"].append(opened)
+                results[label]["first_paint"].append(painted)
+                results[label]["ready_edit"].append(ready)
                 results[label]["scroll_to_end"].append(scrolled)
                 results[label]["insert_visible"].append(edited)
 

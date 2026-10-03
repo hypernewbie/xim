@@ -303,7 +303,11 @@
 // glibc-2.2.5 has them in their system headers.
 #if !defined(__cplusplus) && defined(UNIX) \
        && !defined(MACOS_X) // MACOS_X doesn't yet support osdef.h
-# include "auto/osdef.h"	// bring missing declarations in
+# ifdef XIM_CMAKE_CONFIG
+#  include <osdef.h>
+# else
+#  include "auto/osdef.h"	// bring missing declarations in
+# endif
 #endif
 
 #ifndef PROTO

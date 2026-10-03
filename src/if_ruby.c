@@ -13,7 +13,11 @@
 
 #include "protodef.h"
 #ifdef HAVE_CONFIG_H
-# include "auto/config.h"
+# ifdef XIM_CMAKE_CONFIG
+#  include <config.h>
+# else
+#  include "auto/config.h"
+# endif
 #endif
 
 #include <stdio.h>

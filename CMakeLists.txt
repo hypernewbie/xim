@@ -27,6 +27,9 @@ if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     message(FATAL_ERROR
         "Xim requires Clang for C++. Detected: ${CMAKE_CXX_COMPILER_ID} (${CMAKE_CXX_COMPILER}).")
 endif()
+if(CMAKE_C_COMPILER_VERSION VERSION_LESS 19 OR CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19)
+    message(FATAL_ERROR "Xim requires Clang/Clang++ 19 or newer, with C++26 mode.")
+endif()
 
 message(STATUS "Xim ${PROJECT_VERSION} — Clang ${CMAKE_C_COMPILER_VERSION}")
 

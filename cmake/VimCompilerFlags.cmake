@@ -16,11 +16,15 @@
 #   `_FORTIFY_SOURCE=2` interacts badly with some legacy macros in Vim's
 #   older headers, so the build deliberately downgrades to level 1.
 set(XIM_COMPILE_FLAGS
+    -Wall
     -Wno-deprecated-declarations
     -D_REENTRANT
     -U_FORTIFY_SOURCE
     -D_FORTIFY_SOURCE=1
 )
+
+add_library(xim_compile_policy INTERFACE)
+target_compile_options(xim_compile_policy INTERFACE ${XIM_COMPILE_FLAGS})
 
 # Link flags shared by every executable target.
 #
@@ -30,11 +34,11 @@ set(XIM_COMPILE_FLAGS
 set(XIM_LINK_FLAGS
     -Wl,--as-needed
 )
+target_link_options(xim_compile_policy INTERFACE ${XIM_LINK_FLAGS})
 
 # Apply these to every target in this directory tree (and below) by
 # attaching them as default flags. Targets can still override per-file
 # flags via set_source_files_properties().
 function(xim_apply_default_flags target)
-    target_compile_options(${target} PRIVATE ${XIM_COMPILE_FLAGS})
-    target_link_options(${target} PRIVATE ${XIM_LINK_FLAGS})
+    target_link_libraries(${target} PRIVATE xim_compile_policy)
 endfunction()

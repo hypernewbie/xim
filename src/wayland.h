@@ -17,8 +17,13 @@
 #include <wayland-client.h>
 
 #ifdef FEAT_WAYLAND_CLIPBOARD
-# include "auto/wayland/wlr-data-control-unstable-v1.h"
-# include "auto/wayland/ext-data-control-v1.h"
+# ifdef XIM_CMAKE_CONFIG
+#  include <wlr-data-control-unstable-v1.h>
+#  include <ext-data-control-v1.h>
+# else
+#  include "auto/wayland/wlr-data-control-unstable-v1.h"
+#  include "auto/wayland/ext-data-control-v1.h"
+# endif
 #endif
 
 #ifdef FEAT_WAYLAND_CLIPBOARD

@@ -1,7 +1,7 @@
 # Plan 1 local validation — 2026-10-03
 
-Source: `68465ee00f5d8048014e1f8def292606c08d444f`, plus the Plan 0 closeout
-and Plan 1 working-tree changes. Clang/Clang++ 22.1.8, libc++, C++26,
+Source: `68465ee00f5d8048014e1f8def292606c08d444f`, plus the Plan 0 closeout,
+Plan 1, and subsequent save-workflow fixes. Clang/Clang++ 22.1.8, libc++, C++26,
 CMake 4.3.4, Ninja 1.13.2, Linux UTF-8. The primary acceptance configuration
 is `build/dev`: Huge/no-GUI, RelWithDebInfo, X11, Wayland, pixman, channels
 and terminal enabled; optional interpreters off, matching the reference.
@@ -22,8 +22,15 @@ choices, readonly and failed writes, explicit configuration, and ignored modal
 insert mappings. Ctrl-S flow control is disabled in the actual PTY attributes.
 Pasted text stays literal even with autoindent enabled; the option is restored.
 Typing undo groups are bounded to 256 characters. Palette selection scrolls
-into view on a ten-row terminal. Failed confirmation writes retain the error
-and the pending Save/Discard/Cancel choices.
+into view on a ten-row terminal. Failed confirmation writes retain the error and the pending Save/Discard/Cancel
+choices.
+
+Plan 1 review defects R1 and R2 are closed. Successful Save and Save-as calls
+preserve the insertion position, including a bracketed paste ending at a
+buffer or CRLF boundary. An empty or failed unnamed Save-as continuation keeps
+visible Save/Discard/Cancel state, an invalid filename is restored to the
+original buffer state in xim, and clearing the prompt does not revive hidden
+pending actions.
 
 Results:
 
@@ -31,17 +38,18 @@ Results:
   tests, and no source-tree generated headers in Ninja dependencies. Explicit
   `--include` arguments supply prospective source additions before tracking.
 - Full `build/dev` suite: all 17 CTest registrations passed in a serial run
-  (720.76 s total, 702.59 s in the eight Vim-script batches). This covers 274
-  inherited script targets, 11 legacy targets, four C units, libvterm, mixed
-  C/C++ linkage, Vim smoke, native command/PTY tests, and native screen tests.
+  (702.35 s total, 684.16 s in the eight Vim-script batches after the save-flow
+  fixes). This covers 274 inherited script targets, 11 legacy targets, four C
+  units, libvterm, mixed C/C++ linkage, Vim smoke, native command/PTY tests,
+  and native screen tests.
 - The initial concurrent run failed in `test_plugin_termdebug` while other
   builds were active. Isolated candidate and reference runs each passed all
   13 tests. The entire `vim_scripts_n_s` batch subsequently passed in 174.5 s.
   The cause of the initial failure is not established. Its evidence is in
   `temp/XIM_PLAN1_FULL_INITIAL_FAILURE.md`; no tests were changed or skipped.
-- ASan/UBSan and TSan native command/PTY tests passed, including the failed
-  confirmation-save path. Plan 0 sanitizer engine-unit evidence is recorded
-  in the closeout document.
+- ASan/UBSan and TSan native command/PTY tests passed after the save fixes,
+  including failed confirmation writes and unnamed Save-as continuations.
+  Plan 0 sanitizer engine-unit evidence is recorded in the closeout document.
 - The existing `default` cache, which has Python3 enabled and channels/terminal
   disabled, also builds and passes native PTY tests. Screen verification uses
   the terminal-enabled `build/dev` configuration.
@@ -52,9 +60,9 @@ Results:
   environment overrides removed. No system Vim supplies the runtime.
 - No new compiler warnings. `git diff --check` passes.
 
-Ten screen dumps cover status, selection, open/find prompts, palette,
-unsaved changes, palette scrolling, failed-save feedback, desert and
-catppuccin. Shipped default, desert, slate, habamax and catppuccin themes
+Eleven screen dumps cover status, selection, open/find prompts, palette,
+unsaved changes, palette scrolling, failed named and unnamed save feedback,
+desert and catppuccin. Shipped default, desert, slate, habamax and catppuccin themes
 were exercised. Local third-party `phi_canary` and `phi_copper` were exercised
 with `termguicolors`; native prompt links follow Pmenu after theme changes.
 These local themes are named samples, not dependencies of the registered tests.
@@ -74,21 +82,21 @@ Final results in milliseconds:
 
 | Phase | Xim median | Xim p90 | Reference median | Reference p90 | Xim p90 budget |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| First paint | 22.842 | 24.162 | 26.248 | 27.270 | — |
-| Launch to first accepted edit | 23.177 | 24.470 | 26.548 | 27.624 | 30 |
-| Typing | 0.424 | 0.480 | 0.444 | 0.540 | 5 |
-| Selection | 0.302 | 0.347 | 0.298 | 0.365 | 5 |
-| Page scroll | 0.277 | 0.321 | 0.324 | 0.364 | 5 |
-| 10 KiB paste | 12.407 | 12.842 | 198.516 | 204.426 | 20 |
-| Command UI | 0.298 | 0.377 | 0.228 | 0.289 | 5 |
+| First paint | 22.790 | 23.567 | 25.693 | 26.789 | — |
+| Launch to first accepted edit | 23.107 | 23.872 | 26.013 | 27.127 | 30 |
+| Typing | 0.408 | 0.448 | 0.433 | 0.504 | 5 |
+| Selection | 0.306 | 0.330 | 0.307 | 0.383 | 5 |
+| Page scroll | 0.271 | 0.311 | 0.337 | 0.384 | 5 |
+| 10 KiB paste | 12.430 | 12.678 | 198.614 | 203.390 | 20 |
+| Command UI | 0.303 | 0.363 | 0.223 | 0.292 | 5 |
 
 Command UI compares the native palette with the preserved Ex prompt; their
 available interfaces differ. The two earlier equivalent-config 60-sample
 rounds also meet the budgets. Earlier minimal-reference startup samples did
 not enable syntax and are not equivalent startup configurations.
 
-The one-second completion self-test reports 1023.4 ms for native first edit
-and 1026.6 ms for the reference, rejecting echoed input as completion.
+The one-second completion self-test reports 1023.5 ms for native first edit
+and 1027.1 ms for the reference, rejecting echoed input as completion.
 A separate 60-sample compatibility comparison reports candidate/reference
 median first accepted edit 7.451/7.419 ms and p90 7.748/7.846 ms, with no
 repeatable regression against the corrected Plan 0 rounds.
@@ -100,6 +108,9 @@ Raw evidence (local, gitignored):
 - `temp/XIM_PLAN1_FINAL_SELFTEST.json`
 - `temp/XIM_PLAN1_COMPAT_PERF.json`
 - `temp/XIM_PLAN1_STARTUP_NORMAL.log`
+- `temp/XIM_PLAN1_SAVE_FIX_PERF.json`
+- `temp/XIM_PLAN1_SAVE_FIX_SELFTEST.json`
+- `temp/XIM_PLAN1_SAVE_FIX_STARTUP.log`
 
 ## Profiling and limits
 

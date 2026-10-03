@@ -32,7 +32,7 @@ void xim_engine_undo(int redo);
 char *xim_engine_copy(int cut);
 char *xim_engine_clipboard(void);
 void xim_engine_free(char *text);
-int xim_engine_command(const char *command, const char *argument);
+int xim_engine_command(const char *command, const char *argument, int preserve_position);
 const char *xim_engine_error(void);
 void xim_engine_find(const char *text, int backward);
 void xim_engine_overlay(const char *prompt, const char *items, int error);

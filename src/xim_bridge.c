@@ -287,12 +287,17 @@ xim_engine_undo(int redo)
 }
 
     int
-xim_engine_command(const char *command, const char *argument)
+xim_engine_command(const char *command, const char *argument, int preserve_position)
 {
     char_u *escaped = NULL;
     char_u *line;
     int result = FAIL;
     int errors = called_emsg;
+    buf_T *editing = curbuf;
+    pos_T insertion = curwin->w_cursor;
+    char_u *old_ffname = curbuf->b_ffname == NULL ? NULL : vim_strsave(curbuf->b_ffname);
+    char_u *old_sfname = curbuf->b_sfname == NULL ? NULL : vim_strsave(curbuf->b_sfname);
+    bool distinct_sfname = curbuf->b_sfname != NULL && curbuf->b_sfname != curbuf->b_ffname;
     xim_engine_boundary();
     xim_engine_cancel();
     if (*argument != NUL && *command != NUL)
@@ -314,10 +319,33 @@ xim_engine_command(const char *command, const char *argument)
             --no_wait_return;
             need_wait_return = FALSE;
             State = MODE_INSERT;
+            if (preserve_position && editing == curbuf
+                    && insertion.lnum <= curbuf->b_ml.ml_line_count
+                    && insertion.col <= ml_get_buf_len(curbuf, insertion.lnum))
+            {
+                curwin->w_cursor = insertion;
+                if (insertion.col == 0 || insertion.col < ml_get_buf_len(curbuf, insertion.lnum))
+                    curwin->w_cursor.coladd = 0;
+            }
             vim_free(full);
         }
     }
     vim_free(escaped);
+    if (STRCMP(command, "saveas") == 0 && called_emsg != errors && editing == curbuf)
+    {
+        vim_free(curbuf->b_ffname);
+        if (distinct_sfname)
+            vim_free(curbuf->b_sfname);
+        curbuf->b_ffname = old_ffname;
+        curbuf->b_sfname = old_sfname;
+        curbuf->b_fname = (curbuf->b_sfname != NULL && curbuf->b_sfname != curbuf->b_ffname)
+            ? curbuf->b_sfname : curbuf->b_ffname;
+    }
+    else
+    {
+        vim_free(old_ffname);
+        vim_free(old_sfname);
+    }
     curwin->w_set_curswant = TRUE;
     return called_emsg == errors ? result : FAIL;
 }

@@ -250,6 +250,8 @@ def run(binary, root, themes=()):
             session.wait(b"Save as:")
             session.send("absent/parent/file.txt\r")
             session.wait(b"E212")
+            session.send(b"\x1b")
+            time.sleep(.05)
             assert session.snapshot() == "changedoriginal\n"
         finally:
             session.close()
@@ -288,6 +290,133 @@ def run(binary, root, themes=()):
             session.send("from-confirm.txt\r")
             assert session.process.wait(timeout=5) == 0
             assert (directory / "from-confirm.txt").read_text() == "next\n"
+        finally:
+            session.close()
+        # Successful writes never move the insertion position.
+        position = directory / "cursor.txt"
+        position.write_text("αβ\n")
+        session = Session(binary, directory, (str(position),))
+        try:
+            session.send(b"\x01draft")
+            assert session.snapshot() == "draft\n"
+            session.send(b"\x13")
+            session.ex("echo 'written'")
+            assert position.read_text() == "draft\n"
+            session.send("X")
+            assert session.snapshot() == "draftX\n"
+            session.send(b"\x13")
+            session.ex("echo 'written'")
+            assert position.read_text() == "draftX\n"
+        finally:
+            session.close()
+        session = Session(binary, directory)
+        try:
+            session.send("draft")
+            session.send(b"\x13")
+            session.wait(b"Save as:")
+            session.send("saved-as.txt\r")
+            session.ex("echo 'written'")
+            assert (directory / "saved-as.txt").read_text() == "draft\n"
+            session.send("X")
+            assert session.snapshot() == "draftX\n"
+        finally:
+            session.close()
+        session = Session(binary, directory)
+        try:
+            session.send(b"\x1b[200~" + "α😀\r\nβ".encode() + b"\x1b[201~")
+            session.send(b"\x13")
+            session.wait(b"Save as:")
+            session.send("unicode-lines.txt\r")
+            session.ex("echo 'written'")
+            session.send("X")
+            assert session.snapshot() == "α😀\nβX\n"
+        finally:
+            session.close()
+        # A failed unnamed quit confirmation keeps its choices.
+        session = Session(binary, directory)
+        try:
+            session.send("keep")
+            session.send(b"\x11")
+            session.wait(b"Save changes")
+            session.send(b"s")
+            session.wait(b"Save as:")
+            session.send("missing/parent/quit.txt\r")
+            session.wait(b"E212")
+            session.wait(b"Save changes")
+            session.send(b"d")
+            assert session.process.wait(timeout=5) == 0
+            assert not Path(directory / "missing/parent/quit.txt").exists()
+        finally:
+            session.close()
+        # Empty Save-as names cannot hide the pending operation.
+        session = Session(binary, directory)
+        try:
+            session.send("keep")
+            session.send(b"\x11")
+            session.wait(b"Save changes")
+            session.send(b"s")
+            session.wait(b"Save as:")
+            session.send(b"\r")
+            session.wait(b"Save changes")
+            session.send(b"\x1b")
+            time.sleep(.05)
+            assert "keep" in session.snapshot().split()
+            session.send(b"\x13")
+            session.wait(b"Save as:")
+            session.send("empty-saved.txt\r")
+            session.ex("echo 'not-quitting'")
+            assert session.process.poll() is None
+            assert (directory / "empty-saved.txt").read_text() == "keep\n"
+        finally:
+            session.close()
+        # An unnamed open continuation keeps fallback choices after a failed save.
+        other = directory / "other.txt"
+        other.write_text("replace me\n")
+        session = Session(binary, directory)
+        try:
+            session.send("changed")
+            session.send(b"\x0fother.txt\r")
+            session.wait(b"Save changes")
+            session.send(b"s")
+            session.wait(b"Save as:")
+            session.send("missing/parent/opening.txt\r")
+            session.wait(b"E212")
+            session.wait(b"Save changes")
+            session.send(b"\x1b")
+            time.sleep(.05)
+            assert session.snapshot() == "changed\n"
+            session.send(b"\x13")
+            session.wait(b"Save as:")
+            session.send("saved-before-open.txt\r")
+            session.ex("echo 'saved'")
+            assert (directory / "saved-before-open.txt").read_text() == "changed\n"
+            session.send(b"\x0fother.txt\r")
+            session.ex("echo 'opened'")
+            assert session.snapshot() == "replace me\n"
+        finally:
+            session.close()
+        # An unnamed close continuation leaves a visible recovery path.
+        session = Session(binary, directory)
+        try:
+            session.send("closeme")
+            session.send(b"\x17")
+            session.wait(b"Save changes")
+            session.send(b"s")
+            session.wait(b"Save as:")
+            session.send("missing/parent/closing.txt\r")
+            session.wait(b"E212")
+            session.wait(b"Save changes")
+            session.send(b"\x1b")
+            time.sleep(.05)
+            assert session.snapshot() == "closeme\n"
+            session.send(b"\x10Save as\r")
+            session.wait(b"Save as:")
+            session.send("closed-ok.txt\r")
+            session.ex("echo 'saved'")
+            assert session.snapshot() == "closeme\n"
+            assert (directory / "closed-ok.txt").read_text() == "closeme\n"
+            session.send(b"\x17")
+            assert session.snapshot() == "\n"
         finally:
             session.close()
         print("Read-only, failed save, configuration and compatibility checks passed")

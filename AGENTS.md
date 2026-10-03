@@ -27,9 +27,10 @@ Do not preserve obsolete compiler support at the expense of development.
 product, release, and compiler policies do not override this file.
 
 Local notes are in `temp/XIM_DESIGN.md`, `temp/XIM_PLAN0.md`,
-`temp/XIM_PLAN0_REVIEW.md`, and `temp/XIM_PLAN1.md`. Read them when present.
-`temp/` is gitignored, so these files can be absent in other checkouts.
-The requirements in this file do not depend on those notes.
+`temp/XIM_PLAN0_REVIEW.md`, `temp/XIM_PLAN1.md`, `temp/XIM_PLAN1_REVIEW.md`,
+`temp/XIM_PLAN1_FULL_INITIAL_FAILURE.md`, and `temp/XIM_PLAN2.md`.
+Read them when present. `temp/` is gitignored, so these files can be absent
+in other checkouts. The requirements in this file do not depend on those notes.
 
 ## Toolchain direction
 
@@ -46,11 +47,19 @@ The requirements in this file do not depend on those notes.
 - Choose explicit minimum tool versions. Do not constrain new code to ancient
   compiler capabilities.
 
-## Current milestone: Plan 1 native editing
+## Current milestone: Plan 1 closeout
 
 Plan 0 closeout fixes and the operator-authorized Plan 1 native editing layer
 are implemented. Evidence is in `cmake/PLAN0_CLOSEOUT.md` and
-`cmake/PLAN1_VALIDATION.md`. Keep these gates in effect for subsequent changes:
+`cmake/PLAN1_VALIDATION.md`. The Plan 1 review found two save-workflow
+defects; both are corrected by preserving the insertion position across
+successful writes and retaining visible Save-as failure state for unnamed
+confirmation continuations. Regression cases are in `cmake/test_xim.py` and
+`src/testdir/test_xim_native.vim`.
+
+Plan 2 proposes native project/file navigation. Its implementation awaits
+operator authorization.
+Keep these gates in effect for subsequent changes:
 
 - Build from tracked sources without Make-generated source-tree headers.
 - Use the selected build's generated headers, not stale reference artifacts.

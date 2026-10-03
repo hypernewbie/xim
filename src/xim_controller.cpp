@@ -20,6 +20,7 @@ Action pending = Action::ignore;
 std::string pending_path;
 std::string pending_error;
 bool save_then_continue = false;
+bool pending_save_as_retry = false;
 
 void perform_pending(bool discard)
 {
@@ -27,9 +28,20 @@ void perform_pending(bool discard)
         : pending == Action::close ? (discard ? "bdelete!" : "bdelete")
         : (discard ? "edit!" : "edit");
     prompt = Action::ignore;
-    xim_engine_command(command, pending_path.c_str());
+    pending_error.clear();
+    bool succeeded = xim_engine_command(command, pending_path.c_str(), 0) != 0;
+    save_then_continue = false;
+    pending_save_as_retry = false;
+    if (!succeeded)
+    {
+        auto error = xim_engine_error();
+        pending_error = error && *error != '\0' ? error : "The pending operation failed";
+        prompt = Action::confirm;
+        return;
+    }
     pending = Action::ignore;
     pending_path.clear();
+    pending_error.clear();
 }
 
 void protect(Action action, std::string_view path = {})
@@ -83,7 +95,7 @@ void execute(Action action)
     switch (action)
     {
         case Action::save:
-            if (xim_engine_named()) xim_engine_command("update", "");
+            if (xim_engine_named()) xim_engine_command("update", "", 1);
             else begin(Action::save_as);
             break;
         case Action::save_as: case Action::open: case Action::find:
@@ -172,6 +184,7 @@ extern "C" void xim_dispatch(int key, int modifiers)
             pending = Action::ignore;
             pending_path.clear();
             pending_error.clear();
+            pending_save_as_retry = false;
             return;
         }
         if (prompt == Action::confirm)
@@ -179,14 +192,19 @@ extern "C" void xim_dispatch(int key, int modifiers)
             if (key == 'd' || key == 'D') perform_pending(true);
             else if (key == 's' || key == 'S')
             {
-                if (!xim_engine_named())
+                if (pending_save_as_retry)
+                {
+                    pending_error.clear();
+                    begin(Action::save_as);
+                }
+                else if (!xim_engine_named())
                 {
                     save_then_continue = true;
                     begin(Action::save_as);
                 }
                 else
                 {
-                    if (!xim_engine_command(pending == Action::quit ? "wall" : "update", ""))
+                    if (!xim_engine_command(pending == Action::quit ? "wall" : "update", "", 1))
                     {
                         auto error = xim_engine_error();
                         pending_error = error ? error : "Write failed";
@@ -210,16 +228,55 @@ extern "C" void xim_dispatch(int key, int modifiers)
                 query = input;
                 xim_engine_find(query.c_str(), false);
             }
+            else if (current == Action::save_as && input.empty())
+            {
+                if (pending != Action::ignore && save_then_continue)
+                {
+                    pending_error = "Empty Save-as path";
+                    prompt = Action::confirm;
+                    pending_save_as_retry = true;
+                }
+                else
+                    prompt = current;
+                input.clear();
+                return;
+            }
             else if (!input.empty())
             {
                 if (current == Action::open) protect(current, input);
                 else
                 {
-                    xim_engine_command(current == Action::save_as ? "saveas" : "", input.c_str());
+                    bool saved = true;
+                    auto command = current == Action::ex ? input.c_str() : "";
+                    auto argument = current == Action::ex ? "" : input.c_str();
+                    if (current == Action::save_as)
+                    {
+                        saved = xim_engine_command("saveas", input.c_str(), 1) != 0;
+                        if (!saved)
+                        {
+                            auto error = xim_engine_error();
+                            pending_error = error && *error != '\0' ? error : "Write failed";
+                            prompt = pending != Action::ignore && save_then_continue
+                                ? Action::confirm : current;
+                            if (prompt == current)
+                                pending_error.clear();
+                            else
+                                pending_save_as_retry = true;
+                            input.clear();
+                            return;
+                        }
+                    }
+                    else if (current == Action::ex)
+                        xim_engine_command(command, argument, 0);
                     if (current == Action::save_as && save_then_continue)
                     {
                         save_then_continue = false;
                         if (!xim_engine_unsaved(pending == Action::quit)) perform_pending(false);
+                        else
+                        {
+                            pending_error = "The buffer still has unsaved changes";
+                            prompt = Action::confirm;
+                        }
                     }
                 }
             }

@@ -63,7 +63,9 @@ modified buffers with Save, Discard, and Cancel choices.  Quit checks all
 buffers.  Failed writes retain the modified text and report the error.  A
 failed confirmation save keeps Save, Discard, and Cancel available.  Save as
 refuses to overwrite an existing file; an explicitly requested Ex command
-can apply the inherited write policy.
+can apply the inherited write policy.  A successful Save or Save-as write
+keeps the cursor at its previous insertion point.  An empty or failed Save-as
+choice does not revive a cancelled pending operation.
 
 Typing is grouped into undo entries of at most 256 characters.  Newlines,
 movement and commands end a typing group.  Paste and selection replacement

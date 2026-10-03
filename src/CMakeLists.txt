@@ -376,10 +376,43 @@ endif()
 # ----------------------------------------------------------------------------
 add_executable(vim main.c ${VIM_OBJ_MAIN_SRC})
 target_link_libraries(vim PRIVATE vim_core)
-xim_apply_default_flags(vim)
+
+# Native input policy is linked only into xim; vim keeps its modal dispatch.
+if(NOT XIM_FEATURE_LEVEL STREQUAL "tiny")
+    add_executable(xim main.c ${VIM_OBJ_MAIN_SRC}
+        xim_bridge.c xim_controller.cpp xim_commands.cpp)
+    target_compile_definitions(xim PRIVATE XIM_NATIVE_ENTRY)
+    target_link_libraries(xim PRIVATE vim_core)
+    xim_apply_cxx_settings(xim)
+    add_custom_target(xim_runtime
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_SOURCE_DIR}/runtime ${CMAKE_BINARY_DIR}/runtime
+        COMMAND $<TARGET_FILE:vim> -u NONE -i NONE -n -X -es
+            -c "helptags ${CMAKE_BINARY_DIR}/runtime/doc" -c "qall!"
+        DEPENDS vim
+        COMMENT "Staging the matching Xim runtime")
+    add_dependencies(xim xim_runtime)
+
+    add_executable(xim_commands_test testdir/xim_commands_test.cpp xim_commands.cpp)
+    xim_apply_default_flags(xim_commands_test)
+    xim_apply_cxx_settings(xim_commands_test)
+    add_test(NAME xim_commands COMMAND xim_commands_test)
+    set_tests_properties(xim_commands PROPERTIES LABELS "xim_native")
+    find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME xim_native_pty
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/test_xim.py
+            --binary $<TARGET_FILE:xim> --work ${CMAKE_BINARY_DIR}/Testing/native)
+    set_tests_properties(xim_native_pty PROPERTIES LABELS "xim_native" TIMEOUT 120)
+else()
+    message(STATUS "Tiny omits Vimscript/Visual support; building compatibility Vim only.")
+endif()
 
 include(GNUInstallDirs)
 install(TARGETS vim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(TARGET xim)
+    install(TARGETS xim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(DIRECTORY ${CMAKE_BINARY_DIR}/runtime/ DESTINATION ${CMAKE_INSTALL_DATADIR}/xim/runtime)
+endif()
 
 # ----------------------------------------------------------------------------
 # C unit tests — small executables that link vim_core plus a driver .c

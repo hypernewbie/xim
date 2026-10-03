@@ -1,43 +1,111 @@
 # AGENTS.md
 
-Guidance for AI coding agents working in the Vim repository.
+Guidance for AI coding agents working in Xim, a fork of Vim.
 
 ## Project
 
-Vim is a text editor written in C. The canonical repository is
-https://github.com/vim/vim. The code is old and has grown organically over
-the past 30+ years. Some files are vendored from upstream projects
-(`src/xdiff`, `src/libvterm`); parts of the runtime are occasionally shared
-with forks like Neovim.
+This repository is **Xim**, not an upstream Vim checkout. Vim is the starting
+codebase, not the product specification. Upstream is https://github.com/vim/vim.
+Some components are vendored, including `src/xdiff` and `src/libvterm`.
 
-Vim strives to be portable across several different operating systems and
-aims to be a stable, robust editor gradually developing new features while
-remaining backwards compatible as much as possible.
+The vision is a one-run, instant-start VS Code-like terminal editor, with a
+Sublime-like feel, partial Vim plugin compatibility, and support for Vim themes.
+Non-modal editing is the intended default. Essential capabilities belong in
+the editor, not a required plugin stack. Treat plugin implementations as UX
+prototypes, not the production architecture. The future architecture excludes
+LSPs. Native code must also avoid unnecessary work.
 
-At the same time, Vim can be compiled with different feature sets, from the
-POSIX compatible minimal vi to a full-fledged GUI editor which includes
-additional scripting interfaces.
+The performance ambition is 20x faster startup and operation than comparable
+plugin-heavy Vim setups and most Neovim preconfigs. This is a target, not a
+measured claim. Define reference configurations and workloads before claiming
+an improvement. Use multicore hardware for independent tasks. Profile throughout
+development, with correctness and performance tests at every stage.
 
-See `runtime/doc/develop.txt` for the high level design goals.
+Xim will diverge from Vim's architecture, build system, and portability policy.
+Do not preserve obsolete compiler support at the expense of development.
+`runtime/doc/develop.txt` explains inherited code and conventions. Its upstream
+product, release, and compiler policies do not override this file.
+
+Local notes are in `temp/XIM_DESIGN.md`, `temp/XIM_PLAN0.md`,
+`temp/XIM_PLAN0_REVIEW.md`, and `temp/XIM_PLAN1.md`. Read them when present.
+`temp/` is gitignored, so these files can be absent in other checkouts.
+The requirements in this file do not depend on those notes.
+
+## Toolchain direction
+
+- Use Clang for C and C++ on all supported platforms.
+- Do not add GCC/G++ or MSVC compiler build paths.
+- Prefer libc++ where practical. On Windows, use clang-cl with the MSVC ABI
+  and MSVC library/runtime/SDK components where required. The compiler remains
+  Clang/LLVM.
+- Use CMake with the Ninja generator. Implement real source targets, not a
+  permanent wrapper around legacy Make.
+- Use current C++ for development productivity, including AI-assisted
+  development. Plan 0 targets the installed compiler's C++26 mode, not complete
+  support for every draft-standard feature.
+- Choose explicit minimum tool versions. Do not constrain new code to ancient
+  compiler capabilities.
+
+## Current milestone: Plan 1 native editing
+
+Plan 0 closeout fixes and the operator-authorized Plan 1 native editing layer
+are implemented. Evidence is in `cmake/PLAN0_CLOSEOUT.md` and
+`cmake/PLAN1_VALIDATION.md`. Keep these gates in effect for subsequent changes:
+
+- Build from tracked sources without Make-generated source-tree headers.
+- Use the selected build's generated headers, not stale reference artifacts.
+- Apply the shared compiler policy to the core and its consumers.
+- Measure completed operations, not echoed command text.
+- Repeat full tests and corrected performance comparisons after fixes.
+- Preserve enabled features, runtime behavior, and inherited C compilation.
+- Record baseline failures separately. Accept no new failures, compiler warnings,
+  or reproducible performance regressions.
+
+`xim` uses native non-modal input; `vim` and `xim --vim` retain compatibility
+dispatch. Read `cmake/XIM_INPUT.md` before changing the input boundary. Editor
+state stays on its owning thread. Further product slices require operator
+authorization; a plan file alone is not permission to change behavior.
+
+Large scope does not justify reducing the vision. Milestone boundaries separate
+build parity from later product changes.
 
 ## Build and test
 
-    # Full build on Unix/Linux (from src/):
-    make
+CMake/Ninja is the primary build path. The `default`, `debug`, `release`,
+`asan`, and `tsan` configure/build presets exist. Use the tracked-source export
+check described in `cmake/README.md` to verify clean-build header routing.
 
-    # Run the full test suite:
-    make test
+    # Primary build and registered unit tests (from the repository root):
+    cmake --preset default
+    cmake --build --preset default --parallel
+    ctest --preset default
 
-    # Generate proto files
+    # Enable the full inherited Vim-script suite:
+    cmake --preset default -DBUILD_FULL_TEST=ON
+    cmake --build --preset default --parallel
+    ctest --preset default
+
+The inherited commands remain available for reference comparisons:
+
+    # Reference build on Unix/Linux (from src/):
+    make CC=clang
+
+    # Run the inherited full test suite (from src/):
+    make test CC=clang
+
+    # Generate proto files (from src/, only when needed):
     make proto
 
-    # Run a single test file:
+    # Run a single test file (from the repository root):
     cd src/testdir && make test_name.res
 
-Output is in testdir/messages and testdir/test.log
+Inherited test output is in `src/testdir/messages` and `src/testdir/test.log`.
+During migration, run tests against the candidate binary and matching runtime,
+not a system Vim or a stale reference binary.
 
-Builds on Windows depend on the Environment, see `src/INSTALLpc.txt`
-for Cygwin/MSYS and MSVC ways to build Vim
+See `cmake/README.md` for build, sanitizer, and performance commands.
+Legacy platform install documents describe upstream builds, not Xim's
+supported compiler policy.
 
 Before submitting any patch, at minimum:
 1. The build succeeds without new warnings.
@@ -46,7 +114,8 @@ Before submitting any patch, at minimum:
 
 ## Layout
 
-- `src/` - the C source. Subsystem names are usually obvious from filenames
+- `src/` - inherited C source and future C++ components. Subsystem names are
+  usually obvious from filenames
   (`buffer.c`, `window.c`, `search.c`, `vim9compile.c`, etc.).
 - `src/proto/` - function prototypes, one `.pro` file per source file.
   Regenerated; do not hand-edit unless you know what you're doing.
@@ -62,17 +131,19 @@ Before submitting any patch, at minimum:
   from Vims source
 - `runtime/`  - runtime files shipped with Vim, when updating, also update the
   Last Change header and a short description if this file has no maintainer
-  If the file has a maintainer, changes should go via them (so make a merge
-  request against the upstream repo instead)
-- `src/version.c` - contains the `included_patches[]` list. Every
-  patch touching anything below `src/` (with the exception of `src/po`) needs a
-  new entry at the top, will be updated only when merging into
-  the master tree.
+  Preserve maintainer and license information. Coordinate shared fixes with
+  upstream maintainers, but make Xim-specific changes in this repository.
+- `src/version.c` - contains upstream's `included_patches[]` history.
+  Do not invent upstream patch numbers or add entries for Xim-only changes.
 
 ## Commit format
 
-Vim uses a strict commit message format. The subject line is a
-one-sentence **problem statement**, not a description of the fix:
+For Xim commits, use a concise subject and explain the change and its tests.
+Include `Signed-off-by:` for the DCO and `Assisted-by:` when AI was used.
+Do not label Xim commits as numbered upstream Vim patches.
+
+For patches intended for Vim upstream, use its strict format. The subject
+line is a one-sentence **problem statement**, not a description of the fix:
 
     patch 9.2.NNNN: short description of the problem
 
@@ -92,7 +163,7 @@ one-sentence **problem statement**, not a description of the fix:
     Co-authored-by: Name
     Signed-off-by: Author Name <email>
 
-Rules:
+Rules for upstream submissions:
 
 - **Subject line states the problem**, not the solution. "fix typo" is
   wrong; "typo in foo() causes OOB read" is right.
@@ -112,7 +183,11 @@ Rules:
   also have their own Signed-off-by.
 - **`Assisted-by:` is required** when AI was used.
 
-## C code conventions
+## Existing C code conventions
+
+Apply these conventions to inherited C files. They do not impose Vim's legacy
+language restrictions or naming rules on new C++ components. Preserve local
+style unless the task explicitly changes it.
 
 - **Indentation is 4 spaces per level.** Existing files use tabs with
   `ts=8 sts=4 sw=4 noet` (set by the modeline in the file),
@@ -137,12 +212,9 @@ Rules:
   adopted them. Match the surrounding code.
 - **Custom types end in `_T`** (e.g., `buf_T`, `linenr_T`, `pos_T`).
   Never use `_t` — it collides with POSIX typedefs.
-- **C language is C95 plus specific C99 features**: `//` comments,
-  mixed declarations and statements, `__func__`, `bool`/`_Bool`,
-  variadic macros, compound literals, `static inline`, trailing enum
-  commas. Do not reach for later C standards — Vim still must build
-  with Compaq C on OpenVMS. See `*assumptions-C-compiler*` in
-  `develop.txt` for the full list.
+- Keep inherited C sources compiled as C during Plan 0. Match the surrounding
+  code instead of doing unrelated language conversions. Xim does not require
+  Compaq C, OpenVMS, or upstream's C95 compatibility limits.
 - **`bool` / `true` / `false` are acceptable.** Vim is transitioning
   from `int` with `TRUE`/`FALSE` to C99 `bool`. Do not "fix" `bool`
   back to `int`. Within a single patch, be consistent — don't mix
@@ -180,21 +252,32 @@ Rules:
 | `isspace()`   | `vim_isspace()`        | Handles bytes > 127         |
 | `iswhite()`   | `vim_iswhite()`        | TRUE only for tab and space |
 
-Further rules, not spelled out here, live in `runtime/doc/develop.txt`:
+Use `runtime/doc/develop.txt` for inherited C style. Apply the references here
+within that scope, not as portability requirements for new Xim code:
 
 - `*style-names*` — reserved name patterns (`is*`, `to*`, `str*`, `mem*`,
-  `wcs*`, `.*_t`, `__.*`), forbidden identifiers (`delete`, `this`, `new`,
-  `time`, `index`), and the 31-character function-name limit.
+  `wcs*`, `.*_t`, `__.*`) and inherited naming conventions. The historical
+  31-character function-name limit does not apply to Xim.
 - `*style-spaces*`, `*style-examples*` — spacing and one-statement-per-line.
 - `*style-various*` — `FEAT_` feature prefix, uppercase `#define`,
   `#ifdef HAVE_X` rather than `#if HAVE_X`, no `'\"'`.
-- `*assumptions-makefiles*` — POSIX.1-2001 `make` only in the main
-  Makefiles (no `%` rules, `:=`, `.ONESHELL`, GNU conditionals).
+- `*assumptions-makefiles*` — guidance for inherited reference Makefiles only.
+  New build work uses CMake/Ninja, not these Makefile restrictions.
 - Vim uses `char_u` instead of `char` type
 - Vim uses the macros `STRLEN`, `STRCPY`, `STRCMP`, `STRCAT` that work
   with the `char_u` type.
 - `*style-clang-format*` — `sign.c` and `sound.c` are formatted with
   `clang-format`; re-run it after editing those files.
+
+## New C++ components
+
+- Use the selected modern C++ mode and supported Clang features.
+- Use clear ownership and RAII for resources. Preserve allocator contracts at
+  existing C boundaries.
+- Match project formatting. Do not copy C-only wrapper and naming requirements
+  into C++ without a reason.
+- Keep language migration separate from behavior changes. Add correctness
+  tests and performance measurements for each migration step.
 
 ## Vim9 script conventions (in tests and runtime files)
 
@@ -275,20 +358,16 @@ reference. Key conventions:
 - **Language**: gender-neutral language is preferred for new or updated
   text; existing wording does not need to be rewritten for this alone.
 
-## Release policy
+## Compatibility and release scope
 
-Vim alternates between development cycles and stability periods — see
-`runtime/doc/develop.txt` `*design-policy*`.
+Xim does not inherit Vim's stability periods or release restrictions.
 
-- **During a stability period** only clear bug fixes, security fixes,
-  documentation updates, translations, and runtime file updates are
-  accepted. No new features, no backwards-incompatible changes.
-- **Once released in a minor version**, C-core features must stay
-  backwards-compatible. Runtime files have a bit more flexibility so
-  their maintainers can correct old behavior.
-- **Deprecated features** stay reachable via config (do not hard-error),
-  are documented as deprecated, can be disabled at compile time, and
-  may be removed in a later cycle.
+- Preserve existing behavior during Plan 0.
+- For later architecture changes, support Vimscript and plugins on a
+  best-effort basis. Define the compatibility boundary through tests.
+- Preserve Vim colorscheme support as part of the product direction.
+- Document compatibility gaps and user-visible changes. Do not claim complete
+  Vim compatibility.
 
 ## Security
 
@@ -298,9 +377,10 @@ the disclosure process described there.
 
 ## Before submitting
 
-1. Commit message follows the format above.
+1. Commit message uses the appropriate Xim or upstream format.
 2. All modified code compiles without new warnings.
 3. Tests pass, and new functionality has regression tests.
+   Build and migration changes also have comparable performance results.
 4. Documentation is updated for user-visible changes.
 5. Signed-off-by is present.
 6. Diff contains only changes relevant to the stated problem —

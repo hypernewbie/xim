@@ -9,6 +9,9 @@
 
 #define EXTERN
 #include "vim.h"
+#ifdef XIM_NATIVE_ENTRY
+# include "xim_input.h"
+#endif
 
 #ifdef __CYGWIN__
 # include <cygwin/version.h>
@@ -105,6 +108,9 @@ main
      * Do any system-specific initialisations.  These can NOT use IObuff or
      * NameBuff.  Thus emsg2() cannot be called!
      */
+#  ifdef XIM_NATIVE_ENTRY
+    xim_prepare_args(&argc, &argv);
+#  endif
     mch_early_init();
 
 #  ifdef MSWIN
@@ -220,6 +226,10 @@ main
      * argument list "global_alist".
      */
     command_line_scan(&params);
+#  ifdef XIM_NATIVE_ENTRY
+    if (exmode_active || silent_mode || !params.want_full_screen)
+        xim_native_mode = FALSE;
+#  endif
     TIME_MSG("parsing arguments");
 
     /*
@@ -431,6 +441,10 @@ main
 	p_lpl = FALSE;
 
     // Execute --cmd arguments.
+#  ifdef XIM_NATIVE_ENTRY
+    if (xim_native_mode)
+        xim_initialize();
+#  endif
     exe_pre_commands(&params);
 
     // Source startup scripts.
@@ -991,6 +1005,14 @@ vim_main2(void)
     /*
      * Call the main command loop.  This never returns.
      */
+# ifdef XIM_NATIVE_ENTRY
+    if (xim_native_mode)
+    {
+        restart_edit = 0;
+        need_start_insertmode = FALSE;
+        State = MODE_INSERT;
+    }
+# endif
     main_loop(FALSE, FALSE);
 
 #endif // NO_VIM_MAIN
@@ -1654,6 +1676,13 @@ main_loop(
 	 * If we're invoked as ex, do a round of ex commands.
 	 * Otherwise, get and execute a normal mode command.
 	 */
+#ifdef XIM_NATIVE_ENTRY
+        if (xim_native_mode && !cmdwin && !noexmode && !exmode_active)
+        {
+            xim_step();
+            continue;
+        }
+#endif
 	if (exmode_active)
 	{
 	    if (noexmode)   // End of ":global/path/visual" commands

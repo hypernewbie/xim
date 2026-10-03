@@ -1,7 +1,8 @@
 # CMake build and validation
 
-Xim uses out-of-tree CMake/Ninja builds with Clang and Clang++. CMake 3.25 or
-later is required. Configure, build, and run the registered unit tests with:
+Xim uses out-of-tree CMake/Ninja builds with Clang and Clang++ 19 or newer.
+CMake 3.25 or later and Python 3.10 or later are required. Configure, build,
+and run the registered unit tests with:
 
 ```sh
 cmake --preset default
@@ -12,6 +13,24 @@ ctest --preset default
 The default preset uses Huge features and RelWithDebInfo. CMake checks the
 host's dependencies, requires Clang's C++26 mode, and uses libc++ when its
 compile, link, and run probe succeeds. Inherited `.c` files remain C sources.
+
+For clean-source acceptance, run:
+
+```sh
+python3 cmake/check_clean_build.py --source . --work build/clean-check
+```
+
+This copies tracked working-tree sources, builds without inherited generated
+headers, runs unit tests, and checks Ninja's header dependencies. The core and
+its consumers share `-Wall` and the reference macro policy. `:version` reports
+the selected configuration; `compile_commands.json` and
+`ninja -C build/default -t commands vim` contain the actual commands.
+Before new files are tracked, supply their relative paths or globs with
+repeated `--include` arguments. Other untracked files are excluded.
+
+Use short build and runtime paths for inherited screen/socket tests. Unix
+socket paths have a platform length limit, and some command-line screen tests
+assume that the expanded runtime path fits in their terminal width.
 
 ## Vim-script suite
 
@@ -42,7 +61,41 @@ cmake --build --preset asan --parallel
 ctest --preset asan
 ```
 
-## Performance comparison
+## Native editor
+
+The build produces `build/default/src/xim` and stages its matching runtime
+under `build/default/runtime`. Run `xim file.txt` from any working directory.
+Use `xim --vim` for compatibility mode. Native startup loads configuration
+only when explicitly requested with `-u`. See `runtime/doc/xim.txt` and
+`cmake/XIM_INPUT.md` for the shortcuts and scripting boundary.
+
+Run native correctness checks with Python 3.10 or newer:
+
+```sh
+ctest --test-dir build/default -L xim_native --output-on-failure
+python3 cmake/benchmark_xim.py --native build/default/src/xim \
+    --reference src/vim --work build/default/Testing/latency \
+    --runs 60 --output temp/XIM_PLAN1_PERF.json
+```
+
+The native benchmark uses real Xim shortcuts, buffer-content assertions,
+editor-assembled completion markers, and redraw before acknowledgment.
+Each round alternates reference/native order. Command-UI entry compares the
+native palette with Vim's Ex prompt; those are different available interfaces.
+The Vim reference enables the same syntax defaults, status-area height and
+exclusive selection. It loads no user plugins. Earlier minimal-reference
+startup samples did not enable syntax and are not equivalent configurations.
+See `cmake/PLAN0_CLOSEOUT.md` for the pre-implementation native budgets.
+See `cmake/PLAN1_VALIDATION.md` for the implementation's test, theme and
+performance evidence, including the recorded full-suite rerun.
+Use `--self-test --runs 1` to check delayed completion. `--startup-log PATH`
+records a native startup trace for the first sample. For an instrumented
+Clang profiling build, use `-pg -DWE_ARE_PROFILING` for C and C++ and `-pg`
+at link time. Supply `--profile-dir PATH` to preserve gprof data; quit is
+orderly in that mode. Instrumented timings are diagnostic, not acceptance
+numbers. Inspect them with `gprof -p BINARY PATH/*.gmon`.
+
+## Compatibility performance comparison
 
 Build the inherited reference with `make CC=clang` from `src/`, then build the
 CMake candidate with the default preset. Compare both binaries with the same
@@ -59,8 +112,12 @@ python3 cmake/benchmark_vim.py \
 ```
 
 The script alternates binary order and reports median and 90th-percentile
-latency for process startup/exit, first buffer paint, scrolling to the last
-line, and a visible insert. It generates its fixture in a temporary directory,
+latency for process startup/exit, first buffer paint, the first accepted edit,
+scrolling to the last line, and a completed insert/redraw. It validates edited
+buffer contents and uses markers assembled by the editor, which cannot appear
+in echoed input. Interaction timers start before input is sent. Run
+`--self-test --runs 1` to verify a one-second delayed completion. Earlier edit
+measurements with echoed markers are invalid. It generates a temporary fixture,
 uses a clean Vim configuration in a 24-by-100 `xterm-256color` PTY, and prints
 JSON results. Confirm both binaries report the same feature flags before you
 compare them. The script does not flush the filesystem cache; compare runs made

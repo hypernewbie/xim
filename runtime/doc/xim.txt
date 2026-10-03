@@ -1,0 +1,124 @@
+*xim.txt*	Native non-modal terminal editing
+					Last change: 2026 Oct 03
+
+Xim's native input layer uses the existing Vim text engine.  This document
+describes the first native editing milestone.
+
+==============================================================================
+1. Starting Xim						*xim-start*
+
+Run `xim file.txt` to open a file and type immediately.  Escape cancels a
+prompt or selection.  It does not switch to Vim Normal mode.
+
+Native startup does not load your vimrc, gvimrc, plugins, or viminfo.  To load
+a configuration explicitly, use `xim -u path/to/config.vim`.  There is no
+implicit Xim configuration file in this milestone.  Native defaults are set
+before explicit configuration and --cmd arguments.
+
+The build stages its matching runtime alongside the executable.  An installed
+build uses share/xim/runtime relative to its installation prefix.  A nonempty
+VIMRUNTIME environment variable overrides runtime discovery.
+
+Use `xim --vim` or the `vim` executable for the inherited modal interface.
+Ex-mode and silent script invocations use the inherited dispatch path.
+
+==============================================================================
+2. Editing							*xim-keys*
+
+Printable keys insert text.  Enter inserts a newline; Tab inserts a tab.
+Backspace and Delete remove text and join lines at a line boundary.  Arrow
+keys move by characters or logical lines.  Home/End move to the start/end of
+the current line.  PageUp/PageDown scroll a page.  Wrapped-line movement
+remains logical-line movement.
+
+Shift plus an arrow, Home, or End extends an exclusive selection.  Typing
+replaces the selection.  Escape cancels selection without moving the cursor.
+Ctrl-A selects the buffer.  Selection is characterwise, including newlines.
+
+Command		Shortcut	Fallback ~
+Save		Ctrl-S		F4 or palette: Save
+Save as		Ctrl-Shift-S	palette: Save as
+Open		Ctrl-O		F5 or palette: Open
+Close buffer	Ctrl-W		palette: Close
+Quit		Ctrl-Q		F12 or palette: Quit
+Select all	Ctrl-A		palette: Select all
+Copy		Ctrl-C		F6 or palette: Copy
+Cut		Ctrl-X		F7 or palette: Cut
+Paste		Ctrl-V		F8 or palette: Paste
+Undo		Ctrl-Z		F9 or palette: Undo
+Redo		Ctrl-Y		F10 or palette: Redo
+Find		Ctrl-F		F11 or palette: Find
+Next match	Ctrl-N		F3 or palette: Next match
+Previous match	Ctrl-B		Shift-F3 or palette: Previous match
+Command palette	Ctrl-P		F1 or F2
+
+The palette filters command names by case-insensitive substring.  Up/Down
+select a command; Enter runs it.  The list scrolls to keep the selection in
+view.  Open, Save as, and Find accept text at the bottom of the screen.  Enter
+accepts; Escape cancels.  Find uses literal text and follows the buffer's
+existing case and wrap-search options.
+
+Save on an unnamed buffer opens Save as.  Open, Close, and Quit protect
+modified buffers with Save, Discard, and Cancel choices.  Quit checks all
+buffers.  Failed writes retain the modified text and report the error.  A
+failed confirmation save keeps Save, Discard, and Cancel available.  Save as
+refuses to overwrite an existing file; an explicitly requested Ex command
+can apply the inherited write policy.
+
+Typing is grouped into undo entries of at most 256 characters.  Newlines,
+movement and commands end a typing group.  Paste and selection replacement
+have a single undo boundary.  Bracketed paste retains literal tabs, newlines,
+and text without applying mappings or indentation rules.
+
+==============================================================================
+3. Terminal and clipboard support				*xim-terminal*
+
+The tested native target is Linux with UTF-8 and xterm-compatible terminal
+key sequences, including xterm-256color and bracketed paste.  The existing
+decoder handles supported terminal protocols; native dispatch receives its
+decoded characters, special keys, and Shift/Ctrl/Alt modifiers.
+
+Xim disables terminal Ctrl-S/Ctrl-Q flow control in native raw mode.  A
+terminal or multiplexer can still intercept shortcuts before Xim receives
+them.  Ctrl-Shift-S is indistinguishable from Ctrl-S on many terminals; use
+the palette in that case.  Unrecognized keys are ignored.  Mouse editing,
+Alt shortcuts, and platform-specific GUI input are outside this milestone.
+
+Copy and cut require a selection.  Xim keeps an internal text clipboard when
+the inherited '+' clipboard is unavailable.  When '+' is available, Xim uses
+the engine's configured X11 or Wayland clipboard path.  Native startup does
+not load a clipboard-provider plugin.  No new OSC 52 transport is provided.
+Copy uses register x as an engine scratch register.  NUL-containing binary
+clipboard/paste payloads are not part of the native text-input contract.
+
+==============================================================================
+4. Themes and scripting					*xim-compatibility*
+
+Vimscript evaluation, buffer APIs, Ex commands and Vim colorschemes remain
+available.  Choose Ex command in the palette to enter an Ex command without
+leaving native editing.  Explicit -u files and --cmd/-c commands can set
+options, define functions and autocommands, or load a colorscheme.
+
+Native selection reuses Visual highlighting.  The native interface defines
+these default links, which follow a colorscheme's target groups: >vim
+	hi default link XimStatus StatusLine
+	hi default link XimPrompt Pmenu
+	hi default link XimPalette Pmenu
+	hi default link XimPaletteSel PmenuSel
+<
+Users can override these groups.  Shipped themes tested include default,
+desert, slate, habamax and catppuccin.  Two local third-party Phi themes,
+phi_canary and phi_copper, were tested with 'termguicolors'.  This sample
+does not establish support for every Vim or Neovim theme.
+
+The native layer uses Insert state for engine cursor bounds, but it does
+not run the inherited edit() loop.  Modal mappings, abbreviation/completion
+hooks, InsertEnter/InsertLeave, TextChangedI and CursorMovedI behavior are
+not guaranteed.  The top-level loop still sends deferred TextChanged and
+CursorMoved events.  Plugins that rely on modal UI state need compatibility
+mode.  Ex commands that open inherited modal UI are best-effort interfaces.
+
+Editor-state mutation stays on the main thread.  The command/input boundary
+does not expose Vim globals to future background workers.
+
+vim:tw=78:ts=8:noet:ft=help:norl:

@@ -175,9 +175,13 @@ ui_inchar(
 
 	// ... there is no need for CTRL-C to interrupt something, don't let
 	// it set got_int when it was mapped.
-	if ((mapped_ctrl_c | curbuf->b_mapped_ctrl_c) & get_real_state())
+	if (xim_native_mode
+		|| ((mapped_ctrl_c | curbuf->b_mapped_ctrl_c) & get_real_state()))
 	    ctrl_c_interrupts = FALSE;
     }
+
+	if (xim_native_mode)
+	    ctrl_c_interrupts = FALSE;
 
     /*
      * Here we call gui_inchar() or mch_inchar(), the GUI or machine-dependent

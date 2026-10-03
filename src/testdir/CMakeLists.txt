@@ -19,6 +19,17 @@ if(NOT XVFB_RUN)
         "Install xvfb to enable them.")
 endif()
 
+if(TARGET xim)
+    add_test(NAME xim_native_screens
+        COMMAND ${CMAKE_COMMAND} -E env XIM_BINARY=$<TARGET_FILE:xim>
+            ${CMAKE_SOURCE_DIR}/cmake/run_vim_tests.sh
+            $<TARGET_FILE:vim> ${CMAKE_BINARY_DIR}/runtime
+            ${CMAKE_CURRENT_SOURCE_DIR} test_xim_native
+            ${CMAKE_BINARY_DIR}/Testing $<TARGET_FILE:xxd>
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Testing)
+    set_tests_properties(xim_native_screens PROPERTIES LABELS "xim_native" TIMEOUT 120)
+endif()
+
 # ----------------------------------------------------------------------------
 # Smoke test — runs a representative single test file in seconds.
 # ----------------------------------------------------------------------------

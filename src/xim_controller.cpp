@@ -273,12 +273,21 @@ extern "C" void xim_dispatch(int key, int modifiers)
                 if (!list.empty())
                 {
                     auto item = list[selected % list.size()];
+                    // Out-of-root file picker results carry a "> " marker.
+                    // Strip it before opening the absolute path verbatim.
+                    std::string item_str(item);
+                    bool out_of_root = false;
+                    if (item_str.size() > 2 && item_str.compare(0, 2, "> ") == 0)
+                    {
+                        out_of_root = true;
+                        item_str.erase(0, 2);
+                    }
                     if (current == Action::buffers)
-                        xim_engine_command("buffer", item.c_str(), 0);
+                        xim_engine_command("buffer", item_str.c_str(), 0);
                     else if (current == Action::explorer)
                     {
                         char *path = nullptr;
-                        xim_project_explorer_activate(item.c_str(), &path);
+                        xim_project_explorer_activate(item_str.c_str(), &path);
                         if (path != nullptr)
                         {
                             std::unique_ptr<char, decltype(&xim_project_free)> guard(
@@ -289,7 +298,8 @@ extern "C" void xim_dispatch(int key, int modifiers)
                             prompt = current;
                     }
                     else
-                        protect(Action::open, item);
+                        protect(Action::open, item_str);
+                    (void)out_of_root;
                 }
                 else
                     prompt = current;

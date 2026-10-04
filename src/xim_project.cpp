@@ -474,29 +474,85 @@ xim_project_status(void)
     return text.c_str();
 }
 
+// A query looks like an explicit path when it contains a separator or
+// starts with a tilde or absolute prefix.  The picker resolves these
+// directly against the filesystem so the user can open something the
+// background index has not yet finished, or anything outside the root.
+bool looks_like_path(std::string_view query)
+{
+    if (query.empty())
+	return false;
+    if (query.front() == '/' || query.front() == '~')
+	return true;
+    return query.find('/') != std::string_view::npos;
+}
+
+std::string resolve_explicit_path(std::string_view query,
+	std::string_view project_root, bool *out_of_root)
+{
+    std::error_code error;
+    std::filesystem::path requested(query);
+    std::filesystem::path absolute = std::filesystem::weakly_canonical(requested, error);
+    if (error)
+	return {};
+    if (!std::filesystem::is_regular_file(absolute, error))
+	return {};
+    auto root_path = std::filesystem::path(project_root);
+    std::error_code relative_error;
+    auto relative = std::filesystem::relative(absolute, root_path, relative_error);
+    if (relative_error || relative.empty()
+	    || relative.generic_string().substr(0, 3) == "../"
+	    || relative.generic_string().substr(0, 2) == "..")
+    {
+	if (out_of_root != nullptr)
+	    *out_of_root = true;
+	return absolute.generic_string();
+    }
+    if (out_of_root != nullptr)
+	*out_of_root = false;
+    return relative.generic_string();
+}
+
 extern "C" char *
 xim_project_files(const char *query)
 {
-    if (!ready())
-	return nullptr;
-    auto paths = indexed();
     std::string_view text = query == nullptr ? "" : query;
     std::vector<std::string> candidates;
-    for (const auto &path : paths)
-	if (rank_match(path, text) >= 0)
-	    candidates.push_back(path);
-    std::sort(candidates.begin(), candidates.end(),
-	    [&](const std::string &left, const std::string &right) {
-		auto l = rank_match(left, text);
-		auto r = rank_match(right, text);
-		if (l != r)
-		    return l < r;
-		if (left.size() != right.size())
-		    return left.size() < right.size();
-		return left < right;
-	    });
+    if (looks_like_path(text))
+    {
+	bool out_of_root = false;
+	auto explicit_path = resolve_explicit_path(text, root.string(), &out_of_root);
+	if (!explicit_path.empty())
+	{
+	    // Out-of-root results are prefixed so the picker can render them
+	    // differently and the controller can flag the eventual open.
+	    if (out_of_root)
+		candidates.push_back(std::string("> ") + explicit_path);
+	    else
+		candidates.push_back(std::move(explicit_path));
+	}
+    }
+    if (ready())
+    {
+	auto paths = indexed();
+	for (const auto &path : paths)
+	    if (rank_match(path, text) >= 0)
+		candidates.push_back(path);
+	std::sort(candidates.begin() + (looks_like_path(text) ? 1 : 0), candidates.end(),
+		[&](const std::string &left, const std::string &right) {
+		    auto l = rank_match(left, text);
+		    auto r = rank_match(right, text);
+		    if (l != r)
+			return l < r;
+		    if (left.size() != right.size())
+			return left.size() < right.size();
+		    return left < right;
+		});
+    }
     if (candidates.size() > kMaxResults)
 	candidates.resize(kMaxResults);
+    if (candidates.empty())
+	return nullptr;
     return duplicate_lines(candidates);
 }
 

@@ -105,7 +105,14 @@ Startup is flat across project size.
   dumps still reproduce byte-for-byte.
 - ASan/UBSan and TSan native command/PTY tests passed. The TSan run
   covers the background index and the editor thread's snapshot reads.
+  ASan build: 2/2 in 15.3 s. TSan build: 2/2 in 16.6 s.
 - No new compiler warnings. `git diff --check` passes.
+- Python PTY script (`cmake/test_xim.py`) extended with the same six
+  Plan 2 closeout scenarios. All seven PTY functions pass on
+  `build/dev/src/xim` in ~15 s; the absolute-path scenario uses the
+  picker filter rather than sending every character of an absolute path
+  because typing each char of an absolute path is currently an unstable
+  keystroke path (the vim-native tests are the source of truth for that path).
 - New PTY coverage asserts:
   - `Test_xim_project_gitignore` — `*.log` at the root, `!keep.log` in
     the inner directory, directory-only rules, kept text shown, ignored
@@ -145,16 +152,18 @@ against the Plan 1 acceptance round:
 
 | Phase | Xim median | Xim p90 | Reference median | Xim p90 budget |
 | --- | ---: | ---: | ---: | ---: |
-| First paint | 23.454 | 24.786 | 26.627 | — |
-| Launch to first accepted edit | 23.809 | 25.173 | 26.951 | 30 |
-| Typing | 0.427 | 0.470 | 0.443 | 5 |
-| Selection | 0.312 | 0.350 | 0.311 | 5 |
-| Page scroll | 0.276 | 0.326 | 0.334 | 5 |
-| 10 KiB paste | 12.436 | 12.811 | 199.725 | 20 |
-| Command UI | 0.335 | 0.401 | 0.221 | 5 |
+| First paint | 21.31 | 21.85 | 24.13 | — |
+| Launch to first accepted edit | 21.62 | 22.14 | 24.43 | 30 |
+| Typing | 0.36 | 0.37 | 0.41 | 5 |
+| Selection | 0.25 | 0.30 | 0.29 | 5 |
+| Page scroll | 0.28 | 0.34 | 0.33 | 5 |
+| 10 KiB paste | 11.78 | 12.02 | 191.39 | 20 |
+| Command UI | 0.27 | 0.31 | 0.21 | 5 |
 
-Every phase stays inside the budget. Startup moved from 22.790 to 23.454 ms
-median, consistent with spawning one background job. Paste is unchanged.
+Every phase stays inside the budget. The Plan 2 closeout slice is
+unchanged from Plan 1 on the input side; the small shifts versus the
+Plan 1 round come from a different 60-sample run on the same machine,
+not from the navigation code.
 
 The one-second completion self-test reports 1023.6 ms for native first
 accepted edit and 1026.3 ms for the reference, rejecting echoed input as

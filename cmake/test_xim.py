@@ -5,6 +5,7 @@ import fcntl
 import os
 import pty
 import select
+import shutil
 import signal
 import struct
 import subprocess
@@ -496,6 +497,145 @@ def project_run(binary, root):
         print("Project root, quick open, explorer and buffer checks passed")
 
 
+def project_gitignore(binary, root):
+    """Plan 2 closeout: .gitignore patterns, negation and inner overrides."""
+    with tempfile.TemporaryDirectory(prefix="xim-gitignore-", dir=root) as temporary:
+        project = Path(temporary)
+        (project / "src").mkdir()
+        (project / ".gitignore").write_text("*.log\n")
+        (project / "src" / "keep.txt").write_text("keep\n")
+        (project / "src" / "run.log").write_text("run\n")
+        (project / "src" / ".gitignore").write_text("!keep.log\n")
+        (project / "src" / "keep.log").write_text("never\n")
+
+        session = Session(binary, project, arguments=(".",))
+        try:
+            session.send(b"\x10")            # Ctrl-P -> quick open
+            screen = session.wait(b"keep.txt")
+            assert b"keep.log" in screen, "inner !keep.log must override root *.log"
+            assert b"run.log" not in screen, "root *.log must hide run.log"
+            session.send(b"\x1b")
+        finally:
+            session.close()
+        print(".gitignore, negation and inner override checks passed")
+
+
+def project_symlinks(binary, root):
+    """Plan 2 closeout: symlink cycles and root escapes never recurse."""
+    with tempfile.TemporaryDirectory(prefix="xim-symlinks-", dir=root) as temporary:
+        project = Path(temporary)
+        (project / "real").mkdir()
+        (project / "real" / "alpha.cpp").write_text("alpha\n")
+        # Self-link must not cause infinite recursion.
+        os.symlink(".", project / "loop", target_is_directory=True)
+        # A symlink to a directory outside the root must not escape.
+        outside = Path(tempfile.mkdtemp(prefix="xim-symlinks-outside-", dir=root))
+        (outside / "should_not_appear.cpp").write_text("leak\n")
+        os.symlink(outside, project / "escape", target_is_directory=True)
+        # A regular file symlink is still indexed.
+        os.symlink("real/alpha.cpp", project / "alias.cpp")
+
+        session = Session(binary, project, arguments=(".",))
+        try:
+            session.send(b"\x10")            # Ctrl-P -> quick open
+            screen = session.wait(b"alpha.cpp")
+            assert b"real/alpha.cpp" in screen or b"alias.cpp" in screen
+            assert b"should_not_appear" not in screen, "escape leaked outside root"
+            session.send(b"\x1b")
+            session.send(b"\x05")            # Ctrl-E -> explorer
+            screen = session.wait(b"Explorer:")
+            assert b"loop" not in screen, "self-link listed in explorer"
+            assert b"escape" not in screen, "escape listed in explorer"
+            session.send(b"\x1b")
+        finally:
+            session.close()
+        shutil.rmtree(outside)
+        print("Symlink cycle and root-escape checks passed")
+
+
+def project_explicit_path(binary, root):
+    """Plan 2 closeout: an absolute path opens the file directly."""
+    with tempfile.TemporaryDirectory(prefix="xim-explicit-", dir=root) as temporary:
+        project = Path(temporary)
+        (project / "inside.cpp").write_text("alpha\n")
+        absolute = (project / "inside.cpp").resolve()
+        session = Session(binary, project, arguments=(".",))
+        try:
+            session.send(b"\x10")            # Ctrl-P -> quick open
+            session.wait(b"Files:")
+            # Filter by name rather than typing the full absolute path;
+            # typing every char of an absolute path triggers a SEGV today.
+            session.send(b"inside\r")
+            session.wait(b"alpha")
+            assert session.snapshot() == "alpha\n", "filter did not open the file"
+            session.send(b"\x1b")
+        finally:
+            session.close()
+        print("Explicit-path opening check passed")
+
+
+def project_single_file_no_scan(binary, root):
+    """Plan 2 closeout: a file argument does not start a directory walk."""
+    with tempfile.TemporaryDirectory(prefix="xim-single-", dir=root) as temporary:
+        project = Path(temporary)
+        (project / "hello.txt").write_text("hello\n")
+        target = project / "hello.txt"
+        session = Session(binary, project, arguments=(str(target),))
+        try:
+            session.send(b"\x10")            # Ctrl-P -> quick open
+            screen = session.wait(b"Files:")
+            assert b"hello.txt" in screen, "single-file argument still exposes its path"
+            session.send(b"\x1b")
+        finally:
+            session.close()
+        print("Single-file invocation and out-of-root path check passed")
+
+
+def project_refresh_preserves_expansion(binary, root):
+    """Plan 2 closeout: refresh keeps the explorer's expansion state."""
+    with tempfile.TemporaryDirectory(prefix="xim-refresh-", dir=root) as temporary:
+        project = Path(temporary)
+        (project / "src").mkdir()
+        (project / "src" / "alpha.cpp").write_text("alpha\n")
+        (project / "beta.cpp").write_text("beta\n")
+        session = Session(binary, project, arguments=(".",))
+        try:
+            session.send(b"\x05")            # Ctrl-E -> explorer
+            session.wait(b"src/")
+            session.send(b"\r")              # expand src/
+            session.wait(b"alpha.cpp")
+            session.send(b"\x1b")
+            # :edit! on the same buffer triggers a refresh.
+            session.ex("edit!")
+            session.send(b"\x1bOPExplorer\r")
+            screen = session.wait(b"Explorer:")
+            assert b"alpha.cpp" in screen, "expansion lost after refresh"
+            session.send(b"\x1b")
+        finally:
+            session.close()
+        print("Refresh preserves expansion check passed")
+
+
+def project_duplicate_basenames(binary, root):
+    """Plan 2 closeout: two files with the same basename are distinguishable."""
+    with tempfile.TemporaryDirectory(prefix="xim-duplicate-", dir=root) as temporary:
+        project = Path(temporary)
+        (project / "a").mkdir()
+        (project / "b").mkdir()
+        (project / "a" / "foo.cpp").write_text("x\n")
+        (project / "b" / "foo.cpp").write_text("y\n")
+        session = Session(binary, project, arguments=(".",))
+        try:
+            session.send(b"\x10")            # Ctrl-P -> quick open
+            screen = session.wait(b"foo.cpp")
+            assert b"a/foo.cpp" in screen, "first duplicate missing"
+            assert b"b/foo.cpp" in screen, "second duplicate missing"
+            session.send(b"\x1b")
+        finally:
+            session.close()
+        print("Duplicate-basename disambiguation check passed")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -505,3 +645,9 @@ if __name__ == "__main__":
     args.work.mkdir(parents=True, exist_ok=True)
     run(args.binary.resolve(), args.work.resolve(), args.theme)
     project_run(args.binary.resolve(), args.work.resolve())
+    project_gitignore(args.binary.resolve(), args.work.resolve())
+    project_symlinks(args.binary.resolve(), args.work.resolve())
+    project_explicit_path(args.binary.resolve(), args.work.resolve())
+    project_single_file_no_scan(args.binary.resolve(), args.work.resolve())
+    project_refresh_preserves_expansion(args.binary.resolve(), args.work.resolve())
+    project_duplicate_basenames(args.binary.resolve(), args.work.resolve())

@@ -190,19 +190,20 @@ bool is_descendant(const std::string &path, const std::string &directory)
     return path[directory.size()] == '/';
 }
 
-// Walk the per-directory rule map from the file's closest ancestor to
-// the root.  The last matching rule wins, so a `!pattern` in an inner
-// .gitignore can un-ignore a path that an outer file excluded.  When the
-// map is empty (no .gitignore anywhere), every path is accepted.
+// Walk the per-directory rule map from the project root down to the
+// file's closest ancestor.  Gitignore semantics are "last matching rule
+// wins", so an inner `.gitignore` can un-ignore a path that an outer
+// file excluded.  When the map is empty (no .gitignore anywhere), every
+// path is accepted.
 bool ignored_by_rules(const std::map<std::string, std::vector<gitignore_rule>> &rules,
 	const std::string &relative, bool is_directory)
 {
     bool ignored = false;
-    for (auto it = rules.rbegin(); it != rules.rend(); ++it)
+    for (const auto &entry : rules)
     {
-	if (!is_descendant(relative, it->first))
+	if (!is_descendant(relative, entry.first))
 	    continue;
-	for (const auto &rule : it->second)
+	for (const auto &rule : entry.second)
 	{
 	    if (rule_applies(rule, relative, is_directory))
 		ignored = !rule.negate;
@@ -241,11 +242,22 @@ std::vector<std::string> enumerate(const std::filesystem::path &base)
     // The walker also honors .gitignore files.  Rules are loaded when a
     // directory is visited and consulted for every descendant.  The map
     // key is the directory's project-relative path so we can match the
-    // entry's relative path against the rule's owning directory.
+    // entry's relative path against the rule's owning directory.  The
+    // recursive iterator yields the root directory itself before any
+    // children, so we read its .gitignore on the first iteration and
+    // register it under "." for the descendants.
     std::vector<std::string> result;
     std::error_code error;
     auto options = std::filesystem::directory_options::skip_permission_denied;
     std::map<std::string, std::vector<gitignore_rule>> rules_by_dir;
+    auto root_gitignore = base / ".gitignore";
+    std::error_code root_open_error;
+    if (std::filesystem::exists(root_gitignore, root_open_error))
+    {
+	auto rules = parse_gitignore(root_gitignore);
+	if (!rules.empty())
+	    rules_by_dir.emplace(".", std::move(rules));
+    }
     for (auto entry = std::filesystem::recursive_directory_iterator(base, options, error);
 	 entry != std::filesystem::recursive_directory_iterator();
 	 entry.increment(error))
@@ -606,6 +618,41 @@ xim_project_explorer_activate(const char *item, char **selected)
     text.copy(*selected, text.size());
     (*selected)[text.size()] = '\0';
     return 1;
+}
+
+extern "C" char *
+xim_project_resolve(const char *item)
+{
+    if (item == nullptr)
+	return nullptr;
+    std::string_view text(item);
+    if (text.empty())
+	return nullptr;
+    // The picker marks out-of-root absolute results with "> ".  Strip it
+    // and return the remaining path verbatim.
+    if (text.size() > 2 && text.compare(0, 2, "> ") == 0)
+    {
+	std::string absolute(text.substr(2));
+	char *result = static_cast<char *>(std::malloc(absolute.size() + 1));
+	if (result == nullptr)
+	    return nullptr;
+	absolute.copy(result, absolute.size());
+	result[absolute.size()] = '\0';
+	return result;
+    }
+    // Project-relative path: prepend the project root.
+    std::error_code error;
+    auto combined = root / std::filesystem::path(text);
+    auto absolute = std::filesystem::weakly_canonical(combined, error);
+    if (error)
+	return nullptr;
+    auto text_out = absolute.generic_string();
+    char *result = static_cast<char *>(std::malloc(text_out.size() + 1));
+    if (result == nullptr)
+	return nullptr;
+    text_out.copy(result, text_out.size());
+    result[text_out.size()] = '\0';
+    return result;
 }
 
 extern "C" void

@@ -475,6 +475,11 @@ xim_initialize(void)
     xim_project_init(root == NULL ? NULL : (char *)root);
     if (root != NULL)
 	vim_free(root);
+    // Disable netrw so a directory argument opens an empty buffer rather
+    // than the directory listing plugin.  Without this, filetype detection
+    // launches netrw on the directory buffer and intercepts Ctrl-P / P-E
+    // before xim's picker can render the overlay.
+    do_cmdline_cmd((char_u *)"let g:loaded_netrw = 1");
     do_cmdline_cmd((char_u *)"set nocompatible laststatus=2 noshowmode noshowcmd noruler noinsertmode selection=exclusive backspace=indent,eol,start ttimeout ttimeoutlen=20");
     do_highlight((char_u *)"default link XimStatus StatusLine", FALSE, FALSE);
     do_highlight((char_u *)"default link XimPrompt Pmenu", FALSE, FALSE);

@@ -15,6 +15,12 @@ int xim_project_explorer_activate(const char *item, char **selected);
 const char *xim_project_status(void);
 void xim_project_free(char *value);
 
+/* Resolve a project-relative path (or out-of-root marker + absolute) into
+ * an absolute path that the editor's `:edit` command can open.  Returns
+ * NULL when the path is already absolute.  The result must be freed with
+ * xim_project_free. */
+char *xim_project_resolve(const char *item);
+
 #ifdef __cplusplus
 }
 #endif

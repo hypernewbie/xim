@@ -5,6 +5,8 @@
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -54,6 +56,161 @@ bool has_ignored_component(const std::string &relative)
     return false;
 }
 
+// A single .gitignore rule.  Lines that start with `!` negate a previous
+// match; a trailing `/` means the rule applies only to directories; an
+// optional leading `/` anchors the rule to the directory the file lives
+// in.  Everything else is a literal basename or component pattern.
+struct gitignore_rule
+{
+    bool negate = false;
+    bool directory_only = false;
+    bool anchored = false;
+    std::string pattern;
+};
+
+std::vector<gitignore_rule> parse_gitignore(const std::filesystem::path &file)
+{
+    std::vector<gitignore_rule> rules;
+    std::ifstream stream(file);
+    if (!stream.is_open())
+	return rules;
+    std::string line;
+    while (std::getline(stream, line))
+    {
+	auto start = line.find_first_not_of(" \t\r");
+	if (start == std::string::npos)
+	    continue;
+	if (line[start] == '#')
+	    continue;
+	auto end = line.find_last_not_of(" \t\r");
+	std::string text = line.substr(start, end - start + 1);
+	gitignore_rule rule;
+	if (!text.empty() && text.front() == '!')
+	{
+	    rule.negate = true;
+	    text.erase(0, 1);
+	}
+	if (!text.empty() && text.back() == '/')
+	{
+	    rule.directory_only = true;
+	    text.pop_back();
+	}
+	if (!text.empty() && text.front() == '/')
+	{
+	    rule.anchored = true;
+	    text.erase(0, 1);
+	}
+	if (text.empty())
+	    continue;
+	rule.pattern = std::move(text);
+	rules.push_back(std::move(rule));
+    }
+    return rules;
+}
+
+// Wildcard match for a single path component.  `*` matches any run of
+// non-separator characters, `?` matches one.  The pattern is otherwise
+// a literal string.  This covers the common case without dragging in a
+// full glob engine.
+bool component_matches(std::string_view pattern, std::string_view component)
+{
+    while (!pattern.empty())
+    {
+	if (pattern.front() == '*')
+	{
+	    pattern.remove_prefix(1);
+	    if (pattern.empty())
+		return true;
+	    while (!component.empty())
+	    {
+		if (component_matches(pattern, component))
+		    return true;
+		component.remove_prefix(1);
+	    }
+	    return false;
+	}
+	if (pattern.front() == '?')
+	{
+	    if (component.empty())
+		return false;
+	    pattern.remove_prefix(1);
+	    component.remove_prefix(1);
+	    continue;
+	}
+	if (component.empty() || pattern.front() != component.front())
+	    return false;
+	pattern.remove_prefix(1);
+	component.remove_prefix(1);
+    }
+    return component.empty();
+}
+
+bool rule_applies(const gitignore_rule &rule,
+	const std::string &relative, bool is_directory)
+{
+    if (rule.directory_only && !is_directory)
+	return false;
+    // Anchored rules that contain a slash are path-relative to the
+    // .gitignore file's directory; supporting them requires knowing the
+    // owning depth.  We accept single-component anchored rules as a
+    // basename match against any component and skip anchored path rules
+    // (recorded as a limitation).  Non-anchored rules match any
+    // component's basename at any depth.
+    if (rule.anchored && rule.pattern.find('/') != std::string::npos)
+	return false;
+    std::string_view remaining(relative);
+    while (!remaining.empty())
+    {
+	std::size_t slash = remaining.find('/');
+	std::string_view component = remaining.substr(0, slash);
+	if (component_matches(rule.pattern, component))
+	    return true;
+	if (slash == std::string_view::npos)
+	    break;
+	remaining.remove_prefix(slash + 1);
+    }
+    return false;
+}
+
+// A path is a descendant of a directory when it starts with that
+// directory plus a separator.  The directory itself is not a descendant
+// of itself; the matching .gitignore applies to its children only.
+// Root is recorded as "."; everything strictly inside root is a
+// descendant of root.
+bool is_descendant(const std::string &path, const std::string &directory)
+{
+    if (directory.empty())
+	return true;
+    if (directory == ".")
+	return path != ".";
+    if (path.size() <= directory.size())
+	return false;
+    if (path.compare(0, directory.size(), directory) != 0)
+	return false;
+    return path[directory.size()] == '/';
+}
+
+// Walk the per-directory rule map from the file's closest ancestor to
+// the root.  The last matching rule wins, so a `!pattern` in an inner
+// .gitignore can un-ignore a path that an outer file excluded.  When the
+// map is empty (no .gitignore anywhere), every path is accepted.
+bool ignored_by_rules(const std::map<std::string, std::vector<gitignore_rule>> &rules,
+	const std::string &relative, bool is_directory)
+{
+    bool ignored = false;
+    for (auto it = rules.rbegin(); it != rules.rend(); ++it)
+    {
+	if (!is_descendant(relative, it->first))
+	    continue;
+	for (const auto &rule : it->second)
+	{
+	    if (rule_applies(rule, relative, is_directory))
+		ignored = !rule.negate;
+	}
+    }
+    return ignored;
+}
+
 int rank_match(const std::string &path, std::string_view query)
 {
     if (query.empty())
@@ -75,9 +232,20 @@ int rank_match(const std::string &path, std::string_view query)
 
 std::vector<std::string> enumerate(const std::filesystem::path &base)
 {
+    // C++17 directory_options does not enable follow_directory_symlink, so
+    // the iterator prunes directory symlinks by default.  This is the
+    // documented policy: cycles stay local, escapes cannot leave the root,
+    // and a self-link fixture is harmless.  Regression coverage lives in
+    // Test_xim_project_symlinks.
+    //
+    // The walker also honors .gitignore files.  Rules are loaded when a
+    // directory is visited and consulted for every descendant.  The map
+    // key is the directory's project-relative path so we can match the
+    // entry's relative path against the rule's owning directory.
     std::vector<std::string> result;
     std::error_code error;
     auto options = std::filesystem::directory_options::skip_permission_denied;
+    std::map<std::string, std::vector<gitignore_rule>> rules_by_dir;
     for (auto entry = std::filesystem::recursive_directory_iterator(base, options, error);
 	 entry != std::filesystem::recursive_directory_iterator();
 	 entry.increment(error))
@@ -88,17 +256,24 @@ std::vector<std::string> enumerate(const std::filesystem::path &base)
 	if (relative_error || relative.empty())
 	    continue;
 	auto text = relative.generic_string();
-	if (has_ignored_component(text))
+	auto is_dir = entry->is_directory(error);
+	if (has_ignored_component(text)
+		|| ignored_by_rules(rules_by_dir, text, is_dir))
 	{
-	    if (entry->is_directory(error))
+	    if (is_dir)
 		entry.disable_recursion_pending();
 	    continue;
 	}
-	if (entry->is_directory(error))
+	if (is_dir)
 	{
-	    // Ignored trees are pruned; every other directory is descended.
-	    if (has_ignored_component(text))
-		entry.disable_recursion_pending();
+	    auto gitignore = entry->path() / ".gitignore";
+	    std::error_code open_error;
+	    if (std::filesystem::exists(gitignore, open_error))
+	    {
+		auto rules = parse_gitignore(gitignore);
+		if (!rules.empty())
+		    rules_by_dir.emplace(text, std::move(rules));
+	    }
 	    continue;
 	}
 	if (entry->is_regular_file(error))
@@ -112,28 +287,47 @@ std::vector<std::string> enumerate(const std::filesystem::path &base)
     return result;
 }
 
-void collect_listing(std::vector<std::string> &out, const std::string &parent, int depth)
+void collect_listing(std::vector<std::string> &out, const std::string &parent,
+	int depth,
+	std::map<std::string, std::vector<gitignore_rule>> &rules_by_dir)
 {
     std::vector<std::pair<bool, std::string>> children;
-std::error_code error;
-auto absolute = parent == "." ? root : root / std::filesystem::path(parent);
-for (auto entry = std::filesystem::directory_iterator(absolute,
+    std::error_code error;
+    auto absolute = parent == "." ? root : root / std::filesystem::path(parent);
+    // The walker calls this once for the project root before expanding
+    // anything, so register the root's .gitignore here as well.  The
+    // recursive enumeration pass already handles descendants; the
+    // explorer needs them too so its visible tree matches the index.
+    if (parent == ".")
+    {
+	std::error_code open_error;
+	auto root_gitignore = root / ".gitignore";
+	if (std::filesystem::exists(root_gitignore, open_error))
+	{
+	    auto rules = parse_gitignore(root_gitignore);
+	    if (!rules.empty())
+		rules_by_dir.emplace(".", std::move(rules));
+	}
+    }
+    for (auto entry = std::filesystem::directory_iterator(absolute,
 		 std::filesystem::directory_options::skip_permission_denied, error);
-     entry != std::filesystem::directory_iterator();
-     entry.increment(error))
-{
-    error.clear();
-    auto relative = std::filesystem::relative(entry->path(), root, error);
-    if (error || relative.empty())
-	continue;
-    auto text = relative.generic_string();
-    if (has_ignored_component(text))
-	continue;
-    if (entry->is_directory(error))
-	children.emplace_back(true, text);
-    else if (entry->is_regular_file(error))
-	children.emplace_back(false, text);
-}
+	 entry != std::filesystem::directory_iterator();
+	 entry.increment(error))
+    {
+	error.clear();
+	auto relative = std::filesystem::relative(entry->path(), root, error);
+	if (error || relative.empty())
+	    continue;
+	auto text = relative.generic_string();
+	auto is_dir = entry->is_directory(error);
+	if (has_ignored_component(text)
+		|| ignored_by_rules(rules_by_dir, text, is_dir))
+	    continue;
+	if (is_dir)
+	    children.emplace_back(true, text);
+	else if (entry->is_regular_file(error))
+	    children.emplace_back(false, text);
+    }
     std::sort(children.begin(), children.end(),
 	    [](const auto &left, const auto &right) {
 		if (left.first != right.first)
@@ -148,7 +342,25 @@ for (auto entry = std::filesystem::directory_iterator(absolute,
 	    out.back() += expanded_directories.contains(relative) ? "- " : "+ ";
 	    out.back() += relative + "/";
 	    if (expanded_directories.contains(relative))
-		collect_listing(out, relative, depth + 1);
+	    {
+		// Load this directory's .gitignore before recursing so the
+		// children honor its rules.
+		std::error_code open_error;
+		auto gitignore = root / std::filesystem::path(relative) / ".gitignore";
+		bool owned = false;
+		if (std::filesystem::exists(gitignore, open_error))
+		{
+		    auto rules = parse_gitignore(gitignore);
+		    if (!rules.empty())
+		    {
+			rules_by_dir.emplace(relative, std::move(rules));
+			owned = true;
+		    }
+		}
+		collect_listing(out, relative, depth + 1, rules_by_dir);
+		if (owned)
+		    rules_by_dir.erase(relative);
+	    }
 	}
 	else
 	{
@@ -292,7 +504,8 @@ extern "C" char *
 xim_project_explorer(const char *query)
 {
     std::vector<std::string> listing;
-    collect_listing(listing, ".", 0);
+    std::map<std::string, std::vector<gitignore_rule>> rules_by_dir;
+    collect_listing(listing, ".", 0, rules_by_dir);
     if (query == nullptr || *query == '\0')
 	return duplicate_lines(listing);
     std::vector<std::string> matches;

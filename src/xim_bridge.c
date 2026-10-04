@@ -461,32 +461,16 @@ xim_engine_overlay(const char *prompt, const char *items, int error)
 xim_initialize(void)
 {
     // A directory argument starts a project at that directory.  A file
-    // argument roots the project at its parent so indexing stays local.
+    // argument opens that file alone; it does not start a directory walk.
+    // The picker falls back to a direct filesystem check for any path
+    // the user types, so an out-of-tree file remains reachable without
+    // a project root.
     char_u *root = NULL;
     if (GARGCOUNT > 0)
     {
 	char_u *name = GARGLIST[0].ae_fname;
-	if (name != NULL && *name != NUL)
-	{
-	    if (mch_isdir(name))
-		root = vim_strsave(name);
-	    else
-	    {
-		char_u *parent = vim_strsave(name);
-		if (parent != NULL)
-		{
-		    if (mch_isdir(parent))
-			root = parent;
-		    else
-		    {
-			char_u *slash = gettail(parent);
-			if (slash != NULL)
-			    *slash = NUL;
-			root = parent;
-		    }
-		}
-	    }
-	}
+	if (name != NULL && *name != NUL && mch_isdir(name))
+	    root = vim_strsave(name);
     }
     xim_project_init(root == NULL ? NULL : (char *)root);
     if (root != NULL)

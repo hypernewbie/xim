@@ -466,15 +466,27 @@ xim_initialize(void)
     // the user types, so an out-of-tree file remains reachable without
     // a project root.
     char_u *root = NULL;
-    if (GARGCOUNT > 0)
+    int file_arguments = 0;
+    int i;
+
+    for (i = 0; i < GARGCOUNT; ++i)
     {
-	char_u *name = GARGLIST[0].ae_fname;
-	if (name != NULL && *name != NUL && mch_isdir(name))
+	char_u *name = GARGLIST[i].ae_fname;
+	if (name == NULL || *name == NUL)
+	    continue;
+	++file_arguments;
+	if (i == 0 && mch_isdir(name))
 	    root = vim_strsave(name);
     }
-    xim_project_init(root == NULL ? NULL : (char *)root);
     if (root != NULL)
-	vim_free(root);
+	xim_project_init((char *)root);
+    else if (file_arguments == 0)
+	// Bare start: the current directory is the project root.
+	xim_project_init(NULL);
+    else
+	// File-only start: no project, so no directory walk runs.
+	xim_project_disable();
+    vim_free(root);
     // Disable netrw so a directory argument opens an empty buffer rather
     // than the directory listing plugin.  Without this, filetype detection
     // launches netrw on the directory buffer and intercepts Ctrl-P / P-E

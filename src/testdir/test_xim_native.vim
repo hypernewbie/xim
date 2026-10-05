@@ -200,15 +200,20 @@ func Test_xim_project_symlinks()
   let buf = s:StartProjectXim('Xximsym')
   call term_sendkeys(buf, "\<C-P>")
   call WaitForAssert({-> assert_match('real/alpha\.cpp', s:Screen(buf))}, 5000)
-  " A symlink to a file resolves to the target path; either form works.
-  call WaitForAssert({-> assert_match('alias\.cpp\|real/alpha\.cpp.*real/alpha\.cpp', s:Screen(buf))}, 5000)
+  " A file symlink is indexed under its own name; either form opens it.
+  call WaitForAssert({-> assert_match('alias\.cpp', s:Screen(buf))}, 5000)
+  call WaitForAssert({-> assert_notmatch('outside', s:Screen(buf))}, 5000)
   call term_sendkeys(buf, "\<Esc>")
-  " Explorer never lists the loop or escape directories.
+  " Explorer never lists the loop or escape directories, nor any path
+  " outside the project root.
   call term_sendkeys(buf, "\<C-E>")
   call WaitForAssert({-> assert_match('Explorer:', s:Screen(buf))})
   call assert_notmatch('loop', s:Screen(buf))
   call assert_notmatch('escape', s:Screen(buf))
-  call term_sendkeys(buf, "\<Esc>")
+  call assert_notmatch('\.\.', s:Screen(buf))
+  " A file symlink opens its target under the in-tree name.
+  call term_sendkeys(buf, "alias.cpp\<CR>")
+  call WaitForAssert({-> assert_match('alpha', s:Screen(buf))}, 5000)
   call s:StopXim(buf)
   call delete('Xximsym', 'rf')
   call delete('Xximsymoutside', 'rf')
@@ -272,6 +277,61 @@ func Test_xim_project_refresh_preserves_expansion()
   call term_sendkeys(buf, "\<Esc>")
   call s:StopXim(buf)
   call delete('Xximrefresh', 'rf')
+endfunc
+
+func Test_xim_project_gitignore_anchored()
+  call mkdir('Xximanchor/cache', 'p')
+  call mkdir('Xximanchor/src/cache', 'p')
+  call writefile(['/cache/'], 'Xximanchor/.gitignore')
+  call writefile(['ignored', ''], 'Xximanchor/cache/root.txt')
+  call writefile(['kept', ''], 'Xximanchor/src/cache/kept.txt')
+  let buf = s:StartProjectXim('Xximanchor')
+  " An anchored single-component rule excludes the owner's directory
+  " only; a deeper directory with the same name stays visible.
+  call term_sendkeys(buf, "\<C-P>")
+  call WaitForAssert({-> assert_match('src/cache/kept\.txt', s:Screen(buf))}, 5000)
+  call WaitForAssert({-> assert_notmatch('root\.txt', s:Screen(buf))}, 5000)
+  call term_sendkeys(buf, "\<Esc>")
+  call s:StopXim(buf)
+  call delete('Xximanchor', 'rf')
+endfunc
+
+func Test_xim_project_arrow_select()
+  call mkdir('Xximarrow', 'p')
+  call writefile(['A', ''], 'Xximarrow/a.txt')
+  call writefile(['B', ''], 'Xximarrow/b.txt')
+  let buf = s:StartProjectXim('Xximarrow')
+  call term_sendkeys(buf, "\<C-P>")
+  call WaitForAssert({-> assert_match('b\.txt', s:Screen(buf))}, 5000)
+  call term_sendkeys(buf, "\<Down>\<CR>")
+  call WaitForAssert({-> assert_match('B', s:Screen(buf))}, 5000)
+  call s:StopXim(buf)
+  call delete('Xximarrow', 'rf')
+endfunc
+
+func Test_xim_project_dirty_switch()
+  call mkdir('Xximdirty', 'p')
+  call writefile(['A', ''], 'Xximdirty/a.txt')
+  call writefile(['B', ''], 'Xximdirty/b.txt')
+  let buf = s:StartProjectXim('Xximdirty')
+  call term_sendkeys(buf, "\<C-P>a\<CR>")
+  call WaitForAssert({-> assert_match('A', s:Screen(buf))}, 5000)
+  call term_sendkeys(buf, 'dirty')
+  " Picking b.txt keeps the modified buffer without prompting.
+  call term_sendkeys(buf, "\<C-P>b\<CR>")
+  call WaitForAssert({-> assert_match('B', s:Screen(buf))}, 5000)
+  call assert_notmatch('Save changes', s:Screen(buf))
+  " The buffer picker (palette fallback) still lists the unsaved buffer.
+  call term_sendkeys(buf, "\<F2>Buffers\<CR>")
+  call WaitForAssert({-> assert_match('a\.txt', s:Screen(buf))}, 5000)
+  call WaitForAssert({-> assert_match('b\.txt', s:Screen(buf))}, 5000)
+  call term_sendkeys(buf, "\<Esc>")
+  " Quit still protects the unsaved buffer.
+  call term_sendkeys(buf, "\<C-Q>")
+  call WaitForAssert({-> assert_match('Save changes', s:Screen(buf))}, 5000)
+  call term_sendkeys(buf, "\<Esc>")
+  call s:StopXim(buf)
+  call delete('Xximdirty', 'rf')
 endfunc
 
 func Test_xim_project_duplicate_basenames()

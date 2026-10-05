@@ -539,14 +539,20 @@ def project_symlinks(binary, root):
         try:
             session.send(b"\x10")            # Ctrl-P -> quick open
             screen = session.wait(b"alpha.cpp")
-            assert b"real/alpha.cpp" in screen or b"alias.cpp" in screen
+            assert b"alias.cpp" in screen, "file symlink not indexed under its own name"
+            assert b"real/alpha.cpp" in screen, "real file missing from the index"
             assert b"should_not_appear" not in screen, "escape leaked outside root"
+            assert b"loop" not in screen and b"escape" not in screen
             session.send(b"\x1b")
             session.send(b"\x05")            # Ctrl-E -> explorer
             screen = session.wait(b"Explorer:")
             assert b"loop" not in screen, "self-link listed in explorer"
             assert b"escape" not in screen, "escape listed in explorer"
-            session.send(b"\x1b")
+            assert b".." not in screen, "explorer listed a path outside the root"
+            # A file symlink opens its target under the in-tree name.
+            session.send(b"alias.cpp\r")
+            session.wait(b"alpha")
+            assert session.snapshot() == "alpha\n", "symlink did not open its target"
         finally:
             session.close()
         shutil.rmtree(outside)
@@ -563,11 +569,13 @@ def project_explicit_path(binary, root):
         try:
             session.send(b"\x10")            # Ctrl-P -> quick open
             session.wait(b"Files:")
-            # Filter by name rather than typing the full absolute path;
-            # typing every char of an absolute path triggers a SEGV today.
-            session.send(b"inside\r")
+            # Type the whole absolute path.  Every intermediate prefix
+            # must stay on a valid result range: the first character is
+            # a bare "/", which used to sort past an empty candidate
+            # list and crash the editor.
+            session.send(str(absolute).encode() + b"\r")
             session.wait(b"alpha")
-            assert session.snapshot() == "alpha\n", "filter did not open the file"
+            assert session.snapshot() == "alpha\n", "path did not open the file"
             session.send(b"\x1b")
         finally:
             session.close()
@@ -579,16 +587,28 @@ def project_single_file_no_scan(binary, root):
     with tempfile.TemporaryDirectory(prefix="xim-single-", dir=root) as temporary:
         project = Path(temporary)
         (project / "hello.txt").write_text("hello\n")
+        (project / "sibling.txt").write_text("sibling\n")
         target = project / "hello.txt"
         session = Session(binary, project, arguments=(str(target),))
         try:
+            assert session.snapshot() == "hello\n", "file argument did not open"
+            # A name query must find nothing: no walk ever ran.
             session.send(b"\x10")            # Ctrl-P -> quick open
-            screen = session.wait(b"Files:")
-            assert b"hello.txt" in screen, "single-file argument still exposes its path"
+            session.wait(b"Files:")
+            session.send(b"sibling")
+            output = session.drain(0.4)
+            assert b"> " not in output, "file-only start indexed a sibling"
+            assert b"Indexing" not in output, "file-only start claimed indexing"
+            # An absolute path still opens through the picker.
             session.send(b"\x1b")
+            session.send(b"\x10")
+            session.wait(b"Files:")
+            session.send(str(target.resolve()).encode() + b"\r")
+            session.wait(b"hello")
+            assert session.snapshot() == "hello\n", "absolute path did not reopen"
         finally:
             session.close()
-        print("Single-file invocation and out-of-root path check passed")
+        print("Single-file invocation skips the walk; absolute paths open")
 
 
 def project_refresh_preserves_expansion(binary, root):
@@ -614,6 +634,99 @@ def project_refresh_preserves_expansion(binary, root):
         finally:
             session.close()
         print("Refresh preserves expansion check passed")
+
+
+def project_gitignore_anchored(binary, root):
+    """Plan 2 closeout: an anchored rule matches one component only."""
+    with tempfile.TemporaryDirectory(prefix="xim-anchored-", dir=root) as temporary:
+        project = Path(temporary)
+        (project / "cache").mkdir(parents=True)
+        (project / "src" / "cache").mkdir(parents=True)
+        (project / ".gitignore").write_text("/cache/\n")
+        (project / "cache" / "root.txt").write_text("ignored\n")
+        (project / "src" / "cache" / "kept.txt").write_text("kept\n")
+        session = Session(binary, project, arguments=(".",))
+        try:
+            session.send(b"\x10")            # Ctrl-P -> quick open
+            session.wait(b"Files:")
+            session.send(b"cache")           # force a re-render after the scan
+            output = session.drain(0.4)
+            assert b"src/cache/kept.txt" in output, "anchored rule hit a deeper directory"
+            assert b"cache/root.txt" not in output, "anchored rule missed its own directory"
+            session.send(b"\x1b")
+        finally:
+            session.close()
+        print("Anchored gitignore scoping check passed")
+
+
+def project_gitignore_scoped(binary, root):
+    """Plan 2 closeout: an inner .gitignore applies to its own directory."""
+    with tempfile.TemporaryDirectory(prefix="xim-scoped-", dir=root) as temporary:
+        project = Path(temporary)
+        (project / "a").mkdir()
+        (project / "a" / ".gitignore").write_text("a\n")
+        (project / "a" / "keep.txt").write_text("kept\n")
+        session = Session(binary, project, arguments=(".",))
+        try:
+            session.send(b"\x10")            # Ctrl-P -> quick open
+            session.wait(b"Files:")
+            session.send(b"keep")            # force a re-render after the scan
+            output = session.drain(0.4)
+            assert b"a/keep.txt" in output, "inner rule wrongly ignored a child"
+            session.send(b"\x1b")
+        finally:
+            session.close()
+        print("Inner .gitignore scoping check passed")
+
+
+def project_picker_arrows(binary, root):
+    """Plan 2 closeout: arrow keys select in the file picker."""
+    with tempfile.TemporaryDirectory(prefix="xim-arrows-", dir=root) as temporary:
+        project = Path(temporary)
+        (project / "a.txt").write_text("A\n")
+        (project / "b.txt").write_text("B\n")
+        session = Session(binary, project, arguments=(".",))
+        try:
+            session.send(b"\x10")            # Ctrl-P -> quick open
+            session.wait(b"b.txt")
+            session.send(b"\x1b[B")          # Down
+            output = session.drain(0.3)
+            assert b"> b.txt" in output, "Down did not move the selection"
+            session.send(b"\r")
+            session.wait(b"2B")
+            assert session.snapshot() == "B\n", "Enter opened the first entry, not the selected one"
+        finally:
+            session.close()
+        print("Picker arrow selection check passed")
+
+
+def project_dirty_switch(binary, root):
+    """Plan 2 closeout: picking a file keeps an unsaved buffer in the list."""
+    with tempfile.TemporaryDirectory(prefix="xim-dirty-", dir=root) as temporary:
+        project = Path(temporary)
+        (project / "a.txt").write_text("A\n")
+        (project / "b.txt").write_text("B\n")
+        session = Session(binary, project, arguments=(".",))
+        try:
+            session.send(b"\x10a\r")         # open a.txt
+            session.wait(b"2B")
+            session.send(b"dirty")           # modify it
+            session.send(b"\x10b\r")         # pick b.txt: no prompt
+            output = session.wait(b"2B")
+            assert b"Save changes" not in output, "switch prompted for the dirty buffer"
+            assert session.snapshot() == "B\n", "switch did not open the picked file"
+            session.send(b"\x1bOQ")          # F2 -> palette
+            session.wait(b"Command:")
+            session.send(b"Buffers\r")       # documented Ctrl-Shift-B fallback
+            output = session.wait(b"Buffers:")
+            output += session.drain(0.4)
+            assert b"a.txt" in output and b"b.txt" in output, "dirty buffer vanished from the list"
+            session.send(b"\x1b")
+            session.send(b"\x11")            # Ctrl-Q: unsaved work still protects
+            session.wait(b"Save changes")
+        finally:
+            session.close()
+        print("Dirty-switch retention and quit protection checks passed")
 
 
 def project_duplicate_basenames(binary, root):
@@ -651,3 +764,7 @@ if __name__ == "__main__":
     project_single_file_no_scan(args.binary.resolve(), args.work.resolve())
     project_refresh_preserves_expansion(args.binary.resolve(), args.work.resolve())
     project_duplicate_basenames(args.binary.resolve(), args.work.resolve())
+    project_gitignore_anchored(args.binary.resolve(), args.work.resolve())
+    project_gitignore_scoped(args.binary.resolve(), args.work.resolve())
+    project_picker_arrows(args.binary.resolve(), args.work.resolve())
+    project_dirty_switch(args.binary.resolve(), args.work.resolve())

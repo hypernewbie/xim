@@ -274,7 +274,9 @@ extern "C" void xim_dispatch(int key, int modifiers)
                 {
                     auto item = list[selected % list.size()];
                     if (current == Action::buffers)
-                        xim_engine_command("buffer", item.c_str(), 0);
+                        // Hidden switch: a modified buffer stays in the
+                        // buffer list instead of prompting here.
+                        xim_engine_command("hide buffer", item.c_str(), 0);
                     else if (current == Action::explorer)
                     {
                         char *path = nullptr;
@@ -283,7 +285,18 @@ extern "C" void xim_dispatch(int key, int modifiers)
                         {
                             std::unique_ptr<char, decltype(&xim_project_free)> guard(
                                     path, xim_project_free);
-                            protect(Action::open, path);
+                            // Resolve through the project root: the
+                            // editor's working directory may differ from
+                            // the project root.
+                            char *resolved = xim_project_resolve(path);
+                            if (resolved != nullptr)
+                            {
+                                std::unique_ptr<char, decltype(&xim_project_free)> resolved_guard(
+                                        resolved, xim_project_free);
+                                xim_engine_command("hide edit", resolved, 0);
+                            }
+                            else
+                                xim_engine_command("hide edit", path, 0);
                         }
                         else
                             prompt = current;
@@ -299,10 +312,13 @@ extern "C" void xim_dispatch(int key, int modifiers)
                         {
                             std::unique_ptr<char, decltype(&xim_project_free)> guard(
                                     resolved, xim_project_free);
-                            protect(Action::open, resolved);
+                            // Hidden switch: picking a file keeps an
+                            // unsaved buffer in the buffer list; Close
+                            // and Quit still protect modified buffers.
+                            xim_engine_command("hide edit", resolved, 0);
                         }
                         else
-                            protect(Action::open, item);
+                            xim_engine_command("hide edit", item.c_str(), 0);
                     }
                 }
                 else
@@ -365,10 +381,24 @@ extern "C" void xim_dispatch(int key, int modifiers)
             input.clear();
             return;
         }
-        if (prompt == Action::palette && (key == XIM_UP || key == XIM_DOWN))
+        if (key == XIM_UP || key == XIM_DOWN)
         {
-            auto items = filtered();
-            if (!items.empty()) selected = (selected + items.size() + (key == XIM_UP ? -1 : 1)) % items.size();
+            // Every list prompt supports arrow selection, not only the
+            // command palette.
+            std::size_t count = 0;
+            if (prompt == Action::palette)
+            {
+                auto items = filtered();
+                count = items.size();
+            }
+            else if (prompt == Action::files || prompt == Action::buffers
+                    || prompt == Action::explorer)
+            {
+                auto list = project_items(prompt, input);
+                count = list.size();
+            }
+            if (count > 0)
+                selected = (selected + count + (key == XIM_UP ? -1 : 1)) % count;
         }
         else if (action == Action::backspace && !input.empty())
         {

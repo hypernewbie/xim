@@ -26,6 +26,8 @@ std::filesystem::path root;
 std::set<std::string> expanded_directories;
 
 std::mutex state_lock;
+bool active = true;			    // a project root exists
+bool scan_complete = false;		    // the current scan finished
 std::vector<std::string> snapshot;	    // owned by the indexer
 unsigned snapshot_generation = 0;
 std::atomic<unsigned> current_generation{0};
@@ -146,18 +148,25 @@ bool component_matches(std::string_view pattern, std::string_view component)
 }
 
 bool rule_applies(const gitignore_rule &rule,
-	const std::string &relative, bool is_directory)
+	std::string_view relative, bool is_directory)
 {
     if (rule.directory_only && !is_directory)
 	return false;
-    // Anchored rules that contain a slash are path-relative to the
-    // .gitignore file's directory; supporting them requires knowing the
-    // owning depth.  We accept single-component anchored rules as a
-    // basename match against any component and skip anchored path rules
-    // (recorded as a limitation).  Non-anchored rules match any
-    // component's basename at any depth.
-    if (rule.anchored && rule.pattern.find('/') != std::string::npos)
-	return false;
+    // Anchored rules (leading `/`) are relative to the directory that
+    // owns the .gitignore file; the caller already removed that prefix.
+    // A single-component anchor matches exactly one component deep:
+    // "/cache" excludes the owner's "cache" entry, not "src/cache".
+    // Anchored multi-component patterns stay unsupported (a declared
+    // limitation).
+    if (rule.anchored)
+    {
+	if (rule.pattern.find('/') != std::string_view::npos)
+	    return false;
+	auto slash = relative.find('/');
+	return component_matches(rule.pattern, relative.substr(0, slash));
+    }
+    // Non-anchored rules match a component basename at any depth below
+    // the owning directory.
     std::string_view remaining(relative);
     while (!remaining.empty())
     {
@@ -203,9 +212,14 @@ bool ignored_by_rules(const std::map<std::string, std::vector<gitignore_rule>> &
     {
 	if (!is_descendant(relative, entry.first))
 	    continue;
+	// A .gitignore applies to paths relative to its own directory, so
+	// strip the owning prefix before matching.
+	std::string_view scoped(relative);
+	if (entry.first != ".")
+	    scoped.remove_prefix(entry.first.size() + 1);
 	for (const auto &rule : entry.second)
 	{
-	    if (rule_applies(rule, relative, is_directory))
+	    if (rule_applies(rule, scoped, is_directory))
 		ignored = !rule.negate;
 	}
     }
@@ -263,11 +277,13 @@ std::vector<std::string> enumerate(const std::filesystem::path &base)
 	 entry.increment(error))
     {
 	error.clear();
-	std::error_code relative_error;
-	auto relative = std::filesystem::relative(entry->path(), root, relative_error);
-	if (relative_error || relative.empty())
+	// Lexical relative path: never resolve symlinks.  A file link keeps
+	// its in-tree name and a directory link stays an entry of this
+	// directory instead of turning into a path outside the root.
+	auto text = entry->path().lexically_relative(root).generic_string();
+	if (text.empty() || text == "." || text == ".."
+		|| text.compare(0, 3, "../") == 0)
 	    continue;
-	auto text = relative.generic_string();
 	auto is_dir = entry->is_directory(error);
 	if (has_ignored_component(text)
 		|| ignored_by_rules(rules_by_dir, text, is_dir))
@@ -327,11 +343,15 @@ void collect_listing(std::vector<std::string> &out, const std::string &parent,
 	 entry.increment(error))
     {
 	error.clear();
-	auto relative = std::filesystem::relative(entry->path(), root, error);
-	if (error || relative.empty())
+	auto text = entry->path().lexically_relative(root).generic_string();
+	if (text.empty() || text == "." || text == ".."
+		|| text.compare(0, 3, "../") == 0)
 	    continue;
-	auto text = relative.generic_string();
-	auto is_dir = entry->is_directory(error);
+	// Do not follow directory symlinks here: expanding one would walk
+	// the target tree (and loop forever on a self-link).  File symlinks
+	// keep their in-tree name; opening one still resolves the target.
+	bool linked = entry->is_symlink(error);
+	auto is_dir = !linked && entry->is_directory(error);
 	if (has_ignored_component(text)
 		|| ignored_by_rules(rules_by_dir, text, is_dir))
 	    continue;
@@ -409,6 +429,7 @@ void scan(unsigned generation)
 	return;		    // stale root change, drop the batch
     snapshot = std::move(paths);
     snapshot_generation = generation;
+    scan_complete = true;
 }
 
 void start_scan()
@@ -420,14 +441,17 @@ void start_scan()
 	std::lock_guard<std::mutex> guard(state_lock);
 	snapshot.clear();
 	snapshot_generation = 0;
+	scan_complete = false;
     }
     worker = std::thread([generation]() { scan(generation); });
 }
 
 bool ready()
 {
+    if (!active)
+	return false;
     std::lock_guard<std::mutex> guard(state_lock);
-    return !snapshot.empty()
+    return scan_complete
 	 && snapshot_generation == current_generation.load(std::memory_order_acquire);
 }
 
@@ -445,6 +469,7 @@ xim_project_init(const char *path)
     auto requested = path == nullptr || *path == '\0'
 	? std::filesystem::current_path() : std::filesystem::absolute(path, error);
     root = error ? std::filesystem::current_path() : requested;
+    active = true;
     expanded_directories.clear();
     start_scan();
     static bool registered = false;
@@ -453,6 +478,22 @@ xim_project_init(const char *path)
 	std::atexit(xim_project_shutdown);
 	registered = true;
     }
+}
+
+// A file-only invocation has no project: pickers serve explicit paths
+// and the buffer list, and no directory walk ever starts.
+extern "C" void
+xim_project_disable(void)
+{
+    if (worker.joinable())
+	worker.join();
+    std::lock_guard<std::mutex> guard(state_lock);
+    active = false;
+    scan_complete = false;
+    root.clear();
+    expanded_directories.clear();
+    snapshot.clear();
+    snapshot_generation = 0;
 }
 
 extern "C" void
@@ -472,6 +513,11 @@ extern "C" const char *
 xim_project_status(void)
 {
     static thread_local std::string text;
+    if (!active)
+    {
+	text.clear();
+	return text.c_str();
+    }
     if (ready())
     {
 	unsigned generation = current_generation.load(std::memory_order_acquire);
@@ -509,6 +555,13 @@ std::string resolve_explicit_path(std::string_view query,
 	return {};
     if (!std::filesystem::is_regular_file(absolute, error))
 	return {};
+    // Without a project root every explicit path is out of root.
+    if (project_root.empty())
+    {
+	if (out_of_root != nullptr)
+	    *out_of_root = true;
+	return absolute.generic_string();
+    }
     auto root_path = std::filesystem::path(project_root);
     std::error_code relative_error;
     auto relative = std::filesystem::relative(absolute, root_path, relative_error);
@@ -530,6 +583,7 @@ xim_project_files(const char *query)
 {
     std::string_view text = query == nullptr ? "" : query;
     std::vector<std::string> candidates;
+    bool explicit_first = false;
     if (looks_like_path(text))
     {
 	bool out_of_root = false;
@@ -542,27 +596,39 @@ xim_project_files(const char *query)
 		candidates.push_back(std::string("> ") + explicit_path);
 	    else
 		candidates.push_back(std::move(explicit_path));
+	    explicit_first = true;
 	}
     }
     if (ready())
     {
+	// Rank each candidate once and sort the ranks; the explicit
+	// candidate stays first and is not repeated by the index.
 	auto paths = indexed();
+	std::vector<std::pair<int, const std::string *>> ranked;
+	ranked.reserve(paths.size());
 	for (const auto &path : paths)
-	    if (rank_match(path, text) >= 0)
-		candidates.push_back(path);
-	std::sort(candidates.begin() + (looks_like_path(text) ? 1 : 0), candidates.end(),
-		[&](const std::string &left, const std::string &right) {
-		    auto l = rank_match(left, text);
-		    auto r = rank_match(right, text);
-		    if (l != r)
-			return l < r;
-		    if (left.size() != right.size())
-			return left.size() < right.size();
-		    return left < right;
+	{
+	    auto rank = rank_match(path, text);
+	    if (rank >= 0)
+		ranked.emplace_back(rank, &path);
+	}
+	std::sort(ranked.begin(), ranked.end(),
+		[](const auto &left, const auto &right) {
+		    if (left.first != right.first)
+			return left.first < right.first;
+		    if (left.second->size() != right.second->size())
+			return left.second->size() < right.second->size();
+		    return *left.second < *right.second;
 		});
+	for (const auto &match : ranked)
+	{
+	    if (explicit_first && *match.second == candidates.front())
+		continue;
+	    candidates.push_back(*match.second);
+	    if (candidates.size() >= kMaxResults)
+		break;
+	}
     }
-    if (candidates.size() > kMaxResults)
-	candidates.resize(kMaxResults);
     if (candidates.empty())
 	return nullptr;
     return duplicate_lines(candidates);
@@ -572,6 +638,8 @@ extern "C" char *
 xim_project_explorer(const char *query)
 {
     std::vector<std::string> listing;
+    if (!active)
+	return duplicate_lines(listing);
     std::map<std::string, std::vector<gitignore_rule>> rules_by_dir;
     collect_listing(listing, ".", 0, rules_by_dir);
     if (query == nullptr || *query == '\0')
@@ -639,6 +707,16 @@ xim_project_resolve(const char *item)
 	absolute.copy(result, absolute.size());
 	result[absolute.size()] = '\0';
 	return result;
+    }
+    // Without a project root the item is already an absolute path.
+    if (root.empty())
+    {
+	char *verbatim = static_cast<char *>(std::malloc(text.size() + 1));
+	if (verbatim == nullptr)
+	    return nullptr;
+	text.copy(verbatim, text.size());
+	verbatim[text.size()] = '\0';
+	return verbatim;
     }
     // Project-relative path: prepend the project root.
     std::error_code error;

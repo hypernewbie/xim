@@ -1,9 +1,57 @@
 # Plan 2 local validation — 2026-10-04
 
-Source: `4eb65cefc`, the Plan 1 review closeout plus the Plan 2 navigation
-slice and its follow-up. Clang/Clang++ 22.1.8, libc++, C++26, CMake 4.3.4,
+Source: `4eb65cefc` plus the review-closeout fixes (the working tree at the
+time of this section; see `git log` for the closeout commits).
+Clang/Clang++ 22.1.8, libc++, C++26, CMake 4.3.4,
 Ninja 1.13.2, Linux UTF-8. The acceptance configuration is `build/dev`,
 matching Plan 1.
+
+## Review closeout — 2026-10-04
+
+An independent review round (`temp/XIM_PLAN2_REVIEW.md`) reproduced six
+defects beyond the two declared deferrals. All six are fixed in this
+round:
+
+1. **Empty-candidate crash.** Typing a path-like query (for example a
+   bare `/`) sorted from `candidates.begin() + 1` even when no explicit
+   candidate existed, reading past an empty vector's end and killing the
+   editor. The explicit candidate is now tracked by a flag and only a
+   valid range is sorted. Ranking is computed once per candidate into a
+   rank array instead of re-ranking inside the sort comparator.
+2. **Explorer followed directory symlinks.** `collect_listing` used
+   status-based `is_directory()` and `filesystem::relative()` (which
+   resolves symlinks), so a self-link rendered as `+ ./` and expanding it
+   recursed until the stack gave out, and a link to a sibling directory
+   listed files outside the root. Both listing passes now use
+   `lexically_relative()` and directory symlinks are never listed or
+   expanded. A file symlink is indexed under its in-tree name and opens
+   its target.
+3. **Ignore rules matched the wrong scope.** Rules were applied to the
+   full project-relative path, so root `/cache/` also hid `src/cache/`,
+   and a rule in `a/.gitignore` named `a` hid `a/keep.txt` (git keeps
+   both files). Rules now apply to the path relative to the directory
+   that owns the `.gitignore`, and an anchored single-component rule
+   matches exactly one component deep. Differential fixtures against
+   `git check-ignore` agree with the walker on both cases.
+4. **File-only start still scanned.** `xim_project_init(NULL)` selected
+   the working directory and started a walk, so `xim hello.txt` indexed
+   every sibling. A file-only invocation now calls
+   `xim_project_disable()`: no root, no walk, empty status; explicit
+   paths and the buffer picker still work. A bare start keeps the
+   working directory as the project root.
+5. **Arrows only moved the palette selection.** Up/Down now move the
+   selection in every list prompt (palette, quick open, explorer,
+   buffers).
+6. **Picker opens prompted on unsaved work.** Opening a file from quick
+   open, the explorer, or the buffer picker now switches with `:hide
+   edit` / `:hide buffer`: the modified buffer stays in the buffer list
+   instead of raising the Save/Discard prompt. Close, Quit, and the
+   explicit Open prompt still protect modified buffers; Quit checks all
+   buffers including hidden ones.
+
+Scan completion is now an explicit flag instead of "snapshot non-empty",
+so a completed empty project no longer reports "Indexing project..."
+forever.
 
 ## Scope of this slice
 
@@ -45,10 +93,11 @@ side and the explicit path wins because it sorts first in the result list.
 
 ### Single-file invocation skips the walk
 
-`xim_initialize()` only calls `xim_project_init(path)` when the argument is
-a directory; a file argument leaves the project root undefined. Explicit
-paths still work in that mode because the picker falls back to the direct
-filesystem check.
+`xim_initialize()` calls `xim_project_init(path)` for a directory argument
+or a bare start, and `xim_project_disable()` for a file-only invocation.
+In disabled mode the picker serves explicit paths only and no walk ever
+starts. Explicit paths work in that mode because the picker falls back to
+the direct filesystem check.
 
 ### Refresh preserves expansion
 
@@ -107,12 +156,15 @@ Startup is flat across project size.
   covers the background index and the editor thread's snapshot reads.
   ASan build: 2/2 in 15.3 s. TSan build: 2/2 in 16.6 s.
 - No new compiler warnings. `git diff --check` passes.
-- Python PTY script (`cmake/test_xim.py`) extended with the same six
-  Plan 2 closeout scenarios. All seven PTY functions pass on
-  `build/dev/src/xim` in ~15 s; the absolute-path scenario uses the
-  picker filter rather than sending every character of an absolute path
-  because typing each char of an absolute path is currently an unstable
-  keystroke path (the vim-native tests are the source of truth for that path).
+- Python PTY script (`cmake/test_xim.py`) extended with the Plan 2
+  closeout scenarios plus the review-closeout scenarios: 13 functions,
+  all passing on `build/dev/src/xim` (and on the clean tracked-source
+  build's candidate binary) in ~15 s. The absolute-path scenario types
+  every character of the absolute path, including the bare `/` prefix
+  that used to crash the editor.
+- Vim-native screen suite: 15/15 test functions pass, including the
+  three review-closeout tests (anchored gitignore, arrow selection,
+  dirty-buffer switch).
 - New PTY coverage asserts:
   - `Test_xim_project_gitignore` — `*.log` at the root, `!keep.log` in
     the inner directory, directory-only rules, kept text shown, ignored
@@ -127,6 +179,15 @@ Startup is flat across project size.
     survives `:edit!` refresh.
   - `Test_xim_project_duplicate_basenames` — two files with the same
     basename appear as distinct rows.
+  - `project_gitignore_anchored` / `Test_xim_project_gitignore_anchored` —
+    root `/cache/` hides `cache/` but keeps `src/cache/`.
+  - `project_gitignore_scoped` — a rule in `a/.gitignore` does not hide
+    `a/keep.txt` merely because the owner is named `a`.
+  - `project_picker_arrows` / `Test_xim_project_arrow_select` — Down then
+    Enter opens the second entry, not the first.
+  - `project_dirty_switch` / `Test_xim_project_dirty_switch` — a picker
+    switch keeps a modified buffer without prompting, the buffer list
+    still shows it, and Quit still protects it.
 - Existing screen dumps `Test_xim_status`, `Test_xim_selection`,
   `Test_xim_open`, `Test_xim_find`, `Test_xim_palette`,
   `Test_xim_unsaved`, `Test_xim_theme_*`, `Test_xim_palette_scroll`,
@@ -138,11 +199,25 @@ Startup is flat across project size.
 - The overlay prompt line renders a trailing `>` from the first item.
   This is the cursor visualisation that vim places on the prompt row;
   the same artifact appears in the palette dumps. Recorded, not fixed.
-- Anchored path rules in `.gitignore` (a leading `/` followed by a `/`)
-  are skipped. Single-component anchored rules still match.
+- Anchored multi-component `.gitignore` patterns (a leading `/` followed
+  by another `/`) are skipped. Single-component anchors match one
+  component deep, matching git.
 - Results refresh on the next render after a scan completes. There is no
   explicit wake of the input wait, so a result may appear on the next
   keypress. Waking the input wait is the next slice.
+- Matching still runs synchronously on the editor thread at render time
+  (single-pass rank computation, capped results). On a 100000-path
+  synthetic snapshot a query costs roughly 45 ms pre-fix, and the rank
+  caching in this round halves it. Moving matching off the editor thread
+  with cancellation belongs to the wake-input-wait slice.
+- Explorer activation always resolves through the project root; opening
+  a file symlink changes the buffer name to the resolved target.
+- `xim_native_screens` runs only where the runner `vim` has `+terminal`.
+  The `default` preset builds `vim` without it, so the suite silently
+  skips there (`build/default/src/vim --version` shows `-terminal`);
+  `build/dev` is the acceptance configuration for this test.  A skipped
+  suite still exits 0 — check the `messages` file for "NO tests
+  executed" before trusting a green run in a new build directory.
 
 ## Calibrated performance
 

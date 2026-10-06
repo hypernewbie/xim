@@ -1533,6 +1533,10 @@ EXTERN int	dont_scroll INIT(= FALSE);// don't use scrollbars when TRUE
 EXTERN int	mapped_ctrl_c INIT(= FALSE); // modes where CTRL-C is mapped
 EXTERN int	ctrl_c_interrupts INIT(= TRUE);	// CTRL-C sets got_int
 EXTERN int      xim_native_mode INIT(= FALSE); // native entry point only
+EXTERN int      xim_wake_fd INIT(= -1); // owned by the native project module
+EXTERN int      xim_waiting INIT(= FALSE); // top-level native event wait only
+EXTERN int      xim_drawing_overlay INIT(= FALSE);
+EXTERN void     (*xim_redraw_ui)(void) INIT(= NULL); // owning-thread callback
 
 EXTERN cmdmod_T	cmdmod;			// Ex command modifiers
 EXTERN int	sticky_cmdmod_flags INIT(= 0); // used by :execute

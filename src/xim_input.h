@@ -19,6 +19,9 @@ void xim_initialize(void);
 void xim_step(void);
 void xim_dispatch(int key, int modifiers);
 void xim_render(void);
+int xim_prompt_active(void);
+int xim_background(void);
+int xim_input_blocked(void);
 void xim_accept_paste(const char *text);
 
 /* Engine adapters: main-thread only, borrowed strings valid for the call. */

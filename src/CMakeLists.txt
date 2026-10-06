@@ -398,6 +398,16 @@ if(NOT XIM_FEATURE_LEVEL STREQUAL "tiny")
     xim_apply_cxx_settings(xim_commands_test)
     add_test(NAME xim_commands COMMAND xim_commands_test)
     set_tests_properties(xim_commands PROPERTIES LABELS "xim_native")
+
+    find_package(Threads REQUIRED)
+    target_link_libraries(xim PRIVATE Threads::Threads)
+    add_executable(xim_project_test testdir/xim_project_test.cpp)
+    xim_apply_default_flags(xim_project_test)
+    xim_apply_cxx_settings(xim_project_test)
+    target_link_libraries(xim_project_test PRIVATE Threads::Threads)
+    add_test(NAME xim_project COMMAND xim_project_test
+        ${CMAKE_BINARY_DIR}/Testing/project-fixture)
+    set_tests_properties(xim_project PROPERTIES LABELS "xim_native" TIMEOUT 60)
     find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
     add_test(NAME xim_native_pty
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/test_xim.py

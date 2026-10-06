@@ -1086,7 +1086,7 @@ fill_input_buf(int exit_on_error UNUSED)
 	    // If terminal key protocols are in use, we expect to receive
 	    // Ctrl_C as an escape sequence, ignore a raw Ctrl_C as this could
 	    // be paste data.
-	    if (ctrl_c_interrupts
+	    if (!xim_native_mode && ctrl_c_interrupts
 			&& ((inbuf[inbufcount] == Ctrl_C && !key_protocol_enabled())
 			|| (len >= 10 && STRNCMP(inbuf + inbufcount,
 						   "\033[27;5;99~", 10) == 0)

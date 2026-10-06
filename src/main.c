@@ -1630,8 +1630,13 @@ main_loop(
 	    may_clear_sb_text();	// clear scroll-back text on next msg
 	    showruler(FALSE);
 
-	    setcursor();
-	    cursor_on();
+#ifdef XIM_NATIVE_ENTRY
+            if (!xim_native_mode || !xim_prompt_active())
+#endif
+            {
+                setcursor();
+                cursor_on();
+            }
 
 	    do_redraw = FALSE;
 

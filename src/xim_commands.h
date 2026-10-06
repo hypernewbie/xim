@@ -8,7 +8,7 @@ enum class Action
 {
     ignore, text, move, erase, backspace, cancel, select_all, copy, cut, paste,
     undo, redo, save, save_as, open, close, quit, find, next, previous,
-    palette, ex, confirm, files, buffers, explorer
+    palette, ex, confirm, files, buffers, explorer, refresh
 };
 Action resolve(int key, int modifiers);
 struct Command { std::string_view name; Action action; };
@@ -19,7 +19,8 @@ inline constexpr Command commands[] = {
     {"Previous match", Action::previous}, {"Select all", Action::select_all},
     {"Copy", Action::copy}, {"Cut", Action::cut}, {"Paste", Action::paste},
     {"Undo", Action::undo}, {"Redo", Action::redo}, {"Ex command", Action::ex},
-    {"Files", Action::files}, {"Buffers", Action::buffers}, {"Explorer", Action::explorer}
+    {"Files", Action::files}, {"Buffers", Action::buffers}, {"Explorer", Action::explorer},
+    {"Refresh project", Action::refresh}
 };
 bool matches(std::string_view name, std::string_view query);
 }

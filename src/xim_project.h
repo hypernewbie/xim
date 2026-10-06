@@ -10,6 +10,11 @@ void xim_project_init(const char *root);
 void xim_project_disable(void);
 void xim_project_refresh(void);
 void xim_project_shutdown(void);
+int xim_project_wake_fd(void);
+int xim_project_poll(void);
+int xim_project_pending(void);
+void xim_project_cancel_query(void);
+/* Nonblocking: requests a query and returns only its current completion. */
 char *xim_project_files(const char *query);
 char *xim_project_explorer(const char *query);
 int xim_project_explorer_activate(const char *item, char **selected);

@@ -22,6 +22,18 @@ std::string pending_path;
 std::string pending_error;
 bool save_then_continue = false;
 bool pending_save_as_retry = false;
+bool accept_when_ready = false;
+struct DeferredInput
+{
+    int key;
+    int modifiers;
+    bool paste;
+    std::string text;
+};
+std::vector<DeferredInput> deferred_keys;
+constexpr std::size_t kMaxDeferredKeys = 256;
+std::vector<std::string> file_rows;
+std::string file_rows_query;
 
 void perform_pending(bool discard)
 {
@@ -95,7 +107,10 @@ std::vector<std::string> project_items(Action action, const std::string &text)
     }
     std::vector<std::string> items;
     if (sources == nullptr)
+    {
+        if (action == Action::files && file_rows_query != text) file_rows.clear();
         return items;
+    }
     std::string text_all;
     if (action == Action::buffers)
     {
@@ -116,14 +131,28 @@ std::vector<std::string> project_items(Action action, const std::string &text)
         items.push_back(text_all.substr(start, end - start));
         start = end + 1;
     }
+    if (action == Action::files)
+    {
+        if (file_rows_query == text && selected < file_rows.size())
+        {
+            auto found = std::find(items.begin(), items.end(), file_rows[selected]);
+            if (found != items.end()) selected = found - items.begin();
+        }
+        file_rows = items;
+        file_rows_query = text;
+    }
     return items;
 }
 
 void begin(Action action)
 {
+    xim_project_cancel_query();
+    accept_when_ready = false;
     xim_engine_boundary();
     prompt = action;
     input.clear();
+    file_rows.clear();
+    file_rows_query.clear();
     selected = 0;
 }
 
@@ -138,6 +167,7 @@ void execute(Action action)
         case Action::save_as: case Action::open: case Action::find:
         case Action::palette: case Action::ex: case Action::files:
         case Action::buffers: case Action::explorer: begin(action); break;
+        case Action::refresh: xim_project_refresh(); break;
         case Action::quit: case Action::close: protect(action); break;
         case Action::select_all: xim_engine_select_all(); break;
         case Action::cancel: xim_engine_cancel(); break;
@@ -212,10 +242,22 @@ extern "C" void xim_prepare_args(int *argc, char ***argv)
 extern "C" void xim_dispatch(int key, int modifiers)
 {
     auto action = xim::resolve(key, modifiers);
+    if (accept_when_ready && action != Action::cancel)
+    {
+        if (action == Action::ignore) return;
+        // Keys after Enter belong to the opened file, not to the query.
+        // At capacity the input boundary waits on completion only, leaving
+        // further terminal bytes unread (backpressure, not dropped text).
+        deferred_keys.push_back({key, modifiers, false, {}});
+        return;
+    }
     if (prompt != Action::ignore)
     {
         if (action == Action::cancel)
         {
+            xim_project_cancel_query();
+            accept_when_ready = false;
+            deferred_keys.clear();
             prompt = Action::ignore;
             input.clear();
             save_then_continue = false;
@@ -255,6 +297,17 @@ extern "C" void xim_dispatch(int key, int modifiers)
         if (key == '\r' || key == '\n')
         {
             Action current = prompt;
+            if (current == Action::files)
+            {
+                // Enter belongs to this query, never to a previous row.
+                (void)project_items(current, input);
+                if (xim_project_pending())
+                {
+                    accept_when_ready = true;
+                    return;
+                }
+            }
+            accept_when_ready = false;
             prompt = Action::ignore;
             if (current == Action::palette)
             {
@@ -274,9 +327,11 @@ extern "C" void xim_dispatch(int key, int modifiers)
                 {
                     auto item = list[selected % list.size()];
                     if (current == Action::buffers)
-                        // Hidden switch: a modified buffer stays in the
-                        // buffer list instead of prompting here.
-                        xim_engine_command("hide buffer", item.c_str(), 0);
+                    {
+                        // Stable identity precedes the display-only label.
+                        auto number = item.substr(0, item.find(':'));
+                        xim_engine_command("hide buffer", number.c_str(), 0);
+                    }
                     else if (current == Action::explorer)
                     {
                         char *path = nullptr;
@@ -323,7 +378,11 @@ extern "C" void xim_dispatch(int key, int modifiers)
                 }
                 else
                     prompt = current;
-                input.clear();
+                if (prompt == Action::ignore)
+                {
+                    xim_project_cancel_query();
+                    input.clear();
+                }
                 return;
             }
             else if (current == Action::save_as && input.empty())
@@ -381,6 +440,7 @@ extern "C" void xim_dispatch(int key, int modifiers)
             input.clear();
             return;
         }
+        accept_when_ready = false;
         if (key == XIM_UP || key == XIM_DOWN)
         {
             // Every list prompt supports arrow selection, not only the
@@ -423,8 +483,38 @@ extern "C" void xim_dispatch(int key, int modifiers)
 
 extern "C" void xim_accept_paste(const char *text)
 {
+    if (accept_when_ready)
+    {
+        deferred_keys.push_back({0, 0, true, text});
+        return;
+    }
     if (prompt == Action::ignore) xim_engine_paste(text);
-    else input += text;
+    else
+    {
+        accept_when_ready = false;
+        input += text;
+        selected = 0;
+    }
+}
+
+extern "C" int xim_prompt_active() { return prompt != Action::ignore; }
+extern "C" int xim_input_blocked() { return deferred_keys.size() >= kMaxDeferredKeys; }
+
+extern "C" int xim_background()
+{
+    if (!xim_project_poll()) return 0;
+    if (prompt == Action::files && accept_when_ready && !xim_project_pending())
+    {
+        accept_when_ready = false;
+        xim_dispatch('\r', 0);
+        auto keys = std::move(deferred_keys);
+        deferred_keys.clear();
+        for (const auto &entry : keys)
+            if (entry.paste) xim_accept_paste(entry.text.c_str());
+            else xim_dispatch(entry.key, entry.modifiers);
+        return 1;
+    }
+    return 0;
 }
 
 extern "C" void xim_render()

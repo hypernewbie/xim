@@ -7,6 +7,15 @@ static pos_T selection_anchor;
 static int selection_buffer = 0;
 static int typing_count = 0;
 static int overlay_visible = FALSE;
+static int overlay_top = 0;
+static int overlay_rows = 0;
+static int overlay_columns = 0;
+typedef struct
+{
+    char_u bytes[MB_MAXBYTES + 1];
+    int attr;
+} xim_cell_T;
+static xim_cell_T *overlay_background = NULL;
 
     void
 xim_engine_boundary(void)
@@ -42,8 +51,8 @@ xim_engine_buffers(void)
     {
 	if (buf->b_flags & BF_DUMMY)
 	    continue;
-	size += STRLEN(buf->b_ffname != NULL
-					       ? buf->b_ffname : (char_u *)"[No Name]") + 1;
+        size += 4 * STRLEN(buf->b_ffname != NULL
+                ? buf->b_ffname : (char_u *)"[No Name]") + 32;
     }
 
     char_u *names = alloc(size);
@@ -54,11 +63,24 @@ xim_engine_buffers(void)
     {
 	if (buf->b_flags & BF_DUMMY)
 	    continue;
-	char_u *name = buf->b_ffname != NULL ? buf->b_ffname : (char_u *)"[No Name]";
-	size_t len = STRLEN(name);
-	mch_memmove(names + used, name, len);
-	used += len;
-	names[used++] = '\n';
+        char_u *name = buf->b_ffname != NULL ? buf->b_ffname : (char_u *)"[No Name]";
+        char_u *display = transstr(name);
+        if (display == NULL)
+        {
+            vim_free(names);
+            return NULL;
+        }
+        // Identity is the stable buffer number, not a truncated filename
+        // or an ambiguous [No Name] label. Keep the path tail visible.
+        int prefix = vim_snprintf_safelen((char *)names + used, size - used,
+                "%d:%c%c ", buf->b_fnum, buf == curbuf ? '*' : ' ',
+                bufIsChanged(buf) ? '+' : ' ');
+        used += prefix;
+        trunc_string(display, names + used, MAX(1, (int)Columns - prefix - 2),
+                (int)MIN(size - used, INT_MAX));
+        used += STRLEN(names + used);
+        vim_free(display);
+        names[used++] = '\n';
     }
     names[used] = '\0';
     return (char *)names;
@@ -435,11 +457,53 @@ xim_engine_overlay(const char *prompt, const char *items, int error)
     int attr = syn_name2attr((char_u *)"XimPalette");
     int count = 0;
     const char *p;
-    overlay_visible = TRUE;
     for (p = items; *p != NUL; ++p)
         if (*p == '\n')
             ++count;
     row -= count < row ? count : row;
+    xim_drawing_overlay = TRUE;
+    term_set_sync_output(TERM_SYNC_OUTPUT_ENABLE);
+    if (overlay_visible && (overlay_rows != Rows || overlay_columns != Columns))
+    {
+        redraw_all_later(UPD_NOT_VALID);
+        update_screen(0);
+        overlay_visible = FALSE;
+    }
+    if (!overlay_visible)
+    {
+        vim_free(overlay_background);
+        overlay_background = ALLOC_CLEAR_MULT(xim_cell_T, (size_t)Rows * Columns);
+        if (overlay_background != NULL)
+            for (int r = 0; r < Rows; ++r)
+                for (int col = 0; col < Columns; ++col)
+                {
+                    xim_cell_T *cell = &overlay_background[(size_t)r * Columns + col];
+                    screen_getbytes(r, col, cell->bytes, &cell->attr);
+                }
+    }
+    else if (row > overlay_top)
+    {
+        // Restore only newly exposed rows, never redraw the editor under
+        // the part of the menu that remains visible. Preserve UTF-8,
+        // combining characters, wide-cell identity and theme attributes.
+        if (overlay_background != NULL)
+            for (int r = overlay_top; r < row; ++r)
+                for (int col = 0; col < Columns; ++col)
+                {
+                    xim_cell_T *cell = &overlay_background[(size_t)r * Columns + col];
+                    if (*cell->bytes != NUL)
+                        screen_puts(cell->bytes, r, col, cell->attr);
+                }
+        else
+        {
+            redraw_all_later(UPD_NOT_VALID);
+            update_screen(0);
+        }
+    }
+    overlay_visible = TRUE;
+    overlay_top = row;
+    overlay_rows = Rows;
+    overlay_columns = Columns;
     for (p = items; *p != NUL && row < Rows - 2; p = end + 1, ++row)
     {
         int item_attr = error ? syn_name2attr((char_u *)"ErrorMsg")
@@ -447,14 +511,31 @@ xim_engine_overlay(const char *prompt, const char *items, int error)
         end = (const char *)vim_strchr((char_u *)p, '\n');
         if (end == NULL)
             break;
-        screen_fill(row, row + 1, 0, (int)Columns, ' ', ' ', item_attr);
         screen_puts_len((char_u *)p, (int)(end - p), row, 0, item_attr);
+        int cells = vim_strnsize((char_u *)p, (int)(end - p));
+        screen_fill(row, row + 1, MIN(cells, (int)Columns), (int)Columns,
+                ' ', ' ', item_attr);
     }
     attr = syn_name2attr((char_u *)"XimPrompt");
-    screen_fill((int)Rows - 1, (int)Rows, 0, (int)Columns, ' ', ' ', attr);
     screen_puts_len((char_u *)prompt, (int)STRLEN(prompt), (int)Rows - 1, 0, attr);
+    screen_fill((int)Rows - 1, (int)Rows,
+            MIN(vim_strsize((char_u *)prompt), (int)Columns), (int)Columns,
+            ' ', ' ', attr);
     windgoto((int)Rows - 1, MIN(vim_strsize((char_u *)prompt), (int)Columns - 1));
+    term_set_sync_output(TERM_SYNC_OUTPUT_DISABLE);
     out_flush();
+    xim_drawing_overlay = FALSE;
+}
+
+    static void
+xim_redraw_overlay(void)
+{
+    if (!xim_prompt_active())
+        return;
+    // The engine has produced a fresh underlying frame. Capture that
+    // frame rather than retaining a snapshot from before the resize.
+    overlay_visible = FALSE;
+    xim_render();
 }
 
     void
@@ -465,6 +546,7 @@ xim_initialize(void)
     // The picker falls back to a direct filesystem check for any path
     // the user types, so an out-of-tree file remains reachable without
     // a project root.
+    xim_redraw_ui = xim_redraw_overlay;
     char_u *root = NULL;
     int file_arguments = 0;
     int i;
@@ -509,14 +591,39 @@ xim_step(void)
     int c;
     int key;
     int modifiers = 0;
+    int blocking = FALSE;
     state_no_longer_safe("Xim input");
     if (selection_buffer != 0 && selection_buffer != curbuf->b_fnum)
         xim_engine_cancel();
     State = MODE_INSERT;
-    xim_render();
     ++no_mapping;
     ++allow_keys;
+    if (xim_background())
+    {
+        c = K_IGNORE;
+        goto received;
+    }
+    xim_render();
+    // Wait at the top-level seam: completions are not decoder input and
+    // engine operations never run inside safe_vgetc(). The existing Unix
+    // wait still services timers, channels and resize notifications.
+    while (xim_input_blocked()
+            || (vpeekc() == NUL && typebuf.tb_len == 0 && !input_available()))
+    {
+        xim_wake_fd = xim_project_wake_fd();
+        xim_waiting = TRUE;
+        out_flush_cursor(FALSE, FALSE);
+        blocking = mch_wait_for_xim_event(xim_input_blocked(), blocking);
+        xim_waiting = FALSE;
+        if (xim_background())
+        {
+            c = K_IGNORE;
+            goto received;
+        }
+        xim_render();
+    }
     c = safe_vgetc();
+received:
     --allow_keys;
     --no_mapping;
     if (c == K_PS)
@@ -572,11 +679,17 @@ xim_step(void)
     check_cursor();
     if (key != XIM_UP && key != XIM_DOWN)
         curwin->w_set_curswant = TRUE;
-    curwin->w_redr_status = TRUE;
-    redraw_curbuf_later(UPD_VALID);
-    if (overlay_visible)
+    if (!xim_prompt_active())
     {
-        redraw_all_later(UPD_NOT_VALID);
-        overlay_visible = FALSE;
+        curwin->w_redr_status = TRUE;
+        redraw_curbuf_later(UPD_VALID);
+        if (overlay_visible)
+        {
+            redraw_all_later(UPD_NOT_VALID);
+            clear_cmdline = TRUE;
+            redraw_cmdline = TRUE;
+            overlay_visible = FALSE;
+            VIM_CLEAR(overlay_background);
+        }
     }
 }

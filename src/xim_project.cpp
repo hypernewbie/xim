@@ -3,7 +3,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
+#include <condition_variable>
 #include <cstdlib>
+#include <fcntl.h>
+#include <memory>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -14,6 +18,7 @@
 #include <system_error>
 #include <thread>
 #include <vector>
+#include <unistd.h>
 
 namespace
 {
@@ -25,13 +30,51 @@ constexpr std::size_t kMaxExplorerRows = 500;
 std::filesystem::path root;
 std::set<std::string> expanded_directories;
 
+struct IndexedPath
+{
+    std::string path;
+    std::string folded;
+};
+using Index = std::vector<IndexedPath>;
 std::mutex state_lock;
-bool active = true;			    // a project root exists
-bool scan_complete = false;		    // the current scan finished
-std::vector<std::string> snapshot;	    // owned by the indexer
-unsigned snapshot_generation = 0;
+std::condition_variable scan_changed;
+std::condition_variable query_changed;
+bool active = false;
+bool scan_complete = false;
+bool scan_requested = false;
+bool query_requested = false;
+bool completion = false;
+const auto empty_index = std::make_shared<const Index>();
+std::shared_ptr<const Index> snapshot = empty_index;
+std::shared_ptr<const Index> retired_index;
 std::atomic<unsigned> current_generation{0};
-std::thread worker;
+std::atomic<unsigned> current_query{0};
+std::atomic<bool> stopping{false};
+std::string requested_query;
+std::string result_query;
+std::vector<std::string> results;
+unsigned result_generation = 0;
+unsigned result_revision = 0;
+bool query_active = false;
+std::thread scan_worker;
+std::thread query_worker;
+int wake_pipe[2] = {-1, -1};
+const char *worker_error = nullptr;
+
+void notify_editor()
+{
+    // The result slot is already published under state_lock. A full pipe
+    // means a wake is pending; never block a worker on terminal activity.
+    char byte = 1;
+    if (wake_pipe[1] >= 0)
+        while (write(wake_pipe[1], &byte, 1) < 0 && errno == EINTR) {}
+}
+
+bool obsolete(unsigned generation)
+{
+    return stopping.load(std::memory_order_relaxed)
+        || generation != current_generation.load(std::memory_order_relaxed);
+}
 
 std::string lowercase(std::string_view text)
 {
@@ -226,26 +269,21 @@ bool ignored_by_rules(const std::map<std::string, std::vector<gitignore_rule>> &
     return ignored;
 }
 
-int rank_match(const std::string &path, std::string_view query)
+int rank_match(std::string_view folded, std::string_view query)
 {
     if (query.empty())
-	return 0;
-    auto slash = path.find_last_of('/');
-    auto basename = path.substr(slash == std::string::npos ? 0 : slash + 1);
-    auto lower_path = lowercase(path);
-    auto lower_query = lowercase(query);
-    auto lower_basename = lowercase(basename);
-    if (lower_basename == lower_query)
-	return 0;
-    if (lower_basename.size() >= lower_query.size()
-	    && lower_basename.compare(0, lower_query.size(), lower_query) == 0)
-	return 1;
-    if (lower_path.find(lower_query) != std::string::npos)
-	return 2;
-    return -1;
+        return 0;
+    auto slash = folded.find_last_of('/');
+    auto basename = folded.substr(slash == std::string_view::npos ? 0 : slash + 1);
+    if (basename == query)
+        return 0;
+    if (basename.starts_with(query))
+        return 1;
+    return folded.find(query) != std::string_view::npos ? 2 : -1;
 }
 
-std::vector<std::string> enumerate(const std::filesystem::path &base)
+std::vector<std::string> enumerate(const std::filesystem::path &base,
+        unsigned generation)
 {
     // C++17 directory_options does not enable follow_directory_symlink, so
     // the iterator prunes directory symlinks by default.  This is the
@@ -276,11 +314,13 @@ std::vector<std::string> enumerate(const std::filesystem::path &base)
 	 entry != std::filesystem::recursive_directory_iterator();
 	 entry.increment(error))
     {
+        if (obsolete(generation))
+            return {};
 	error.clear();
 	// Lexical relative path: never resolve symlinks.  A file link keeps
 	// its in-tree name and a directory link stays an entry of this
 	// directory instead of turning into a path outside the root.
-	auto text = entry->path().lexically_relative(root).generic_string();
+	auto text = entry->path().lexically_relative(base).generic_string();
 	if (text.empty() || text == "." || text == ".."
 		|| text.compare(0, 3, "../") == 0)
 	    continue;
@@ -420,45 +460,158 @@ char *duplicate_lines(const std::vector<std::string> &lines)
     return result;
 }
 
-// Runs off the editor thread. It touches only owned path data.
-void scan(unsigned generation)
+std::vector<std::string> match_paths(const Index &paths, std::string_view query,
+        unsigned generation, unsigned revision)
 {
-    auto paths = enumerate(root);
-    std::lock_guard<std::mutex> guard(state_lock);
-    if (generation != current_generation.load(std::memory_order_acquire))
-	return;		    // stale root change, drop the batch
-    snapshot = std::move(paths);
-    snapshot_generation = generation;
-    scan_complete = true;
+    struct Match { int rank; const std::string *path; };
+    auto better = [](const Match &left, const Match &right) {
+        if (left.rank != right.rank) return left.rank < right.rank;
+        if (left.path->size() != right.path->size())
+            return left.path->size() < right.path->size();
+        return *left.path < *right.path;
+    };
+    std::vector<Match> best;
+    best.reserve(kMaxResults);
+    auto needle = lowercase(query);
+    for (const auto &path : paths)
+    {
+        if (obsolete(generation) || revision != current_query.load(std::memory_order_relaxed))
+            return {};
+        int rank = rank_match(path.folded, needle);
+        if (rank < 0) continue;
+        Match candidate{rank, &path.path};
+        if (best.size() < kMaxResults)
+        {
+            best.push_back(candidate);
+            std::push_heap(best.begin(), best.end(), better);
+        }
+        else if (better(candidate, best.front()))
+        {
+            std::pop_heap(best.begin(), best.end(), better);
+            best.back() = candidate;
+            std::push_heap(best.begin(), best.end(), better);
+        }
+    }
+    std::sort_heap(best.begin(), best.end(), better);
+    std::vector<std::string> matches;
+    for (const auto &match : best) matches.push_back(*match.path);
+    return matches;
+}
+
+void scan_loop()
+{
+    for (;;)
+    {
+        std::unique_lock lock(state_lock);
+        scan_changed.wait(lock, [] {
+            return stopping.load() || scan_requested || retired_index != nullptr;
+        });
+        if (stopping.load()) return;
+        auto retired = std::move(retired_index);
+        if (!scan_requested)
+        {
+            lock.unlock();
+            retired.reset();
+            continue;
+        }
+        auto base = root; // owned root; never read mutable root off-thread
+        unsigned generation = current_generation.load();
+        scan_requested = false;
+        lock.unlock();
+        retired.reset(); // large snapshots are freed off-thread, outside the mutex
+        auto paths = enumerate(base, generation);
+        auto index = std::make_shared<Index>();
+        index->reserve(paths.size());
+        for (auto &path : paths)
+        {
+            if (obsolete(generation)) break;
+            auto folded = lowercase(path);
+            index->push_back({std::move(path), std::move(folded)});
+        }
+        lock.lock();
+        if (obsolete(generation))
+        {
+            lock.unlock();
+            continue;
+        }
+        snapshot = std::move(index);
+        scan_complete = true;
+        completion = true;
+        if (query_active)
+        {
+            query_requested = true;
+            query_changed.notify_one();
+        }
+        notify_editor();
+        lock.unlock();
+    }
+}
+
+void query_loop();
+
+bool ensure_workers()
+{
+    if (scan_worker.joinable()) return true;
+    if (worker_error != nullptr) return false;
+    stopping.store(false);
+    if (pipe(wake_pipe) < 0)
+    {
+        worker_error = "Project wake descriptor unavailable";
+        return false;
+    }
+    for (int fd : wake_pipe)
+        if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK) < 0
+                || fcntl(fd, F_SETFD, FD_CLOEXEC) < 0)
+        {
+            for (int &owned : wake_pipe) { close(owned); owned = -1; }
+            worker_error = "Project wake descriptor setup failed";
+            return false;
+        }
+    try
+    {
+        scan_worker = std::thread(scan_loop);
+        query_worker = std::thread(query_loop);
+    }
+    catch (const std::system_error &)
+    {
+        {
+            std::lock_guard lock(state_lock);
+            stopping.store(true);
+        }
+        scan_changed.notify_one();
+        if (scan_worker.joinable()) scan_worker.join();
+        for (int &owned : wake_pipe) { close(owned); owned = -1; }
+        worker_error = "Project worker startup failed";
+        return false;
+    }
+    static bool registered = false;
+    if (!registered)
+    {
+        std::atexit(xim_project_shutdown);
+        registered = true;
+    }
+    return true;
+}
+
+// Called under state_lock. There can be only one unpublished retirement:
+// the scanner consumes it before publishing another nonempty snapshot.
+void retire_snapshot()
+{
+    if (!snapshot->empty()) retired_index = std::move(snapshot);
+    snapshot = empty_index;
+    if (retired_index != nullptr) scan_changed.notify_one();
 }
 
 void start_scan()
 {
-    if (worker.joinable())
-	worker.join();	    // bounded: at most one enumeration runs at a time
-    unsigned generation = current_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
-    {
-	std::lock_guard<std::mutex> guard(state_lock);
-	snapshot.clear();
-	snapshot_generation = 0;
-	scan_complete = false;
-    }
-    worker = std::thread([generation]() { scan(generation); });
-}
-
-bool ready()
-{
-    if (!active)
-	return false;
-    std::lock_guard<std::mutex> guard(state_lock);
-    return scan_complete
-	 && snapshot_generation == current_generation.load(std::memory_order_acquire);
-}
-
-std::vector<std::string> indexed()
-{
-    std::lock_guard<std::mutex> guard(state_lock);
-    return snapshot;
+    std::lock_guard lock(state_lock);
+    if (!active) return;
+    current_generation.fetch_add(1);
+    retire_snapshot();
+    results.clear();
+    scan_complete = false;
+    scan_requested = true;
+    scan_changed.notify_one();
 }
 }
 
@@ -468,16 +621,17 @@ xim_project_init(const char *path)
     std::error_code error;
     auto requested = path == nullptr || *path == '\0'
 	? std::filesystem::current_path() : std::filesystem::absolute(path, error);
-    root = error ? std::filesystem::current_path() : requested;
-    active = true;
+    if (!ensure_workers()) return;
+    {
+        std::lock_guard lock(state_lock);
+        root = error ? std::filesystem::current_path() : requested;
+        active = true;
+        current_query.fetch_add(1);
+        query_active = false;
+        query_requested = false;
+    }
     expanded_directories.clear();
     start_scan();
-    static bool registered = false;
-    if (!registered)
-    {
-	std::atexit(xim_project_shutdown);
-	registered = true;
-    }
 }
 
 // A file-only invocation has no project: pickers serve explicit paths
@@ -485,15 +639,18 @@ xim_project_init(const char *path)
 extern "C" void
 xim_project_disable(void)
 {
-    if (worker.joinable())
-	worker.join();
-    std::lock_guard<std::mutex> guard(state_lock);
+    std::lock_guard lock(state_lock);
+    current_generation.fetch_add(1);
+    current_query.fetch_add(1);
     active = false;
+    scan_requested = false;
+    query_requested = false;
+    query_active = false;
     scan_complete = false;
     root.clear();
     expanded_directories.clear();
-    snapshot.clear();
-    snapshot_generation = 0;
+    retire_snapshot();
+    results.clear();
 }
 
 extern "C" void
@@ -505,30 +662,60 @@ xim_project_refresh(void)
 extern "C" void
 xim_project_shutdown(void)
 {
-    if (worker.joinable())
-	worker.join();
+    {
+        std::lock_guard lock(state_lock);
+        stopping.store(true);
+    }
+    scan_changed.notify_one();
+    query_changed.notify_one();
+    if (scan_worker.joinable()) scan_worker.join();
+    if (query_worker.joinable()) query_worker.join();
+    for (int &fd : wake_pipe)
+    {
+        if (fd >= 0) close(fd);
+        fd = -1;
+    }
+}
+
+extern "C" int xim_project_wake_fd(void) { return wake_pipe[0]; }
+
+extern "C" int xim_project_poll(void)
+{
+    char bytes[256];
+    if (wake_pipe[0] >= 0)
+        while (read(wake_pipe[0], bytes, sizeof(bytes)) > 0) {}
+    std::lock_guard lock(state_lock);
+    bool changed = completion;
+    completion = false;
+    return changed;
+}
+
+extern "C" void xim_project_cancel_query(void)
+{
+    std::lock_guard lock(state_lock);
+    current_query.fetch_add(1);
+    query_active = false;
+    query_requested = false;
+    results.clear();
+}
+
+extern "C" int xim_project_pending(void)
+{
+    std::lock_guard lock(state_lock);
+    return query_active && (result_generation != current_generation.load()
+        || result_revision != current_query.load() || result_query != requested_query
+        || (active && !scan_complete && results.empty()));
 }
 
 extern "C" const char *
 xim_project_status(void)
 {
     static thread_local std::string text;
-    if (!active)
-    {
-	text.clear();
-	return text.c_str();
-    }
-    if (ready())
-    {
-	unsigned generation = current_generation.load(std::memory_order_acquire);
-	std::lock_guard<std::mutex> guard(state_lock);
-	if (snapshot_generation != generation)
-	    text = "Indexing project...";
-	else
-	    text.clear();
-    }
-    else
-	text = "Indexing project...";
+    std::lock_guard lock(state_lock);
+    text = worker_error != nullptr ? worker_error
+        : active && !scan_complete ? "Indexing project..."
+        : query_active && (result_revision != current_query.load()
+            || result_generation != current_generation.load()) ? "Finding files..." : "";
     return text.c_str();
 }
 
@@ -578,60 +765,72 @@ std::string resolve_explicit_path(std::string_view query,
     return relative.generic_string();
 }
 
+namespace
+{
+void query_loop()
+{
+    for (;;)
+    {
+        std::unique_lock lock(state_lock);
+        query_changed.wait(lock, [] { return stopping.load() || query_requested; });
+        if (stopping.load()) return;
+        auto paths = snapshot;
+        auto base = root;
+        auto text = requested_query;
+        unsigned generation = current_generation.load();
+        unsigned revision = current_query.load();
+        query_requested = false;
+        lock.unlock();
+        auto candidates = match_paths(*paths, text, generation, revision);
+        if (looks_like_path(text))
+        {
+            bool outside = false;
+            auto path = resolve_explicit_path(text, base.string(), &outside);
+            if (!path.empty())
+            {
+                auto display = outside ? "> " + path : path;
+                std::erase(candidates, display);
+                candidates.insert(candidates.begin(), std::move(display));
+                if (candidates.size() > kMaxResults) candidates.resize(kMaxResults);
+            }
+        }
+        lock.lock();
+        if (obsolete(generation) || revision != current_query.load()
+                || !query_active || paths != snapshot)
+        {
+            lock.unlock();
+            continue;
+        }
+        results = std::move(candidates);
+        result_query = std::move(text);
+        result_generation = generation;
+        result_revision = revision;
+        completion = true;
+        notify_editor();
+        lock.unlock(); // releasing an old shared index must not hold state_lock
+    }
+}
+}
+
 extern "C" char *
 xim_project_files(const char *query)
 {
+    if (!ensure_workers()) return nullptr;
     std::string_view text = query == nullptr ? "" : query;
-    std::vector<std::string> candidates;
-    bool explicit_first = false;
-    if (looks_like_path(text))
+    std::lock_guard lock(state_lock);
+    if (!query_active || requested_query != text)
     {
-	bool out_of_root = false;
-	auto explicit_path = resolve_explicit_path(text, root.string(), &out_of_root);
-	if (!explicit_path.empty())
-	{
-	    // Out-of-root results are prefixed so the picker can render them
-	    // differently and the controller can flag the eventual open.
-	    if (out_of_root)
-		candidates.push_back(std::string("> ") + explicit_path);
-	    else
-		candidates.push_back(std::move(explicit_path));
-	    explicit_first = true;
-	}
+        requested_query = text;
+        current_query.fetch_add(1);
+        query_active = true;
+        query_requested = true;
+        results.clear();
+        query_changed.notify_one();
     }
-    if (ready())
-    {
-	// Rank each candidate once and sort the ranks; the explicit
-	// candidate stays first and is not repeated by the index.
-	auto paths = indexed();
-	std::vector<std::pair<int, const std::string *>> ranked;
-	ranked.reserve(paths.size());
-	for (const auto &path : paths)
-	{
-	    auto rank = rank_match(path, text);
-	    if (rank >= 0)
-		ranked.emplace_back(rank, &path);
-	}
-	std::sort(ranked.begin(), ranked.end(),
-		[](const auto &left, const auto &right) {
-		    if (left.first != right.first)
-			return left.first < right.first;
-		    if (left.second->size() != right.second->size())
-			return left.second->size() < right.second->size();
-		    return *left.second < *right.second;
-		});
-	for (const auto &match : ranked)
-	{
-	    if (explicit_first && *match.second == candidates.front())
-		continue;
-	    candidates.push_back(*match.second);
-	    if (candidates.size() >= kMaxResults)
-		break;
-	}
-    }
-    if (candidates.empty())
-	return nullptr;
-    return duplicate_lines(candidates);
+    if (result_generation != current_generation.load()
+            || result_revision != current_query.load() || result_query != text)
+        return nullptr;
+    return duplicate_lines(results);
 }
 
 extern "C" char *

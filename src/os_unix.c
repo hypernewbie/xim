@@ -485,6 +485,31 @@ mch_char_avail(void)
     return WaitForChar(0L, NULL, FALSE);
 }
 
+/* Native top-level wait: a completion wakes it without adding input bytes. */
+    int
+mch_wait_for_xim_event(int completion_only, int blocking)
+{
+    int interrupted = FALSE;
+    int available;
+
+    (void)vim_handle_signal(SIGNAL_UNBLOCK);
+    ctrl_c_interrupts = FALSE;
+    if (completion_only && xim_wake_fd >= 0)
+        available = RealWaitForChar(xim_wake_fd, -1L, NULL, &interrupted);
+    else
+        available = WaitForChar(blocking ? -1L : p_ut, &interrupted, FALSE);
+    ctrl_c_interrupts = TRUE;
+    (void)vim_handle_signal(SIGNAL_BLOCK);
+    if (!blocking && !available && !interrupted)
+    {
+        // Preserve the inherited one-time idle swap flush, then block
+        // indefinitely. This is not an idle result-polling timer.
+        before_blocking();
+        return TRUE;
+    }
+    return blocking;
+}
+
 #if defined(FEAT_TERMINAL)
 /*
  * Check for any pending input or messages.
@@ -6656,6 +6681,8 @@ RealWaitForChar(int fd, long msec, int *check_for_gpm UNUSED, int *interrupted)
     for (;;)
 # endif
     {
+        int xim_fd = xim_native_mode && xim_waiting ? xim_wake_fd : -1;
+        int xim_woke = FALSE;
 # ifdef MAY_LOOP
 	int		finished = TRUE; // default is to 'loop' just once
 #  ifdef FEAT_MZSCHEME
@@ -6667,8 +6694,9 @@ RealWaitForChar(int fd, long msec, int *check_for_gpm UNUSED, int *interrupted)
 # endif
 # ifndef HAVE_SELECT
 			// each channel may use in, out and err
-	struct pollfd   fds[7 + 3 * MAX_OPEN_CHANNELS + 2 * MAX_CLIENT_CHANNELS];
+	struct pollfd   fds[8 + 3 * MAX_OPEN_CHANNELS + 2 * MAX_CLIENT_CHANNELS];
 	int		nfd;
+        int             xim_idx = -1;
 #  ifdef FEAT_WAYLAND_CLIPBOARD
 	int             wayland_idx = -1;
 #  endif
@@ -6694,6 +6722,12 @@ RealWaitForChar(int fd, long msec, int *check_for_gpm UNUSED, int *interrupted)
 	fds[0].fd = fd;
 	fds[0].events = POLLIN;
 	nfd = 1;
+        if (xim_fd >= 0)
+        {
+            xim_idx = nfd++;
+            fds[xim_idx].fd = xim_fd;
+            fds[xim_idx].events = POLLIN;
+        }
 
 #  ifdef FEAT_WAYLAND
 	if ((wayland_fd = wayland_prepare_read()) >= 0)
@@ -6740,6 +6774,8 @@ RealWaitForChar(int fd, long msec, int *check_for_gpm UNUSED, int *interrupted)
 
 	ret = poll(fds, nfd, towait);
 
+        xim_woke = ret > 0 && xim_idx >= 0
+            && (fds[xim_idx].revents & POLLIN);
 	result = ret > 0 && (fds[0].revents & POLLIN);
 	if (result == 0 && interrupted != NULL && ret > 0)
 	    *interrupted = TRUE;
@@ -6834,6 +6870,12 @@ select_eintr:
 	FD_SET(fd, &efds);
 #  endif
 	maxfd = fd;
+        if (xim_fd >= 0 && xim_fd < FD_SETSIZE)
+        {
+            FD_SET(xim_fd, &rfds);
+            if (maxfd < xim_fd)
+                maxfd = xim_fd;
+        }
 
 #  ifdef FEAT_WAYLAND
 	if ((wayland_fd = wayland_prepare_read()) >= 0)
@@ -6884,6 +6926,8 @@ select_eintr:
 
 	ret = select(maxfd + 1, SELECT_TYPE_ARG234 &rfds,
 		      SELECT_TYPE_ARG234 &wfds, SELECT_TYPE_ARG234 &efds, tvp);
+        xim_woke = ret > 0 && xim_fd >= 0 && xim_fd < FD_SETSIZE
+            && FD_ISSET(xim_fd, &rfds);
 	result = ret > 0 && FD_ISSET(fd, &rfds);
 	if (result)
 	    --ret;
@@ -6990,6 +7034,9 @@ select_eintr:
 #  endif
 
 # endif // HAVE_SELECT
+
+        if (xim_woke)
+            break; // completion belongs to the top-level native controller
 
 # ifdef MAY_LOOP
 	if (finished || msec == 0)

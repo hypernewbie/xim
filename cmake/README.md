@@ -88,8 +88,26 @@ startup samples did not enable syntax and are not equivalent configurations.
 See `cmake/PLAN0_CLOSEOUT.md` for the pre-implementation native budgets.
 See `cmake/PLAN1_VALIDATION.md` for the implementation's test, theme and
 performance evidence, including the recorded full-suite rerun.
-Use `--self-test --runs 1` to check delayed completion. `--startup-log PATH`
-records a native startup trace for the first sample. For an instrumented
+`cmake/PLAN3_VALIDATION.md` covers background completion and incremental UI.
+The PTY harness maintains an incremental screen so unchanged prompt prefixes
+need not be re-emitted for a visible-text assertion.
+
+For completed project-query and editing-during-scan measurements:
+
+```sh
+python3 cmake/benchmark_xim_project.py --binary build/dev/src/xim \
+    --work build/plan3/project-perf --runs 60 \
+    --output build/plan3/project-perf.json
+```
+
+This creates exactly 100000 indexed files in a private temporary project,
+warms the owned path index, verifies both query text and selected result,
+and measures project startup through a content-checked edit during scanning.
+It also checks activation contents and idle output/CPU. Run serially, without
+compilation or other benchmark workloads. `xim_project` checks matching,
+result caps, query/root revisions, refresh and shutdown with owned fixtures.
+For `benchmark_xim.py`, use `--self-test --runs 1` to check delayed completion.
+Its `--startup-log PATH` records a native startup trace for the first sample. For an instrumented
 Clang profiling build, use `-pg -DWE_ARE_PROFILING` for C and C++ and `-pg`
 at link time. Supply `--profile-dir PATH` to preserve gprof data; quit is
 orderly in that mode. Instrumented timings are diagnostic, not acceptance

@@ -13,6 +13,7 @@ import tempfile
 import termios
 import time
 from pathlib import Path
+from terminal_screen import TerminalScreen
 
 
 class Session:
@@ -37,6 +38,7 @@ class Session:
                                         start_new_session=True)
         os.close(slave)
         self.serial = 0
+        self.screen = TerminalScreen()
         try:
             self.wait(ready)
             self.first_paint_ns = time.perf_counter_ns() - self.started
@@ -60,10 +62,14 @@ class Session:
             ready, _, _ = select.select([self.master], [], [], min(remaining, .1))
             if ready:
                 try:
-                    output.extend(os.read(self.master, 65536))
+                    data = os.read(self.master, 65536)
+                    self.screen.feed(data)
+                    output.extend(data)
+                    if marker in self.screen.text():
+                        break
                 except OSError as error:
                     raise AssertionError(f"editor exited: {self.process.poll()}, {bytes(output)!r}") from error
-        return bytes(output)
+        return bytes(output) + b"\n" + self.screen.text()
 
     def drain(self, timeout=.5):
         """Read whatever arrives within the timeout without requiring a marker."""
@@ -73,7 +79,9 @@ class Session:
             ready, _, _ = select.select([self.master], [], [], min(.1, max(0, deadline - time.monotonic())))
             if ready:
                 try:
-                    output.extend(os.read(self.master, 65536))
+                    data = os.read(self.master, 65536)
+                    self.screen.feed(data)
+                    output.extend(data)
                 except OSError:
                     break
         return bytes(output)
@@ -625,8 +633,13 @@ def project_refresh_preserves_expansion(binary, root):
             session.send(b"\r")              # expand src/
             session.wait(b"alpha.cpp")
             session.send(b"\x1b")
-            # :edit! on the same buffer triggers a refresh.
-            session.ex("edit!")
+            # A real native refresh must discover a file created after
+            # the initial scan, not merely reopen an unchanged buffer.
+            (project / "src" / "new.cpp").write_text("new\n")
+            session.send(b"\x1bOPRefresh project\r")
+            session.send(b"\x10new")
+            session.wait(b"src/new.cpp")
+            session.send(b"\x1b")
             session.send(b"\x1bOPExplorer\r")
             screen = session.wait(b"Explorer:")
             assert b"alpha.cpp" in screen, "expansion lost after refresh"
@@ -749,6 +762,102 @@ def project_duplicate_basenames(binary, root):
         print("Duplicate-basename disambiguation check passed")
 
 
+def project_background(binary, root):
+    """Idle completion, query revisions, queued input and worker shutdown."""
+    with tempfile.TemporaryDirectory(prefix="xim-background-", dir=root) as temporary:
+        project = Path(temporary)
+        (project / "files").mkdir()
+        for i in range(7500):
+            (project / "files" / f"alpha_{i:05d}.txt").touch()
+        (project / "idle_target.txt").write_text("TARGET\n")
+        session = Session(binary, project, arguments=(".",))
+        try:
+            session.send(b"\x10idle_target")
+            # No follow-up key: both scan and match completion must wake.
+            session.wait(b"idle_target.txt")
+            session.drain(.1)
+            assert session.drain(.25) == b"", "idle picker repeatedly redraws"
+            # Send an obsolete query, then replace it and immediately Enter.
+            # Subsequent typing belongs to the opened file, not the picker.
+            session.send(b"\x1b\x10obsolete\x1b\x10idle_target\rPOST")
+            assert session.snapshot() == "POSTTARGET\n", "stale query or input after Enter lost"
+            # Bracketed paste following Enter keeps its payload and undo
+            # boundary even if the current query has not completed yet.
+            session.send(b"\x10idle_target\r\x1b[200~" + "界\n".encode() + b"\x1b[201~")
+            assert "界\n" in session.snapshot(), "paste after Enter was lost"
+            session.send(b"\x11")
+            session.wait(b"Save changes")
+            session.send(b"d")
+            session.process.wait(timeout=2)
+            assert session.process.returncode == 0, "worker shutdown failed"
+        finally:
+            session.close()
+        print("Idle background completion, revisions and queued-input checks passed")
+
+
+def buffer_picker_identity(binary, root):
+    """Unnamed buffers have stable IDs; displayed names are not identities."""
+    with tempfile.TemporaryDirectory(prefix="xim-buffer-identity-", dir=root) as temporary:
+        project = Path(temporary)
+        session = Session(binary, project)
+        try:
+            session.send(b"first")
+            session.ex("hide enew")
+            session.send(b"second")
+            assert session.snapshot() == "second\n"
+            session.send(b"\x1bOPBuffers\r")
+            session.wait(b"Buffers:")
+            visible = session.screen.text()
+            assert b"1: + [No Name]" in visible, "first unnamed modified buffer missing"
+            assert b"2:*+ [No Name]" in visible, "second unnamed active buffer missing"
+            session.send(b"\r")
+            assert session.snapshot() == "first\n", "unnamed picker switched by ambiguous name"
+            session.send(b"\x1bOPBuffers\r")
+            session.wait(b"Buffers:")
+            session.send(b"\x1b[B\r")
+            assert session.snapshot() == "second\n", "second unnamed identity changed"
+        finally:
+            session.close()
+        print("Stable unnamed buffer IDs and modified/active markers checked")
+
+
+def ui_incremental(binary, root):
+    """Do not erase the editor/unchanged menu while typing in a prompt."""
+    with tempfile.TemporaryDirectory(prefix="xim-ui-", dir=root) as temporary:
+        project = Path(temporary)
+        marker = "UNDERLYING_MARKER"
+        (project / "fixture.txt").write_text((marker + " α界é\n") * 40)
+        session = Session(binary, project, arguments=("fixture.txt",))
+        try:
+            session.send(b"\x1bOPSa")
+            session.wait(b"Command: Sa")
+            session.drain(.1)
+            session.send(b"v")
+            output = session.drain(.1)
+            assert marker.encode() not in output, "prompt typing restored covered document"
+            assert b"Save as" not in output, "unchanged menu row repainted"
+            assert b"Command: Sav" in session.screen.text(), "incremental prompt text missing"
+            session.send(b"\x1b[B")
+            output = session.drain(.1)
+            assert marker.encode() not in output, "arrow selection repainted document"
+            # Shrinking/closing restores original Unicode cells and text.
+            session.send(b"\x1b")
+            session.drain(.1)
+            assert (marker + " α界é").encode() in session.screen.text(), "overlay restore damaged UTF-8"
+            session.send(b"\x1bOPSa")
+            session.wait(b"Command: Sa")
+            fcntl.ioctl(session.master, termios.TIOCSWINSZ, struct.pack("HHHH", 16, 80, 0, 0))
+            session.screen = TerminalScreen(16, 80)
+            session.process.send_signal(signal.SIGWINCH)
+            session.wait(b"Command: Sa")  # resize redraws without an input key
+            session.send(b"\x1b")
+            session.drain(.1)
+            assert marker.encode() in session.screen.text(), "resize/close did not restore editor"
+        finally:
+            session.close()
+        print("Incremental overlay, Unicode restore and idle resize checks passed")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -768,3 +877,6 @@ if __name__ == "__main__":
     project_gitignore_scoped(args.binary.resolve(), args.work.resolve())
     project_picker_arrows(args.binary.resolve(), args.work.resolve())
     project_dirty_switch(args.binary.resolve(), args.work.resolve())
+    project_background(args.binary.resolve(), args.work.resolve())
+    ui_incremental(args.binary.resolve(), args.work.resolve())
+    buffer_picker_identity(args.binary.resolve(), args.work.resolve())

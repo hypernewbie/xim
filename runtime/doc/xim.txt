@@ -1,5 +1,5 @@
 *xim.txt*	Native non-modal terminal editing
-					Last change: 2026 Oct 04
+					Last change: 2026 Oct 05
 
 Xim's native input layer uses the existing Vim text engine.  This document
 describes the first native editing milestone.
@@ -54,6 +54,7 @@ Quick open	Ctrl-P		palette: Files
 Explorer	Ctrl-E		palette: Explorer
 Buffers	Ctrl-Shift-B	palette: Buffers
 Command palette	Ctrl-Shift-P	F1 or F2
+Refresh project			palette: Refresh project
 
 The palette filters command names by case-insensitive substring.  Up/Down
 move the selection in every list prompt (palette, quick open, explorer,
@@ -79,20 +80,32 @@ A query containing a slash is treated as a path: the picker checks the
 filesystem directly and offers the file even before the index arrives, and
 out-of-root results show an absolute path.
 
-Enumeration runs on a bounded background job, so it never delays first edit.
-The picker shows "Indexing project..." until the first snapshot arrives.
-Results stay capped, and a newer root change discards an older scan.
+Enumeration and file matching run on two persistent background workers.
+The picker shows "Indexing project..." until the snapshot arrives, or
+"Finding files..." while a query is pending.  Completed results appear without
+another keypress.  Only the latest query is shown; Enter during matching waits
+for that query, and subsequent typing or paste belongs to the opened file.
+Escape cancels a pending choice.  Results stay capped at 200.
+
+Use Refresh project in the palette to rebuild the index after files change.
+Refresh keeps explorer expansion and cancels obsolete work without waiting for
+the previous walk to finish.  There is no automatic filesystem watcher.
+Workers never access editor buffers or draw the interface.  Native overlays
+update changed cells rather than erasing the document on each prompt key.
 
 The explorer shows one directory level at a time.  Enter expands or collapses
 a directory and opens a file.  Directory symlinks are never expanded, so a
 link cannot lead outside the root or loop; a file symlink is listed under its
 own name and opens its target.  Picking a file or buffer switches to it
 without a Save/Discard prompt and keeps any unsaved buffer in the buffer
-list.
+list.  Buffer rows show a stable number, '*' for the active buffer and '+' for
+unsaved changes.  Long paths are shortened in the middle so the filename stays
+visible.  Two unnamed buffers remain separate choices.
 
 Save on an unnamed buffer opens Save as.  The explicit Open prompt, Close,
 and Quit protect modified buffers with Save, Discard, and Cancel choices.
-Quit checks all buffers, including buffers kept unsaved by a picker switch.  Failed writes retain the modified text and report the error.  A
+Quit checks all buffers, including buffers kept unsaved by a picker switch.
+Failed writes retain the modified text and report the error.  A
 failed confirmation save keeps Save, Discard, and Cancel available.  Save as
 refuses to overwrite an existing file; an explicitly requested Ex command
 can apply the inherited write policy.  A successful Save or Save-as write

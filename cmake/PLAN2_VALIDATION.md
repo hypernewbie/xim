@@ -101,10 +101,10 @@ the direct filesystem check.
 
 ### Refresh preserves expansion
 
-`start_scan()` leaves `expanded_directories` untouched. A `:edit!` on the
-same buffer re-enters the walker; the explorer's expanded state from the
-previous render survives because the registry is only reset when the root
-changes.
+`start_scan()` leaves `expanded_directories` untouched. The Plan 2 test only
+proved that expansion survived reopening the explorer: `:edit!` did not
+refresh the index. Plan 3 wires the native Refresh project action and tests
+that a newly created file appears. See `cmake/PLAN3_VALIDATION.md`.
 
 ### Symlink cycle and root escape
 
@@ -157,7 +157,8 @@ Startup is flat across project size.
   ASan build: 2/2 in 15.3 s. TSan build: 2/2 in 16.6 s.
 - No new compiler warnings. `git diff --check` passes.
 - Python PTY script (`cmake/test_xim.py`) extended with the Plan 2
-  closeout scenarios plus the review-closeout scenarios: 13 functions,
+  closeout scenarios plus the review-closeout scenarios: 12 workflow
+  functions (13 status reports at that round),
   all passing on `build/dev/src/xim` (and on the clean tracked-source
   build's candidate binary) in ~15 s. The absolute-path scenario types
   every character of the absolute path, including the bare `/` prefix
@@ -202,19 +203,20 @@ Startup is flat across project size.
 - Anchored multi-component `.gitignore` patterns (a leading `/` followed
   by another `/`) are skipped. Single-component anchors match one
   component deep, matching git.
-- Results refresh on the next render after a scan completes. There is no
-  explicit wake of the input wait, so a result may appear on the next
-  keypress. Waking the input wait is the next slice.
-- Matching still runs synchronously on the editor thread at render time
-  (single-pass rank computation, capped results). On a 100000-path
-  synthetic snapshot a query costs roughly 45 ms pre-fix, and the rank
-  caching in this round halves it. Moving matching off the editor thread
-  with cancellation belongs to the wake-input-wait slice.
+- At this round, results required the next keypress after scan completion.
+  Plan 3 corrects this with a wake descriptor, not an idle polling loop.
+- At this round, matching still ran synchronously on the editor thread.
+  The earlier diagnostic measured roughly 45 ms on 100000 paths; rank
+  caching removed repeated comparator work but was not a new acceptance
+  measurement. Plan 3 moves matching off-thread, adds cancellation and
+  an idle wake, and measures completed visible results. See
+  `cmake/PLAN3_VALIDATION.md`.
 - Explorer activation always resolves through the project root; opening
   a file symlink changes the buffer name to the resolved target.
 - `xim_native_screens` runs only where the runner `vim` has `+terminal`.
-  The `default` preset builds `vim` without it, so the suite silently
-  skips there (`build/default/src/vim --version` shows `-terminal`);
+  The existing local `build/default` binary lacked it, so the suite silently
+  skipped there (`build/default/src/vim --version` showed `-terminal`);
+  this was an observed build state, not a default-preset requirement.
   `build/dev` is the acceptance configuration for this test.  A skipped
   suite still exits 0 — check the `messages` file for "NO tests
   executed" before trusting a green run in a new build directory.

@@ -28,7 +28,8 @@ product, release, and compiler policies do not override this file.
 
 Local notes are in `temp/XIM_DESIGN.md`, `temp/XIM_PLAN0.md`,
 `temp/XIM_PLAN0_REVIEW.md`, `temp/XIM_PLAN1.md`, `temp/XIM_PLAN1_REVIEW.md`,
-`temp/XIM_PLAN1_FULL_INITIAL_FAILURE.md`, and `temp/XIM_PLAN2.md`.
+`temp/XIM_PLAN1_FULL_INITIAL_FAILURE.md`, `temp/XIM_PLAN2.md`, and
+`temp/XIM_PLAN3.md`.
 Read them when present. `temp/` is gitignored, so these files can be absent
 in other checkouts. The requirements in this file do not depend on those notes.
 
@@ -47,7 +48,7 @@ in other checkouts. The requirements in this file do not depend on those notes.
 - Choose explicit minimum tool versions. Do not constrain new code to ancient
   compiler capabilities.
 
-## Current milestone: Plan 1 closeout
+## Current milestone: Plan 3 background completion and terminal drawing
 
 Plan 0 closeout fixes and the operator-authorized Plan 1 native editing layer
 are implemented. Evidence is in `cmake/PLAN0_CLOSEOUT.md` and
@@ -62,6 +63,14 @@ The first slice ships the project root, background index, quick open, explorer
 and buffer picker; evidence is in `cmake/PLAN2_VALIDATION.md`. It still follows
 the gates and per-slice validation below. The save-workflow fixes remain
 required before navigation features.
+
+The operator authorized the next background-completion slice and fixes for
+flashing native UI on 2026-10-05. Plan 3 adds cancellable asynchronous file
+matching, event-driven idle completion, native refresh and incremental overlay
+drawing. Evidence is in `cmake/PLAN3_VALIDATION.md`. Editor buffers and rendering
+remain on the owning thread; scanner/matcher workers handle owned path data.
+This authorization does not include content search, Windows bring-up or a
+replacement renderer.
 Keep these gates in effect for subsequent changes:
 
 - Build from tracked sources without Make-generated source-tree headers.

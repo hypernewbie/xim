@@ -82,6 +82,8 @@ The native benchmark uses real Xim shortcuts, buffer-content assertions,
 editor-assembled completion markers, and redraw before acknowledgment.
 Each round alternates reference/native order. Command-UI entry compares the
 native palette with Vim's Ex prompt; those are different available interfaces.
+Native runs also report menu open/selection and mouse click/drag/wheel
+latencies completed on rendered items or engine cursor state.
 The Vim reference enables the same syntax defaults, status-area height and
 exclusive selection. It loads no user plugins. Earlier minimal-reference
 startup samples did not enable syntax and are not equivalent configurations.
@@ -89,8 +91,11 @@ See `cmake/PLAN0_CLOSEOUT.md` for the pre-implementation native budgets.
 See `cmake/PLAN1_VALIDATION.md` for the implementation's test, theme and
 performance evidence, including the recorded full-suite rerun.
 `cmake/PLAN3_VALIDATION.md` covers background completion and incremental UI.
-The PTY harness maintains an incremental screen so unchanged prompt prefixes
-need not be re-emitted for a visible-text assertion.
+`cmake/PLAN4_VALIDATION.md` covers the native menus, mouse interaction,
+idle/overlay checks and the new menu/mouse latency phases. The registered
+`xim_menu` test covers the menu registry, geometry, enabled/checked states and
+hit testing. The PTY harness maintains an incremental screen so unchanged
+prompt prefixes need not be re-emitted for a visible-text assertion.
 
 For completed project-query and editing-during-scan measurements:
 

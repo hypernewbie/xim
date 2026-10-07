@@ -23,12 +23,13 @@ Action resolve(int key, int modifiers)
     if (key == XIM_F7 || key == 24) return Action::cut;
     if (key == XIM_F8 || key == 22) return Action::paste;
     if (key == XIM_F9 || key == 26) return Action::undo;
-    if (key == XIM_F10 || key == 25) return Action::redo;
+    if (key == XIM_F10) return Action::menu;
+    if (key == 25) return Action::redo;
     if (key == XIM_F11 || key == 6) return Action::find;
     if (key == XIM_F12 || key == 17) return Action::quit;
     if (key == 23) return Action::close;
     if (key == 1) return Action::select_all;
-    if (key == 14) return Action::next;
+    if (key == 14) return Action::new_buffer;
     if (key == 2) return Action::previous;
     if (key == '\r' || key == '\n' || key == '\t'
             || (key >= 32 && key < XIM_LEFT && !(modifiers & (XIM_CTRL | XIM_ALT))))

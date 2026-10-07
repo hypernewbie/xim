@@ -28,8 +28,8 @@ product, release, and compiler policies do not override this file.
 
 Local notes are in `temp/XIM_DESIGN.md`, `temp/XIM_PLAN0.md`,
 `temp/XIM_PLAN0_REVIEW.md`, `temp/XIM_PLAN1.md`, `temp/XIM_PLAN1_REVIEW.md`,
-`temp/XIM_PLAN1_FULL_INITIAL_FAILURE.md`, `temp/XIM_PLAN2.md`, and
-`temp/XIM_PLAN3.md`.
+`temp/XIM_PLAN1_FULL_INITIAL_FAILURE.md`, `temp/XIM_PLAN2.md`,
+`temp/XIM_PLAN2_REVIEW.md`, `temp/XIM_PLAN3.md`, and `temp/XIM_PLAN4.md`.
 Read them when present. `temp/` is gitignored, so these files can be absent
 in other checkouts. The requirements in this file do not depend on those notes.
 
@@ -48,7 +48,7 @@ in other checkouts. The requirements in this file do not depend on those notes.
 - Choose explicit minimum tool versions. Do not constrain new code to ancient
   compiler capabilities.
 
-## Current milestone: Plan 3 background completion and terminal drawing
+## Current milestone: Plan 4 native menus and mouse
 
 Plan 0 closeout fixes and the operator-authorized Plan 1 native editing layer
 are implemented. Evidence is in `cmake/PLAN0_CLOSEOUT.md` and
@@ -71,6 +71,16 @@ drawing. Evidence is in `cmake/PLAN3_VALIDATION.md`. Editor buffers and renderin
 remain on the owning thread; scanner/matcher workers handle owned path data.
 This authorization does not include content search, Windows bring-up or a
 replacement renderer.
+
+The operator then authorized native top menus and ordinary mouse interaction
+on 2026-10-06. Plan 4 ships the File/Edit/View/Navigate/Help bar, real
+drop-downs, F10/Alt/mouse navigation, SGR click/selection/wheel editing,
+pickers, prompts, context menus, middle paste and split-separator drags.
+Evidence is in `cmake/PLAN4_VALIDATION.md`; behavior is documented in
+`runtime/doc/xim.txt` and the boundary contract in `cmake/XIM_INPUT.md`.
+F10 is menus (Ctrl-Y remains redo) and Ctrl-N creates a new buffer (F3 remains
+Next match). Mouse work reuses the inherited SGR decoder and owning-thread
+adapters; no second input stream or modal key injection is allowed.
 Keep these gates in effect for subsequent changes:
 
 - Build from tracked sources without Make-generated source-tree headers.

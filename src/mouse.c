@@ -39,6 +39,18 @@ mouse_set_hor_scroll_step(long step)
     mouse_hor_step = step;
 }
 
+    long
+mouse_get_vert_scroll_step(void)
+{
+    return mouse_vert_step;
+}
+
+    long
+mouse_get_hor_scroll_step(void)
+{
+    return mouse_hor_step;
+}
+
 #ifdef CHECK_DOUBLE_CLICK
 /*
  * Return the duration from t1 to t2 in milliseconds.

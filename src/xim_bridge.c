@@ -10,6 +10,23 @@ static int overlay_visible = FALSE;
 static int overlay_top = 0;
 static int overlay_rows = 0;
 static int overlay_columns = 0;
+static int menu_visible = FALSE;
+static int menu_top = 0;
+static int menu_left = 0;
+static int menu_height = 0;
+static int menu_width = 0;
+static int menu_rows = 0;
+static int menu_columns = 0;
+static int hover_enabled = FALSE;
+static int xim_mouse_pressed = FALSE;
+static pos_T xim_press_anchor;
+static int xim_press_buffer = 0;
+static int xim_press_dragging = FALSE;
+// Owned separator drag state: the window whose status or vertical separator
+// was pressed, the press offset inside it, and which separator it is.
+static win_T *xim_sep_window = NULL;
+static int xim_sep_is_status = FALSE;
+static int xim_sep_offset = 0;
 typedef struct
 {
     char_u bytes[MB_MAXBYTES + 1];
@@ -347,6 +364,413 @@ xim_engine_undo(int redo)
 }
 
     int
+xim_engine_columns(void)
+{
+    return (int)Columns;
+}
+
+    int
+xim_engine_has_selection(void)
+{
+    return VIsual_active && selection_buffer == curbuf->b_fnum;
+}
+
+    int
+xim_engine_can_undo(int redo)
+{
+    (void)redo;
+    // Do not call undo_allowed() here: it emits E21 when 'modifiable' is
+    // off, which would spam every menu render and prompt key. Undo/redo
+    // availability is reported without side effects; the engine itself
+    // refuses the operation when the buffer cannot be changed.
+    if (!curbuf->b_p_ma)
+        return FALSE;
+    return TRUE;
+}
+
+    int
+xim_engine_get_option(const char *name)
+{
+    if (STRCMP(name, "wrap") == 0)
+        return curwin->w_p_wrap;
+    if (STRCMP(name, "number") == 0)
+        return curwin->w_p_nu || curwin->w_p_rnu;
+    if (STRCMP(name, "mouse") == 0)
+        return *p_mouse != NUL;
+    return FALSE;
+}
+
+    void
+xim_engine_toggle_option(const char *name)
+{
+    xim_engine_boundary();
+    if (STRCMP(name, "wrap") == 0)
+        do_cmdline_cmd((char_u *)"set wrap!");
+    else if (STRCMP(name, "number") == 0)
+    {
+        if (curwin->w_p_nu || curwin->w_p_rnu)
+            do_cmdline_cmd((char_u *)"set nonumber norelativenumber");
+        else
+            do_cmdline_cmd((char_u *)"set number");
+    }
+    else if (STRCMP(name, "mouse") == 0)
+    {
+        if (*p_mouse != NUL)
+            do_cmdline_cmd((char_u *)"set mouse=");
+        else
+            do_cmdline_cmd((char_u *)"set mouse=a");
+        setmouse();
+    }
+    redraw_all_later(UPD_NOT_VALID);
+}
+
+    static int
+xim_word_class(char_u *line, colnr_T col)
+{
+    char_u ch = line[col];
+    if (ch == ' ' || ch == '\t')
+        return 0;
+    if (vim_iswordc(ch))
+        return 2;
+    if (vim_strchr((char_u *)"-+*/%<>&|^!=", ch) != NULL)
+        return 1;
+    if (has_mbyte && MB_BYTE2LEN(ch) > 1)
+        return 3;
+    return ch;
+}
+
+    static int
+xim_mouse_to_buffer(int screen_row, int screen_col, int *is_status, int *is_sep)
+{
+    int row = screen_row;
+    int col = screen_col;
+    win_T *wp;
+    if (is_status != NULL)
+        *is_status = FALSE;
+    if (is_sep != NULL)
+        *is_sep = FALSE;
+    wp = mouse_find_win(&row, &col, FIND_POPUP);
+    if (wp == NULL)
+        return FALSE;
+    if (row >= wp->w_height || col >= wp->w_width)
+    {
+        if (is_status != NULL && row >= wp->w_height)
+            *is_status = TRUE;
+        if (is_sep != NULL && col >= wp->w_width)
+            *is_sep = TRUE;
+        win_enter(wp, TRUE);
+        return FALSE;
+    }
+    win_enter(wp, TRUE);
+    if (mouse_comp_pos(curwin, &row, &col, &curwin->w_cursor.lnum, NULL))
+    {
+        curwin->w_cursor.lnum = curbuf->b_ml.ml_line_count;
+        curwin->w_cursor.col = ml_get_buf_len(curbuf, curwin->w_cursor.lnum);
+    }
+    else
+    {
+        curwin->w_curswant = col;
+        curwin->w_set_curswant = FALSE;
+        if (coladvance(col) == FAIL)
+            curwin->w_cursor.col = ml_get_buf_len(curbuf, curwin->w_cursor.lnum);
+    }
+    check_cursor();
+    return TRUE;
+}
+
+    int
+xim_engine_click(int row, int col, int extend, int clicks)
+{
+    int is_status = FALSE;
+    int is_sep = FALSE;
+    pos_T before = curwin->w_cursor;
+    (void)before;
+    xim_engine_boundary();
+    if (!xim_mouse_to_buffer(row, col, &is_status, &is_sep))
+    {
+        // A press on a status or separator line arms an owning-thread drag.
+        if ((is_status || is_sep) && clicks <= 1)
+        {
+            int rel_row = row;
+            int rel_col = col;
+            win_T *wp = mouse_find_win(&rel_row, &rel_col, FIND_POPUP);
+            if (wp != NULL)
+            {
+                xim_sep_window = wp;
+                xim_sep_is_status = is_status;
+                xim_sep_offset = is_status ? rel_row - wp->w_height + 1
+                                           : rel_col - wp->w_width + 1;
+            }
+        }
+        redraw_curbuf_later(UPD_VALID);
+        return FALSE;
+    }
+    xim_sep_window = NULL;
+    if (extend && VIsual_active && selection_buffer == curbuf->b_fnum)
+    {
+        // Shift-click extends the existing half-open selection.
+        redraw_curbuf_later(UPD_INVERTED);
+        return TRUE;
+    }
+    xim_engine_cancel();
+    xim_mouse_pressed = TRUE;
+    xim_press_dragging = FALSE;
+    xim_press_anchor = curwin->w_cursor;
+    xim_press_buffer = curbuf->b_fnum;
+    if (clicks >= 3)
+    {
+        // Triple-click selects the logical line.
+        selection_anchor.lnum = curwin->w_cursor.lnum;
+        selection_anchor.col = 0;
+        selection_anchor.coladd = 0;
+        selection_buffer = curbuf->b_fnum;
+        VIsual = selection_anchor;
+        VIsual_active = TRUE;
+        VIsual_mode = 'v';
+        VIsual_select = FALSE;
+        curwin->w_cursor.col = ml_get_buf_len(curbuf, curwin->w_cursor.lnum);
+        redraw_curbuf_later(UPD_INVERTED);
+        return TRUE;
+    }
+    if (clicks == 2)
+    {
+        // Double-click selects a word, mirroring the inherited classes.
+        pos_T start = curwin->w_cursor;
+        pos_T end = curwin->w_cursor;
+        char_u *line = ml_get(start.lnum);
+        if (line[start.col] != NUL)
+        {
+            int cclass;
+            {
+                char_u ch = line[start.col];
+                if (ch == ' ' || ch == '\t')
+                    cclass = 0;
+                else if (vim_iswordc(ch))
+                    cclass = 2;
+                else if (vim_strchr((char_u *)"-+*/%<>&|^!=", ch) != NULL)
+                    cclass = 1;
+                else
+                    cclass = ch;
+                if (has_mbyte && MB_BYTE2LEN(line[start.col]) > 1)
+                    cclass = 3;
+            }
+            while (start.col > 0)
+            {
+                colnr_T prev = start.col - 1;
+                prev -= (*mb_head_off)(line, line + prev);
+                if (xim_word_class(line, prev) != cclass)
+                    break;
+                start.col = prev;
+            }
+            while (line[end.col] != NUL)
+            {
+                colnr_T next = end.col + (*mb_ptr2len)(line + end.col);
+                if (xim_word_class(line, next) != cclass)
+                {
+                    if (*p_sel == 'e')
+                        end.col = next;
+                    break;
+                }
+                end.col = next;
+            }
+            selection_anchor = start;
+            selection_buffer = curbuf->b_fnum;
+            VIsual = start;
+            VIsual_active = TRUE;
+            VIsual_mode = 'v';
+            VIsual_select = FALSE;
+            curwin->w_cursor = end;
+            redraw_curbuf_later(UPD_INVERTED);
+            return TRUE;
+        }
+    }
+    redraw_curbuf_later(UPD_VALID);
+    return TRUE;
+}
+
+    void
+xim_engine_drag(int row, int col)
+{
+    int is_status = FALSE;
+    int is_sep = FALSE;
+    win_T *dragwin = curwin;
+    int rel_row = row;
+    int rel_col = col;
+    win_T *wp;
+    int tmp_row = row;
+    int tmp_col = col;
+    // Separator drags resize the owning frame; the inherited helpers do the
+    // frame math and redraw scheduling on this thread.
+    if (xim_sep_window != NULL)
+    {
+        int count = 0;
+        if (xim_sep_is_status)
+            count = row - W_WINROW(xim_sep_window) - xim_sep_window->w_height + 1
+                    - xim_sep_offset;
+        else
+            count = col - xim_sep_window->w_wincol - xim_sep_window->w_width + 1
+                    - xim_sep_offset;
+        if (count != 0)
+        {
+            if (xim_sep_is_status)
+                win_drag_status_line(xim_sep_window, count);
+            else
+                win_drag_vsep_line(xim_sep_window, count);
+        }
+        return;
+    }
+    wp = mouse_find_win(&tmp_row, &tmp_col, FIND_POPUP);
+    if (wp != NULL && wp != curwin)
+    {
+        // Keep the original window during a drag; edge motion scrolls it.
+        rel_row = row - curwin->w_winrow;
+        rel_col = col - curwin->w_wincol;
+    }
+    else if (wp != NULL)
+    {
+        rel_row = tmp_row;
+        rel_col = tmp_col;
+    }
+    // Edge drag scrolls one line/column on drag events.
+    if (rel_row < 0)
+    {
+        scrolldown(1, TRUE);
+        rel_row = 0;
+    }
+    else if (rel_row >= curwin->w_height)
+    {
+        scrollup(1, TRUE);
+        rel_row = curwin->w_height - 1;
+    }
+    if (rel_col < 0 && !curwin->w_p_wrap)
+    {
+        if (curwin->w_leftcol > 0)
+            set_leftcol(curwin->w_leftcol - 1);
+        rel_col = 0;
+    }
+    else if (rel_col >= curwin->w_width && !curwin->w_p_wrap)
+    {
+        set_leftcol(curwin->w_leftcol + 1);
+        rel_col = curwin->w_width - 1;
+    }
+    (void)dragwin;
+    if (!xim_mouse_pressed)
+        return;
+    // First motion turns the press anchor into a selection.
+    if (!xim_press_dragging)
+    {
+        if (xim_press_buffer != curbuf->b_fnum)
+            return;
+        selection_anchor = xim_press_anchor;
+        selection_buffer = curbuf->b_fnum;
+        VIsual = selection_anchor;
+        VIsual_active = TRUE;
+        VIsual_mode = 'v';
+        VIsual_select = FALSE;
+        xim_press_dragging = TRUE;
+    }
+    {
+        int crow = row - curwin->w_winrow;
+        int ccol = col - curwin->w_wincol;
+        if (crow < 0)
+            crow = 0;
+        if (crow >= curwin->w_height)
+            crow = curwin->w_height - 1;
+        if (ccol < 0)
+            ccol = 0;
+        if (ccol >= curwin->w_width)
+            ccol = curwin->w_width - 1;
+        if (mouse_comp_pos(curwin, &crow, &ccol, &curwin->w_cursor.lnum, NULL))
+        {
+            curwin->w_cursor.lnum = curbuf->b_ml.ml_line_count;
+            curwin->w_cursor.col = ml_get_buf_len(curbuf, curwin->w_cursor.lnum);
+        }
+        else
+        {
+            curwin->w_curswant = ccol;
+            curwin->w_set_curswant = FALSE;
+            if (coladvance(ccol) == FAIL)
+                curwin->w_cursor.col = ml_get_buf_len(curbuf, curwin->w_cursor.lnum);
+        }
+        check_cursor();
+        redraw_curbuf_later(UPD_INVERTED);
+    }
+    (void)is_status;
+    (void)is_sep;
+}
+
+    void
+xim_engine_drag_end(void)
+{
+    xim_sep_window = NULL;
+    xim_mouse_pressed = FALSE;
+    xim_press_dragging = FALSE;
+}
+
+    void
+xim_engine_scroll(int row, int col, int direction)
+{
+    int tmp_row = row;
+    int tmp_col = col;
+    win_T *wp = mouse_find_win(&tmp_row, &tmp_col, FIND_POPUP);
+    win_T *old = curwin;
+    pos_T saved = curwin->w_cursor;
+    int saved_buf = curbuf->b_fnum;
+    pos_T saved_anchor = selection_anchor;
+    int saved_selbuf = selection_buffer;
+    int saved_visual = VIsual_active;
+    if (wp == NULL)
+        return;
+    curwin = wp;
+    curbuf = wp->w_buffer;
+    // Follow 'mousescroll' so a wheel notch scrolls like the inherited path.
+    long vert_step = mouse_get_vert_scroll_step();
+    long hor_step = mouse_get_hor_scroll_step();
+    if (vert_step < 1)
+        vert_step = 3;
+    if (hor_step < 1)
+        hor_step = 6;
+    if (direction == 0)
+        scrolldown((int)vert_step, TRUE);
+    else if (direction == 1)
+        scrollup((int)vert_step, TRUE);
+    else if (!curwin->w_p_wrap)
+    {
+        if (direction == 2 && curwin->w_leftcol > 0)
+        {
+            long leftcol = curwin->w_leftcol - hor_step;
+            if (leftcol < 0)
+                leftcol = 0;
+            set_leftcol((colnr_T)leftcol);
+        }
+        else if (direction == 3)
+            set_leftcol(curwin->w_leftcol + (colnr_T)hor_step);
+    }
+    // Wheel motion never moves the insertion point or selection.
+    if (curbuf->b_fnum == saved_buf)
+        curwin->w_cursor = saved;
+    selection_anchor = saved_anchor;
+    selection_buffer = saved_selbuf;
+    VIsual_active = saved_visual;
+    curwin->w_redr_status = TRUE;
+    redraw_curbuf_later(UPD_VALID);
+    curwin = old;
+    curbuf = curwin->w_buffer;
+}
+
+    void
+xim_engine_middle_paste(int row, int col)
+{
+    if (xim_mouse_to_buffer(row, col, NULL, NULL))
+    {
+        char *text = xim_engine_clipboard();
+        if (text != NULL && *text != NUL)
+            xim_engine_paste(text);
+        vim_free(text);
+    }
+}
+
+    int
 xim_engine_command(const char *command, const char *argument, int preserve_position)
 {
     char_u *escaped = NULL;
@@ -450,6 +874,181 @@ xim_engine_menu_rows(void)
 }
 
     void
+xim_engine_menu_bar(const char *text, int selected_col, int selected_width)
+{
+    int bar_attr = syn_name2attr((char_u *)"XimMenuBar");
+    int sel_attr = syn_name2attr((char_u *)"XimMenuSel");
+    if (bar_attr == 0)
+        bar_attr = syn_name2attr((char_u *)"StatusLine");
+    if (sel_attr == 0)
+        sel_attr = syn_name2attr((char_u *)"PmenuSel");
+    xim_drawing_overlay = TRUE;
+    screen_puts_len((char_u *)text, (int)STRLEN(text), 0, 0, bar_attr);
+    screen_fill(0, 1, MIN(vim_strsize((char_u *)text), (int)Columns),
+            (int)Columns, ' ', ' ', bar_attr);
+    if (selected_width > 0 && selected_col >= 0)
+    {
+        int end = MIN(selected_col + selected_width, (int)Columns);
+        for (int col = MAX(0, selected_col); col < end; ++col)
+        {
+            char_u bytes[MB_MAXBYTES + 1];
+            int attr = 0;
+            screen_getbytes(0, col, bytes, &attr);
+            (void)attr;
+            // Re-highlight the selected heading without moving text.
+            screen_puts_len(bytes, (int)STRLEN(bytes), 0, col, sel_attr);
+        }
+    }
+    xim_drawing_overlay = FALSE;
+}
+
+    void
+xim_draw_menu_bar(void)
+{
+    char text[1024];
+    int sel_col = 0;
+    int sel_width = 0;
+    int bar_attr = syn_name2attr((char_u *)"XimMenuBar");
+    int sel_attr = syn_name2attr((char_u *)"XimMenuSel");
+    if (bar_attr == 0)
+        bar_attr = syn_name2attr((char_u *)"StatusLine");
+    if (sel_attr == 0)
+        sel_attr = syn_name2attr((char_u *)"PmenuSel");
+    xim_menu_bar_text(text, sizeof(text), (int)Columns, &sel_col, &sel_width);
+    xim_drawing_overlay = TRUE;
+    screen_puts_len((char_u *)text, (int)STRLEN(text), 0, 0, bar_attr);
+    screen_fill(0, 1, MIN(vim_strsize((char_u *)text), (int)Columns),
+            (int)Columns, ' ', ' ', bar_attr);
+    if (sel_width > 0)
+    {
+        int start = MAX(0, sel_col);
+        int end = MIN(sel_col + sel_width, (int)Columns);
+        // Highlight the open heading by re-emitting its cells.
+        for (int col = start; col < end; ++col)
+        {
+            char_u bytes[MB_MAXBYTES + 1];
+            int attr = 0;
+            // Read the already-painted cell so wide/combining identity
+            // is preserved; only the attribute changes.
+            screen_getbytes(0, col, bytes, &attr);
+            (void)attr;
+            if (*bytes != NUL)
+                screen_puts(bytes, 0, col, sel_attr);
+            else
+                screen_putchar(' ', 0, col, sel_attr);
+        }
+    }
+    xim_drawing_overlay = FALSE;
+}
+
+    void
+xim_engine_menu_popup(const char *items, int row, int col, int width, int rows,
+        int selected_row, int error)
+{
+    int attr = syn_name2attr((char_u *)"XimPalette");
+    int sel_attr = syn_name2attr((char_u *)"XimPaletteSel");
+    int err_attr = syn_name2attr((char_u *)"ErrorMsg");
+    const char *p = items;
+    const char *end;
+    int r;
+    xim_drawing_overlay = TRUE;
+    term_set_sync_output(TERM_SYNC_OUTPUT_ENABLE);
+    if (menu_visible && (menu_rows != Rows || menu_columns != Columns))
+    {
+        redraw_all_later(UPD_NOT_VALID);
+        update_screen(0);
+        menu_visible = FALSE;
+    }
+    if (!menu_visible)
+    {
+        vim_free(overlay_background);
+        // Share one full-screen snapshot for prompts and menus so a
+        // top drop-down and a bottom prompt do not overwrite each other.
+        // The snapshot is refreshed only when neither overlay is visible.
+        if (!overlay_visible)
+        {
+            overlay_background = ALLOC_CLEAR_MULT(xim_cell_T, (size_t)Rows * Columns);
+            if (overlay_background != NULL)
+                for (int rr = 0; rr < Rows; ++rr)
+                    for (int cc = 0; cc < Columns; ++cc)
+                    {
+                        xim_cell_T *cell = &overlay_background[(size_t)rr * Columns + cc];
+                        screen_getbytes(rr, cc, cell->bytes, &cell->attr);
+                    }
+        }
+    }
+    else if (row != menu_top || col != menu_left || rows != menu_height
+            || width != menu_width)
+    {
+        // Restore the previous drop-down rectangle before painting the
+        // moved one, preserving the document underneath.
+        if (overlay_background != NULL)
+            for (r = menu_top; r < menu_top + menu_height && r < Rows; ++r)
+                for (int cc = menu_left; cc < menu_left + menu_width && cc < Columns; ++cc)
+                {
+                    xim_cell_T *cell = &overlay_background[(size_t)r * Columns + cc];
+                    if (*cell->bytes != NUL)
+                        screen_puts(cell->bytes, r, cc, cell->attr);
+                }
+        else
+        {
+            redraw_all_later(UPD_NOT_VALID);
+            update_screen(0);
+        }
+    }
+    menu_visible = TRUE;
+    menu_top = row;
+    menu_left = col;
+    menu_height = rows;
+    menu_width = width;
+    menu_rows = Rows;
+    menu_columns = Columns;
+    overlay_rows = Rows;
+    overlay_columns = Columns;
+    r = row;
+    for (p = items; *p != NUL && r < row + rows; p = end + 1, ++r)
+    {
+        int item_attr = error ? err_attr
+            : (r - row == selected_row ? sel_attr : attr);
+        end = (const char *)vim_strchr((char_u *)p, '\n');
+        if (end == NULL)
+            break;
+        screen_puts_len((char_u *)p, (int)(end - p), r, col, item_attr);
+        int cells = vim_strnsize((char_u *)p, (int)(end - p));
+        // Clear only trailing cells inside the drop-down; cells beyond
+        // the popup keep the underlying document from the snapshot.
+        screen_fill(r, r + 1, MIN(col + cells, (int)Columns), MIN(col + width, (int)Columns),
+                ' ', ' ', item_attr);
+    }
+    term_set_sync_output(TERM_SYNC_OUTPUT_DISABLE);
+    out_flush();
+    xim_drawing_overlay = FALSE;
+}
+
+    static void
+xim_clear_menu_popup(void)
+{
+    if (!menu_visible)
+        return;
+    if (overlay_background != NULL)
+        for (int r = menu_top; r < menu_top + menu_height && r < Rows; ++r)
+            for (int cc = menu_left; cc < menu_left + menu_width && cc < Columns; ++cc)
+            {
+                xim_cell_T *cell = &overlay_background[(size_t)r * Columns + cc];
+                if (*cell->bytes != NUL)
+                    screen_puts(cell->bytes, r, cc, cell->attr);
+            }
+    else
+    {
+        redraw_all_later(UPD_NOT_VALID);
+        update_screen(0);
+    }
+    menu_visible = FALSE;
+    if (!overlay_visible)
+        VIM_CLEAR(overlay_background);
+}
+
+    void
 xim_engine_overlay(const char *prompt, const char *items, int error)
 {
     int row = (int)Rows - 2;
@@ -521,7 +1120,23 @@ xim_engine_overlay(const char *prompt, const char *items, int error)
     screen_fill((int)Rows - 1, (int)Rows,
             MIN(vim_strsize((char_u *)prompt), (int)Columns), (int)Columns,
             ' ', ' ', attr);
-    windgoto((int)Rows - 1, MIN(vim_strsize((char_u *)prompt), (int)Columns - 1));
+    {
+        int cursor_cells = 0;
+        int length_cells = 0;
+        extern void xim_prompt_get(int *, int *);
+        xim_prompt_get(&cursor_cells, &length_cells);
+        int label_cells = vim_strsize((char_u *)prompt) - length_cells;
+        if (label_cells < 0)
+            label_cells = (int)STRLEN(prompt) - length_cells;
+        if (label_cells < 0)
+            label_cells = 0;
+        int cursor_col = label_cells + cursor_cells;
+        if (cursor_col >= Columns)
+            cursor_col = Columns - 1;
+        if (cursor_col < 0)
+            cursor_col = 0;
+        windgoto((int)Rows - 1, cursor_col);
+    }
     term_set_sync_output(TERM_SYNC_OUTPUT_DISABLE);
     out_flush();
     xim_drawing_overlay = FALSE;
@@ -531,11 +1146,28 @@ xim_engine_overlay(const char *prompt, const char *items, int error)
 xim_redraw_overlay(void)
 {
     if (!xim_prompt_active())
+    {
+        if (menu_visible)
+            xim_clear_menu_popup();
         return;
+    }
     // The engine has produced a fresh underlying frame. Capture that
     // frame rather than retaining a snapshot from before the resize.
     overlay_visible = FALSE;
+    menu_visible = FALSE;
     xim_render();
+}
+
+    static void
+xim_set_hover(int enable)
+{
+    if (enable == hover_enabled)
+        return;
+    hover_enabled = enable;
+    // Passive motion only while a menu is open; idle editing keeps
+    // button-motion reporting so the terminal stays quiet.
+    out_str_nf((char_u *)(enable ? "\033[?1003h" : "\033[?1003l"));
+    out_flush();
 }
 
     void
@@ -547,6 +1179,7 @@ xim_initialize(void)
     // the user types, so an out-of-tree file remains reachable without
     // a project root.
     xim_redraw_ui = xim_redraw_overlay;
+    xim_draw_menu_bar_ptr = xim_draw_menu_bar;
     char_u *root = NULL;
     int file_arguments = 0;
     int i;
@@ -574,13 +1207,16 @@ xim_initialize(void)
     // launches netrw on the directory buffer and intercepts Ctrl-P / P-E
     // before xim's picker can render the overlay.
     do_cmdline_cmd((char_u *)"let g:loaded_netrw = 1");
-    do_cmdline_cmd((char_u *)"set nocompatible laststatus=2 noshowmode noshowcmd noruler noinsertmode selection=exclusive backspace=indent,eol,start ttimeout ttimeoutlen=20");
+    do_cmdline_cmd((char_u *)"set nocompatible laststatus=2 noshowmode noshowcmd noruler noinsertmode selection=exclusive backspace=indent,eol,start ttimeout ttimeoutlen=20 mouse=a mousemodel=extend showtabline=2");
     do_highlight((char_u *)"default link XimStatus StatusLine", FALSE, FALSE);
     do_highlight((char_u *)"default link XimPrompt Pmenu", FALSE, FALSE);
     do_highlight((char_u *)"default link XimPalette Pmenu", FALSE, FALSE);
     do_highlight((char_u *)"default link XimPaletteSel PmenuSel", FALSE, FALSE);
+    do_highlight((char_u *)"default link XimMenuBar StatusLine", FALSE, FALSE);
+    do_highlight((char_u *)"default link XimMenuSel PmenuSel", FALSE, FALSE);
     do_cmdline_cmd((char_u *)"set statusline=%#XimStatus#\\ Xim\\ %f\\ %m%=%l:%c\\ ");
     do_cmdline_cmd((char_u *)"syntax enable");
+    setmouse();
     p_lpl = FALSE;
     State = MODE_NORMAL;
 }
@@ -626,6 +1262,77 @@ xim_step(void)
 received:
     --allow_keys;
     --no_mapping;
+    // Native mouse uses the inherited SGR decoder; no second parser and no
+    // modal key injection. All window math stays on the owning thread.
+    if (is_mouse_key(c))
+    {
+        int m_modifiers = 0;
+        int clicks = ((mod_mask & MOD_MASK_MULTI_CLICK) >> 5) + 1;
+        if (clicks < 1)
+            clicks = 1;
+        if (clicks > 4)
+            clicks = 4;
+        if (mod_mask & MOD_MASK_SHIFT)
+            m_modifiers |= XIM_SHIFT;
+        if (mod_mask & MOD_MASK_CTRL)
+            m_modifiers |= XIM_CTRL;
+        if (mod_mask & MOD_MASK_ALT)
+            m_modifiers |= XIM_ALT;
+        if (c == K_LEFTMOUSE || c == K_LEFTMOUSE_NM)
+            xim_mouse_press(mouse_row, mouse_col, 0, m_modifiers, clicks);
+        else if (c == K_LEFTDRAG)
+            xim_mouse_drag(mouse_row, mouse_col, m_modifiers);
+        else if (c == K_LEFTRELEASE || c == K_LEFTRELEASE_NM)
+        {
+            xim_mouse_release(mouse_row, mouse_col, 0, m_modifiers);
+            xim_mouse_pressed = FALSE;
+            xim_press_dragging = FALSE;
+        }
+        else if (c == K_MIDDLEMOUSE)
+            xim_mouse_press(mouse_row, mouse_col, 1, m_modifiers, clicks);
+        else if (c == K_MIDDLEDRAG)
+            xim_mouse_drag(mouse_row, mouse_col, m_modifiers);
+        else if (c == K_MIDDLERELEASE)
+            xim_mouse_release(mouse_row, mouse_col, 1, m_modifiers);
+        else if (c == K_RIGHTMOUSE)
+            xim_mouse_press(mouse_row, mouse_col, 2, m_modifiers, clicks);
+        else if (c == K_RIGHTDRAG)
+            xim_mouse_drag(mouse_row, mouse_col, m_modifiers);
+        else if (c == K_RIGHTRELEASE)
+            xim_mouse_release(mouse_row, mouse_col, 2, m_modifiers);
+        // SGR wheel codes arrive inverted (64->DOWN, 65->UP); map to
+        // visual directions so wheel-up shows earlier lines.
+        else if (c == K_MOUSEDOWN)
+            xim_mouse_wheel(mouse_row, mouse_col, 0, m_modifiers);
+        else if (c == K_MOUSEUP)
+            xim_mouse_wheel(mouse_row, mouse_col, 1, m_modifiers);
+        else if (c == K_MOUSELEFT)
+            xim_mouse_wheel(mouse_row, mouse_col, 2, m_modifiers);
+        else if (c == K_MOUSERIGHT)
+            xim_mouse_wheel(mouse_row, mouse_col, 3, m_modifiers);
+        else if (c == K_MOUSEMOVE)
+            xim_mouse_move(mouse_row, mouse_col, m_modifiers);
+        got_int = FALSE;
+        State = MODE_INSERT;
+        check_cursor();
+        curwin->w_redr_status = TRUE;
+        redraw_curbuf_later(UPD_VALID);
+        xim_set_hover(xim_menu_active());
+        if (!xim_prompt_active())
+        {
+            if (overlay_visible && !menu_visible)
+            {
+                redraw_all_later(UPD_NOT_VALID);
+                clear_cmdline = TRUE;
+                redraw_cmdline = TRUE;
+                overlay_visible = FALSE;
+                VIM_CLEAR(overlay_background);
+            }
+            if (!xim_menu_active() && menu_visible)
+                xim_clear_menu_popup();
+        }
+        return;
+    }
     if (c == K_PS)
     {
         garray_T text;
@@ -679,17 +1386,25 @@ received:
     check_cursor();
     if (key != XIM_UP && key != XIM_DOWN)
         curwin->w_set_curswant = TRUE;
+    xim_set_hover(xim_menu_active());
     if (!xim_prompt_active())
     {
         curwin->w_redr_status = TRUE;
         redraw_curbuf_later(UPD_VALID);
-        if (overlay_visible)
+        if (overlay_visible && !menu_visible)
         {
             redraw_all_later(UPD_NOT_VALID);
             clear_cmdline = TRUE;
             redraw_cmdline = TRUE;
             overlay_visible = FALSE;
             VIM_CLEAR(overlay_background);
+        }
+        if (!xim_menu_active() && menu_visible)
+            xim_clear_menu_popup();
+        if (!xim_menu_active() && overlay_visible && menu_visible)
+        {
+            // Both overlays shared one snapshot; the menu is gone but the
+            // prompt snapshot remains valid for its own rows.
         }
     }
 }

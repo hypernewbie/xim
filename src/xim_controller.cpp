@@ -1,7 +1,9 @@
 #include "xim_commands.h"
+#include "xim_menu.h"
 #include "xim_project.h"
 #include <algorithm>
 #include <cstdlib>
+#include <cwchar>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -13,6 +15,10 @@ namespace
 {
 using xim::Action;
 std::string input;
+std::size_t input_cursor = 0;
+bool prompt_has_selection = false;
+std::size_t prompt_sel_start = 0;
+std::size_t prompt_sel_end = 0;
 std::string clipboard;
 std::string query;
 Action prompt = Action::ignore;
@@ -34,6 +40,22 @@ std::vector<DeferredInput> deferred_keys;
 constexpr std::size_t kMaxDeferredKeys = 256;
 std::vector<std::string> file_rows;
 std::string file_rows_query;
+// Menu state: F10 or bar click opens a real drop-down. Right-click opens the
+// Edit group as a context menu at the pointer. Keyboard and mouse share the
+// same pure hit layout in xim_menu.
+bool menu_open = false;
+int menu_group = 0;
+int menu_selected = 0;
+bool menu_context = false;
+int menu_context_row = 0;
+int menu_context_col = 0;
+bool menu_dragging = false;
+// Last rendered picker list for hit-testing the visible rows, not a fresh
+// asynchronous ranking.
+std::vector<std::string> last_picker_items;
+Action last_picker_action = Action::ignore;
+int last_picker_first = 0;
+int last_picker_selected = 0;
 
 void perform_pending(bool discard)
 {
@@ -85,6 +107,110 @@ void append_utf8(std::string &text, int c)
         }
         text += static_cast<char>(0x80 | (c & 0x3f));
     }
+}
+
+std::string encode_utf8(int c)
+{
+    std::string out;
+    append_utf8(out, c);
+    return out;
+}
+
+std::size_t utf8_prev(const std::string &text, std::size_t pos)
+{
+    if (pos == 0 || pos > text.size()) return 0;
+    std::size_t start = pos - 1;
+    while (start > 0 && (static_cast<unsigned char>(text[start]) & 0xc0) == 0x80)
+        --start;
+    return start;
+}
+
+std::size_t utf8_next(const std::string &text, std::size_t pos)
+{
+    if (pos >= text.size()) return text.size();
+    unsigned char lead = static_cast<unsigned char>(text[pos]);
+    std::size_t len = 1;
+    if ((lead & 0x80) == 0) len = 1;
+    else if ((lead & 0xe0) == 0xc0) len = 2;
+    else if ((lead & 0xf0) == 0xe0) len = 3;
+    else if ((lead & 0xf8) == 0xf0) len = 4;
+    std::size_t next = pos + len;
+    if (next > text.size()) return text.size();
+    return next;
+}
+
+int cell_width_for_codepoint(int codepoint)
+{
+    if (codepoint < 0) return 1;
+    int width = ::wcwidth(static_cast<wchar_t>(codepoint));
+    if (width < 0) return 1;
+    if (width == 0) return 0;
+    return width;
+}
+
+int utf8_codepoint(const char *p, const char *end)
+{
+    unsigned char lead = static_cast<unsigned char>(*p);
+    if ((lead & 0x80) == 0) return lead;
+    if ((lead & 0xe0) == 0xc0 && end - p >= 2)
+        return ((lead & 0x1f) << 6) | (static_cast<unsigned char>(p[1]) & 0x3f);
+    if ((lead & 0xf0) == 0xe0 && end - p >= 3)
+        return ((lead & 0x0f) << 12)
+            | ((static_cast<unsigned char>(p[1]) & 0x3f) << 6)
+            | (static_cast<unsigned char>(p[2]) & 0x3f);
+    if ((lead & 0xf8) == 0xf0 && end - p >= 4)
+        return ((lead & 0x07) << 18)
+            | ((static_cast<unsigned char>(p[1]) & 0x3f) << 12)
+            | ((static_cast<unsigned char>(p[2]) & 0x3f) << 6)
+            | (static_cast<unsigned char>(p[3]) & 0x3f);
+    return lead;
+}
+
+int cells_before(const std::string &text, std::size_t byte_pos)
+{
+    int cells = 0;
+    std::size_t pos = 0;
+    while (pos < byte_pos && pos < text.size())
+    {
+        std::size_t next = utf8_next(text, pos);
+        int cp = utf8_codepoint(text.data() + pos, text.data() + next);
+        cells += cell_width_for_codepoint(cp);
+        pos = next;
+    }
+    return cells;
+}
+
+std::size_t bytes_for_cells(const std::string &text, int cells)
+{
+    int used = 0;
+    std::size_t pos = 0;
+    while (pos < text.size() && used < cells)
+    {
+        std::size_t next = utf8_next(text, pos);
+        int cp = utf8_codepoint(text.data() + pos, text.data() + next);
+        used += cell_width_for_codepoint(cp);
+        if (used > cells) break;
+        pos = next;
+    }
+    return pos;
+}
+
+void clear_prompt_selection()
+{
+    prompt_has_selection = false;
+    prompt_sel_start = prompt_sel_end = 0;
+}
+
+void delete_prompt_selection()
+{
+    if (!prompt_has_selection) return;
+    std::size_t start = std::min(prompt_sel_start, prompt_sel_end);
+    std::size_t end = std::max(prompt_sel_start, prompt_sel_end);
+    if (start > input.size()) start = input.size();
+    if (end > input.size()) end = input.size();
+    input.erase(start, end - start);
+    input_cursor = start;
+    clear_prompt_selection();
 }
 
 std::vector<const xim::Command *> filtered()
@@ -151,9 +277,51 @@ void begin(Action action)
     xim_engine_boundary();
     prompt = action;
     input.clear();
+    input_cursor = 0;
+    clear_prompt_selection();
     file_rows.clear();
     file_rows_query.clear();
     selected = 0;
+    last_picker_items.clear();
+    last_picker_action = Action::ignore;
+    // Opening a prompt dismisses the menu; the menu never obscures typing.
+    menu_open = false;
+    menu_dragging = false;
+}
+
+unsigned capabilities_now()
+{
+    unsigned caps = 0;
+    if (xim_engine_has_selection()) caps |= xim::kHasSelection;
+    // Internal clipboard counts: copy without '+' still enables paste.
+    if (!clipboard.empty()) caps |= xim::kHasClipboard;
+    else
+    {
+        std::unique_ptr<char, decltype(&xim_engine_free)> text(
+                xim_engine_clipboard(), xim_engine_free);
+        if (text && *text.get() != '\0') caps |= xim::kHasClipboard;
+    }
+    if (!query.empty()) caps |= xim::kHasQuery;
+    if (xim_engine_can_undo(0)) caps |= xim::kCanUndo;
+    if (xim_engine_can_undo(1)) caps |= xim::kCanRedo;
+    if (xim_engine_get_option("wrap")) caps |= xim::kWrapOn;
+    if (xim_engine_get_option("number")) caps |= xim::kNumberOn;
+    if (xim_engine_get_option("mouse")) caps |= xim::kMouseOn;
+    return caps;
+}
+
+void execute(Action action);
+
+void activate_menu_item(xim::MenuGroup group, int index)
+{
+    auto items = xim::menu_items(group);
+    if (index < 0 || index >= static_cast<int>(items.size())) return;
+    const auto &item = items[index];
+    unsigned caps = capabilities_now();
+    if (!xim::menu_enabled(item, caps)) return;
+    menu_open = false;
+    menu_dragging = false;
+    execute(item.action);
 }
 
 void execute(Action action)
@@ -171,8 +339,40 @@ void execute(Action action)
         case Action::quit: case Action::close: protect(action); break;
         case Action::select_all: xim_engine_select_all(); break;
         case Action::cancel: xim_engine_cancel(); break;
+        case Action::menu:
+            menu_open = !menu_open;
+            menu_context = false;
+            menu_dragging = false;
+            if (menu_open)
+            {
+                menu_group = 0;
+                menu_selected = xim::menu_next(static_cast<xim::MenuGroup>(menu_group),
+                        -1, 1, capabilities_now());
+            }
+            break;
+        case Action::new_buffer:
+            if (xim_engine_unsaved(0)) protect(Action::close);
+            else xim_engine_command("enew", "", 0);
+            break;
+        case Action::toggle_wrap: xim_engine_toggle_option("wrap"); break;
+        case Action::toggle_number: xim_engine_toggle_option("number"); break;
+        case Action::toggle_mouse: xim_engine_toggle_option("mouse"); break;
+        case Action::next_buffer: xim_engine_command("bnext", "", 0); break;
+        case Action::prev_buffer: xim_engine_command("bprevious", "", 0); break;
+        case Action::help: xim_engine_command("help", "xim", 0); break;
+        case Action::about:
+            xim_engine_command("echo", "'Xim: one-run terminal editor'", 0);
+            break;
         case Action::copy: case Action::cut:
         {
+            if (prompt != Action::ignore && prompt_has_selection)
+            {
+                std::size_t start = std::min(prompt_sel_start, prompt_sel_end);
+                std::size_t end = std::max(prompt_sel_start, prompt_sel_end);
+                clipboard = input.substr(start, end - start);
+                if (action == Action::cut) delete_prompt_selection();
+                break;
+            }
             std::unique_ptr<char, decltype(&xim_engine_free)> text(
                 xim_engine_copy(action == Action::cut), xim_engine_free);
             if (text) clipboard = text.get();
@@ -182,7 +382,18 @@ void execute(Action action)
         {
             std::unique_ptr<char, decltype(&xim_engine_free)> text(
                 xim_engine_clipboard(), xim_engine_free);
-            xim_engine_paste(text ? text.get() : clipboard.c_str());
+            const char *payload = text && *text.get() != '\0' ? text.get() : clipboard.c_str();
+            if (prompt != Action::ignore)
+            {
+                if (*payload == '\0') break;
+                delete_prompt_selection();
+                std::size_t pos = std::min(input_cursor, input.size());
+                input.insert(pos, payload);
+                input_cursor = pos + std::string(payload).size();
+                selected = 0;
+            }
+            else
+                xim_engine_paste(payload);
             break;
         }
         case Action::undo: case Action::redo: xim_engine_undo(action == Action::redo); break;
@@ -192,6 +403,147 @@ void execute(Action action)
             break;
         default: break;
     }
+}
+
+bool handle_menu_key(int key, int modifiers)
+{
+    if (!menu_open) return false;
+    unsigned caps = capabilities_now();
+    auto group = static_cast<xim::MenuGroup>(menu_group);
+    if (key == 27)
+    {
+        menu_open = false;
+        menu_dragging = false;
+        return true;
+    }
+    if (key == XIM_LEFT || key == XIM_RIGHT)
+    {
+        int delta = key == XIM_LEFT ? -1 : 1;
+        // Alt+Left/Right or plain arrows move between headings.
+        (void)modifiers;
+        menu_group = (menu_group + delta + static_cast<int>(xim::MenuGroup::count))
+            % static_cast<int>(xim::MenuGroup::count);
+        menu_selected = xim::menu_next(static_cast<xim::MenuGroup>(menu_group),
+                -1, 1, caps);
+        menu_context = false;
+        return true;
+    }
+    if (key == XIM_UP || key == XIM_DOWN)
+    {
+        menu_selected = xim::menu_next(group, menu_selected,
+                key == XIM_UP ? -1 : 1, caps);
+        return true;
+    }
+    if (key == '\r' || key == '\n')
+    {
+        activate_menu_item(group, menu_selected);
+        return true;
+    }
+    // Alt-letter access where the decoder distinguishes Alt.
+    if ((modifiers & XIM_ALT) && key >= 32 && key < 127)
+    {
+        char lower = static_cast<char>(key >= 'A' && key <= 'Z' ? key + 32 : key);
+        const char *headings = "fevnh";
+        // f=file e=edit v=view n=navigate h=help
+        for (int i = 0; i < static_cast<int>(xim::MenuGroup::count); ++i)
+            if (headings[i] == lower)
+            {
+                menu_group = i;
+                menu_selected = xim::menu_next(static_cast<xim::MenuGroup>(i),
+                        -1, 1, caps);
+                menu_open = true;
+                menu_context = false;
+                return true;
+            }
+    }
+    return false;
+}
+
+bool activate_current_row(Action current)
+{
+    if (current == Action::palette)
+    {
+        auto items = filtered();
+        if (!items.empty()) execute(items[selected % items.size()]->action);
+        return true;
+    }
+    if (current == Action::find)
+    {
+        query = input;
+        xim_engine_find(query.c_str(), false);
+        return true;
+    }
+    if (current == Action::files || current == Action::buffers
+            || current == Action::explorer)
+    {
+        // Enter uses the last rendered rows when available so a click and
+        // Enter agree on the same visible list.
+        std::vector<std::string> list = last_picker_action == current
+            && !last_picker_items.empty() ? last_picker_items
+            : project_items(current, input);
+        if (list.empty()) list = project_items(current, input);
+        if (!list.empty())
+        {
+            std::size_t row = last_picker_action == current
+                ? static_cast<std::size_t>(last_picker_selected) : selected;
+            auto item = list[row % list.size()];
+            if (current == Action::buffers)
+            {
+                auto number = item.substr(0, item.find(':'));
+                xim_engine_command("hide buffer", number.c_str(), 0);
+            }
+            else if (current == Action::explorer)
+            {
+                char *path = nullptr;
+                xim_project_explorer_activate(item.c_str(), &path);
+                if (path != nullptr)
+                {
+                    std::unique_ptr<char, decltype(&xim_project_free)> guard(
+                            path, xim_project_free);
+                    char *resolved = xim_project_resolve(path);
+                    if (resolved != nullptr)
+                    {
+                        std::unique_ptr<char, decltype(&xim_project_free)> resolved_guard(
+                                resolved, xim_project_free);
+                        xim_engine_command("hide edit", resolved, 0);
+                    }
+                    else
+                        xim_engine_command("hide edit", path, 0);
+                }
+                else
+                {
+                    prompt = current;
+                    return false;
+                }
+            }
+            else
+            {
+                char *resolved = xim_project_resolve(item.c_str());
+                if (resolved != nullptr)
+                {
+                    std::unique_ptr<char, decltype(&xim_project_free)> guard(
+                            resolved, xim_project_free);
+                    xim_engine_command("hide edit", resolved, 0);
+                }
+                else
+                    xim_engine_command("hide edit", item.c_str(), 0);
+            }
+        }
+        else
+        {
+            prompt = current;
+            return false;
+        }
+        if (prompt == Action::ignore)
+        {
+            xim_project_cancel_query();
+            input.clear();
+            input_cursor = 0;
+            clear_prompt_selection();
+        }
+        return true;
+    }
+    return false;
 }
 }
 
@@ -207,7 +559,6 @@ extern "C" void xim_prepare_args(int *argc, char ***argv)
         if (options && arg == "--vim") compat = true;
     }
     xim_native_mode = !compat;
-    // Resolve the staged runtime independently of cwd or any system Vim.
     auto configured_runtime = std::getenv("VIMRUNTIME");
     if (!configured_runtime || !*configured_runtime)
     {
@@ -223,7 +574,6 @@ extern "C" void xim_prepare_args(int *argc, char ***argv)
     args.push_back((*argv)[0]);
     if (!compat)
     {
-        // Explicit later -u/-U/-i arguments override these native defaults.
         for (const char *arg : {"-N", "-u", "NONE", "-U", "NONE", "-i", "NONE", "--noplugin"})
             args.push_back(const_cast<char *>(arg));
     }
@@ -239,15 +589,28 @@ extern "C" void xim_prepare_args(int *argc, char ***argv)
     *argv = args.data();
 }
 
+extern "C" unsigned xim_menu_capabilities() { return capabilities_now(); }
+extern "C" int xim_menu_active() { return menu_open ? 1 : 0; }
+
 extern "C" void xim_dispatch(int key, int modifiers)
 {
     auto action = xim::resolve(key, modifiers);
+    if (handle_menu_key(key, modifiers)) return;
+    if (menu_open && action == Action::cancel)
+    {
+        menu_open = false;
+        menu_dragging = false;
+        return;
+    }
+    // A menu accelerator dismisses the menu and runs the item.
+    if (menu_open)
+    {
+        menu_open = false;
+        menu_dragging = false;
+    }
     if (accept_when_ready && action != Action::cancel)
     {
         if (action == Action::ignore) return;
-        // Keys after Enter belong to the opened file, not to the query.
-        // At capacity the input boundary waits on completion only, leaving
-        // further terminal bytes unread (backpressure, not dropped text).
         deferred_keys.push_back({key, modifiers, false, {}});
         return;
     }
@@ -260,6 +623,8 @@ extern "C" void xim_dispatch(int key, int modifiers)
             deferred_keys.clear();
             prompt = Action::ignore;
             input.clear();
+            input_cursor = 0;
+            clear_prompt_selection();
             save_then_continue = false;
             pending = Action::ignore;
             pending_path.clear();
@@ -299,7 +664,6 @@ extern "C" void xim_dispatch(int key, int modifiers)
             Action current = prompt;
             if (current == Action::files)
             {
-                // Enter belongs to this query, never to a previous row.
                 (void)project_items(current, input);
                 if (xim_project_pending())
                 {
@@ -309,83 +673,15 @@ extern "C" void xim_dispatch(int key, int modifiers)
             }
             accept_when_ready = false;
             prompt = Action::ignore;
-            if (current == Action::palette)
+            if (!activate_current_row(current))
             {
-                auto items = filtered();
-                if (!items.empty()) execute(items[selected % items.size()]->action);
-            }
-            else if (current == Action::find)
-            {
-                query = input;
-                xim_engine_find(query.c_str(), false);
-            }
-            else if (current == Action::files || current == Action::buffers
-                    || current == Action::explorer)
-            {
-                auto list = project_items(current, input);
-                if (!list.empty())
-                {
-                    auto item = list[selected % list.size()];
-                    if (current == Action::buffers)
-                    {
-                        // Stable identity precedes the display-only label.
-                        auto number = item.substr(0, item.find(':'));
-                        xim_engine_command("hide buffer", number.c_str(), 0);
-                    }
-                    else if (current == Action::explorer)
-                    {
-                        char *path = nullptr;
-                        xim_project_explorer_activate(item.c_str(), &path);
-                        if (path != nullptr)
-                        {
-                            std::unique_ptr<char, decltype(&xim_project_free)> guard(
-                                    path, xim_project_free);
-                            // Resolve through the project root: the
-                            // editor's working directory may differ from
-                            // the project root.
-                            char *resolved = xim_project_resolve(path);
-                            if (resolved != nullptr)
-                            {
-                                std::unique_ptr<char, decltype(&xim_project_free)> resolved_guard(
-                                        resolved, xim_project_free);
-                                xim_engine_command("hide edit", resolved, 0);
-                            }
-                            else
-                                xim_engine_command("hide edit", path, 0);
-                        }
-                        else
-                            prompt = current;
-                    }
-                    else
-                    {
-                        // Project-relative paths need the project root
-                        // prepended so the editor's :edit opens the
-                        // right file.  Out-of-root markers carry an
-                        // absolute path already.
-                        char *resolved = xim_project_resolve(item.c_str());
-                        if (resolved != nullptr)
-                        {
-                            std::unique_ptr<char, decltype(&xim_project_free)> guard(
-                                    resolved, xim_project_free);
-                            // Hidden switch: picking a file keeps an
-                            // unsaved buffer in the buffer list; Close
-                            // and Quit still protect modified buffers.
-                            xim_engine_command("hide edit", resolved, 0);
-                        }
-                        else
-                            xim_engine_command("hide edit", item.c_str(), 0);
-                    }
-                }
-                else
-                    prompt = current;
-                if (prompt == Action::ignore)
-                {
-                    xim_project_cancel_query();
-                    input.clear();
-                }
-                return;
+                // Explorer directory toggle keeps the prompt open.
             }
             else if (current == Action::save_as && input.empty())
+            {
+                // Handled inside activate path for empty input.
+            }
+            if (current == Action::save_as && input.empty() && prompt == Action::ignore)
             {
                 if (pending != Action::ignore && save_then_continue)
                 {
@@ -396,78 +692,169 @@ extern "C" void xim_dispatch(int key, int modifiers)
                 else
                     prompt = current;
                 input.clear();
+                input_cursor = 0;
+                clear_prompt_selection();
                 return;
             }
-            else if (!input.empty())
+            if (prompt == Action::ignore && current != Action::palette
+                    && current != Action::find && current != Action::files
+                    && current != Action::buffers && current != Action::explorer)
             {
-                if (current == Action::open) protect(current, input);
-                else
+                if (current == Action::save_as && input.empty())
                 {
-                    bool saved = true;
-                    auto command = current == Action::ex ? input.c_str() : "";
-                    auto argument = current == Action::ex ? "" : input.c_str();
-                    if (current == Action::save_as)
+                    // Already handled above.
+                }
+                else if (!input.empty() || current == Action::save_as)
+                {
+                    if (current == Action::open && !input.empty()) protect(current, input);
+                    else if (!input.empty())
                     {
-                        saved = xim_engine_command("saveas", input.c_str(), 1) != 0;
-                        if (!saved)
+                        auto command = current == Action::ex ? input.c_str() : "";
+                        auto argument = current == Action::ex ? "" : input.c_str();
+                        if (current == Action::save_as)
                         {
-                            auto error = xim_engine_error();
-                            pending_error = error && *error != '\0' ? error : "Write failed";
-                            prompt = pending != Action::ignore && save_then_continue
-                                ? Action::confirm : current;
-                            if (prompt == current)
-                                pending_error.clear();
-                            else
-                                pending_save_as_retry = true;
-                            input.clear();
-                            return;
+                            bool saved = xim_engine_command("saveas", input.c_str(), 1) != 0;
+                            if (!saved)
+                            {
+                                auto error = xim_engine_error();
+                                pending_error = error && *error != '\0' ? error : "Write failed";
+                                prompt = pending != Action::ignore && save_then_continue
+                                    ? Action::confirm : current;
+                                if (prompt == current)
+                                    pending_error.clear();
+                                else
+                                    pending_save_as_retry = true;
+                                input.clear();
+                                input_cursor = 0;
+                                clear_prompt_selection();
+                                return;
+                            }
                         }
-                    }
-                    else if (current == Action::ex)
-                        xim_engine_command(command, argument, 0);
-                    if (current == Action::save_as && save_then_continue)
-                    {
-                        save_then_continue = false;
-                        if (!xim_engine_unsaved(pending == Action::quit)) perform_pending(false);
-                        else
+                        else if (current == Action::ex)
+                            xim_engine_command(command, argument, 0);
+                        if (current == Action::save_as && save_then_continue)
                         {
-                            pending_error = "The buffer still has unsaved changes";
-                            prompt = Action::confirm;
+                            save_then_continue = false;
+                            if (!xim_engine_unsaved(pending == Action::quit)) perform_pending(false);
+                            else
+                            {
+                                pending_error = "The buffer still has unsaved changes";
+                                prompt = Action::confirm;
+                            }
                         }
                     }
                 }
             }
-            input.clear();
+            // activate_current_row already cleared file prompts.
+            if (current == Action::palette || current == Action::find
+                    || current == Action::open || current == Action::ex
+                    || current == Action::save_as)
+            {
+                input.clear();
+                input_cursor = 0;
+                clear_prompt_selection();
+            }
             return;
         }
         accept_when_ready = false;
-        if (key == XIM_UP || key == XIM_DOWN)
+        // List selection with arrows.
+        if ((key == XIM_UP || key == XIM_DOWN)
+                && (prompt == Action::palette || prompt == Action::files
+                    || prompt == Action::buffers || prompt == Action::explorer))
         {
-            // Every list prompt supports arrow selection, not only the
-            // command palette.
             std::size_t count = 0;
-            if (prompt == Action::palette)
-            {
-                auto items = filtered();
-                count = items.size();
-            }
-            else if (prompt == Action::files || prompt == Action::buffers
-                    || prompt == Action::explorer)
-            {
-                auto list = project_items(prompt, input);
-                count = list.size();
-            }
+            if (prompt == Action::palette) count = filtered().size();
+            else count = project_items(prompt, input).size();
             if (count > 0)
                 selected = (selected + count + (key == XIM_UP ? -1 : 1)) % count;
+            return;
         }
-        else if (action == Action::backspace && !input.empty())
+        // Prompt caret editing: arrows, Home/End, Delete and clipboard.
+        if (key == XIM_LEFT || key == XIM_RIGHT)
         {
-            auto start = input.size() - 1;
-            while (start > 0 && (static_cast<unsigned char>(input[start]) & 0xc0) == 0x80)
-                --start;
-            input.resize(start);
+            bool select = (modifiers & XIM_SHIFT) != 0;
+            if (!select) clear_prompt_selection();
+            else if (!prompt_has_selection)
+            {
+                prompt_has_selection = true;
+                prompt_sel_start = prompt_sel_end = input_cursor;
+            }
+            input_cursor = key == XIM_LEFT ? utf8_prev(input, input_cursor)
+                : utf8_next(input, input_cursor);
+            if (select) prompt_sel_end = input_cursor;
+            else clear_prompt_selection();
+            return;
         }
-        else if (key >= 32 && key < XIM_LEFT) { append_utf8(input, key); selected = 0; }
+        if (key == XIM_HOME || key == XIM_END)
+        {
+            bool select = (modifiers & XIM_SHIFT) != 0;
+            if (!select) clear_prompt_selection();
+            else if (!prompt_has_selection)
+            {
+                prompt_has_selection = true;
+                prompt_sel_start = prompt_sel_end = input_cursor;
+            }
+            input_cursor = key == XIM_HOME ? 0 : input.size();
+            if (select) prompt_sel_end = input_cursor;
+            else clear_prompt_selection();
+            return;
+        }
+        if (action == Action::erase)
+        {
+            if (prompt_has_selection) delete_prompt_selection();
+            else if (input_cursor < input.size())
+            {
+                std::size_t next = utf8_next(input, input_cursor);
+                input.erase(input_cursor, next - input_cursor);
+            }
+            selected = 0;
+            return;
+        }
+        if (action == Action::backspace)
+        {
+            if (prompt_has_selection) delete_prompt_selection();
+            else if (input_cursor > 0)
+            {
+                std::size_t prev = utf8_prev(input, input_cursor);
+                input.erase(prev, input_cursor - prev);
+                input_cursor = prev;
+            }
+            selected = 0;
+            return;
+        }
+        if (action == Action::select_all)
+        {
+            prompt_has_selection = true;
+            prompt_sel_start = 0;
+            prompt_sel_end = input.size();
+            input_cursor = input.size();
+            return;
+        }
+        if (action == Action::copy || action == Action::cut)
+        {
+            execute(action);
+            return;
+        }
+        if (action == Action::paste)
+        {
+            execute(action);
+            return;
+        }
+        if (key >= 32 && key < XIM_LEFT)
+        {
+            delete_prompt_selection();
+            std::string piece = encode_utf8(key);
+            std::size_t pos = std::min(input_cursor, input.size());
+            input.insert(pos, piece);
+            input_cursor = pos + piece.size();
+            selected = 0;
+            return;
+        }
+        if (action == Action::move)
+        {
+            // Page keys keep list behavior; other moves are caret moves.
+            return;
+        }
         return;
     }
     switch (action)
@@ -492,13 +879,19 @@ extern "C" void xim_accept_paste(const char *text)
     else
     {
         accept_when_ready = false;
-        input += text;
+        delete_prompt_selection();
+        std::size_t pos = std::min(input_cursor, input.size());
+        input.insert(pos, text);
+        input_cursor = pos + std::string(text).size();
         selected = 0;
     }
 }
 
-extern "C" int xim_prompt_active() { return prompt != Action::ignore; }
-extern "C" int xim_input_blocked() { return deferred_keys.size() >= kMaxDeferredKeys; }
+extern "C" int xim_prompt_active()
+{
+    return (prompt != Action::ignore || menu_open) ? 1 : 0;
+}
+extern "C" int xim_input_blocked() { return deferred_keys.size() >= kMaxDeferredKeys ? 1 : 0; }
 
 extern "C" int xim_background()
 {
@@ -517,8 +910,84 @@ extern "C" int xim_background()
     return 0;
 }
 
+extern "C" int xim_prompt_place(int screen_col)
+{
+    // screen_col counts cells from the start of the input (after "Label: ").
+    if (prompt == Action::ignore) return 0;
+    if (screen_col < 0) screen_col = 0;
+    std::size_t bytes = bytes_for_cells(input, screen_col);
+    input_cursor = bytes;
+    clear_prompt_selection();
+    return static_cast<int>(bytes);
+}
+
+extern "C" void xim_prompt_get(int *cursor_cells, int *length_cells)
+{
+    int cursor = cells_before(input, std::min(input_cursor, input.size()));
+    int length = cells_before(input, input.size());
+    if (cursor_cells) *cursor_cells = cursor;
+    if (length_cells) *length_cells = length;
+}
+
+extern "C" void xim_prompt_selection(int *start_cells, int *end_cells)
+{
+    if (!prompt_has_selection)
+    {
+        if (start_cells) *start_cells = -1;
+        if (end_cells) *end_cells = -1;
+        return;
+    }
+    std::size_t start = std::min(prompt_sel_start, prompt_sel_end);
+    std::size_t end = std::max(prompt_sel_start, prompt_sel_end);
+    if (start_cells) *start_cells = cells_before(input, start);
+    if (end_cells) *end_cells = cells_before(input, end);
+}
+
+static std::string prompt_label()
+{
+    if (prompt == Action::open) return "Open: ";
+    if (prompt == Action::save_as) return "Save as: ";
+    if (prompt == Action::find) return "Find: ";
+    if (prompt == Action::ex) return "Ex: ";
+    if (prompt == Action::files) return "Files: ";
+    if (prompt == Action::buffers) return "Buffers: ";
+    if (prompt == Action::explorer) return "Explorer: ";
+    return "Command: ";
+}
+
+extern "C" void xim_menu_bar_text(char *buf, size_t len, int columns,
+        int *sel_col, int *sel_width)
+{
+    int active = menu_open ? menu_group : -1;
+    auto bar = xim::menu_bar(columns, active);
+    std::size_t copy = std::min(bar.text.size(), len > 0 ? len - 1 : 0);
+    for (std::size_t i = 0; i < copy; ++i)
+        buf[i] = bar.text[i];
+    if (len > 0)
+        buf[copy] = '\0';
+    if (sel_col) *sel_col = bar.selected_col;
+    if (sel_width) *sel_width = bar.selected_width;
+}
+
 extern "C" void xim_render()
 {
+    int columns = xim_engine_columns();
+    int menu_rows = xim_engine_menu_rows();
+    unsigned caps = capabilities_now();
+    // Menu bar is drawn by the tabline hook; the drop-down is an overlay.
+    if (menu_open)
+    {
+        auto group = static_cast<xim::MenuGroup>(menu_group);
+        // Approximate screen rows from menu rows helper.
+        xim::MenuLayout layout = xim::menu_layout(group, menu_selected,
+                menu_rows + 2, columns,
+                menu_context ? menu_context_row : -1,
+                menu_context ? menu_context_col : 0);
+        std::string lines = xim::menu_lines(group, menu_selected, caps, layout);
+        int selected_row = menu_selected - layout.first;
+        xim_engine_menu_popup(lines.c_str(), layout.row, layout.col,
+                layout.width, layout.rows, selected_row, 0);
+    }
     if (prompt == Action::ignore) return;
     if (prompt == Action::confirm)
     {
@@ -526,18 +995,23 @@ extern "C" void xim_render()
         xim_engine_overlay("Save changes? [s] Save  [d] Discard  [Esc] Cancel", error.c_str(), true);
         return;
     }
-    std::string label = prompt == Action::open ? "Open: " : prompt == Action::save_as ? "Save as: "
-        : prompt == Action::find ? "Find: " : prompt == Action::ex ? "Ex: "
-        : prompt == Action::files ? "Files: " : prompt == Action::buffers ? "Buffers: "
-        : prompt == Action::explorer ? "Explorer: " : "Command: ";
+    std::string label = prompt_label();
     std::string items;
     if (prompt == Action::palette)
     {
         auto list = filtered();
         selected = list.empty() ? 0 : selected % list.size();
-        auto rows = static_cast<std::size_t>(xim_engine_menu_rows());
+        auto rows = static_cast<std::size_t>(menu_rows);
         auto first = selected >= rows ? selected - rows + 1 : 0;
         auto last = std::min(list.size(), first + rows);
+        last_picker_items.clear();
+        for (std::size_t i = first; i < last; ++i)
+        {
+            last_picker_items.push_back(std::string(list[i]->name));
+        }
+        last_picker_action = prompt;
+        last_picker_first = static_cast<int>(first);
+        last_picker_selected = static_cast<int>(selected - first);
         for (std::size_t i = first; i < last; ++i)
         {
             items += i == selected ? "> " : "  ";
@@ -554,17 +1028,357 @@ extern "C" void xim_render()
             const char *status = prompt == Action::files ? xim_project_status() : nullptr;
             if (status != nullptr && *status != '\0')
                 items = std::string("  ") + status + "\n";
+            last_picker_items.clear();
+            last_picker_action = prompt;
         }
-        selected = list.empty() ? 0 : selected % list.size();
-        auto rows = static_cast<std::size_t>(xim_engine_menu_rows());
-        auto first = selected >= rows ? selected - rows + 1 : 0;
-        auto last = std::min(list.size(), first + rows);
-        for (std::size_t i = first; i < last; ++i)
+        else
         {
-            items += i == selected ? "> " : "  ";
-            items += list[i];
-            items += '\n';
+            selected = selected % list.size();
+            auto rows = static_cast<std::size_t>(menu_rows);
+            auto first = selected >= rows ? selected - rows + 1 : 0;
+            auto last = std::min(list.size(), first + rows);
+            last_picker_items.assign(list.begin() + first, list.begin() + last);
+            last_picker_action = prompt;
+            last_picker_first = static_cast<int>(first);
+            last_picker_selected = static_cast<int>(selected - first);
+            for (std::size_t i = first; i < last; ++i)
+            {
+                items += i == selected ? "> " : "  ";
+                items += list[i];
+                items += '\n';
+            }
         }
     }
+    // Cursor cells are resolved by the bridge for terminal placement.
     xim_engine_overlay((label + input).c_str(), items.c_str(), false);
+}
+
+// Mouse handling: menus and visible prompts first, documents via the engine.
+namespace
+{
+int screen_rows_for_mouse()
+{
+    // menu rows helper returns Rows-2; recover Rows for hit math.
+    return xim_engine_menu_rows() + 2;
+}
+
+bool activate_picker_row(int row, int columns)
+{
+    (void)columns;
+    if (prompt != Action::files && prompt != Action::buffers
+            && prompt != Action::explorer && prompt != Action::palette)
+        return false;
+    int rows = screen_rows_for_mouse();
+    // Recompute the overlay geometry used by xim_engine_overlay: items end
+    // at Rows-2 with the prompt on Rows-1.
+    std::size_t count = 0;
+    if (prompt == Action::palette) count = filtered().size();
+    else count = project_items(prompt, input).size();
+    if (count == 0) return false;
+    int visible = std::min<int>(static_cast<int>(count), xim_engine_menu_rows());
+    int top = rows - 2 - visible;
+    if (row < top || row >= rows - 1) return false;
+    std::size_t index = 0;
+    if (prompt == Action::palette)
+    {
+        auto list = filtered();
+        auto first = selected >= static_cast<std::size_t>(xim_engine_menu_rows())
+            ? selected - xim_engine_menu_rows() + 1 : 0;
+        index = first + (row - top);
+        if (index >= list.size()) return false;
+        prompt = Action::ignore;
+        execute(list[index]->action);
+        return true;
+    }
+    auto list = project_items(prompt, input);
+    auto first = selected >= static_cast<std::size_t>(xim_engine_menu_rows())
+        ? selected - xim_engine_menu_rows() + 1 : 0;
+    index = first + (row - top);
+    if (index >= list.size()) return false;
+    selected = index;
+    Action current = prompt;
+    prompt = Action::ignore;
+    // Reuse Enter activation so clicks and keys share one path.
+    prompt = current;
+    xim_dispatch('\r', 0);
+    return true;
+}
+}
+
+extern "C" void xim_mouse_press(int row, int col, int button, int modifiers, int clicks)
+{
+    int columns = xim_engine_columns();
+    int rows = screen_rows_for_mouse();
+    unsigned caps = capabilities_now();
+    // Menu bar is screen row 0 while native mode reserves the tabline.
+    if (row == 0 && button == 0)
+    {
+        int heading = xim::menu_heading_at(col, columns, menu_open ? menu_group : -1);
+        if (heading >= 0)
+        {
+            menu_open = true;
+            menu_context = false;
+            menu_group = heading;
+            menu_selected = xim::menu_next(static_cast<xim::MenuGroup>(heading),
+                    -1, 1, caps);
+            menu_dragging = true;
+            return;
+        }
+        if (menu_open)
+        {
+            menu_open = false;
+            menu_dragging = false;
+            return;
+        }
+    }
+    if (menu_open)
+    {
+        auto group = static_cast<xim::MenuGroup>(menu_group);
+        xim::MenuLayout layout = xim::menu_layout(group, menu_selected,
+                rows, columns,
+                menu_context ? menu_context_row : -1,
+                menu_context ? menu_context_col : 0);
+        int hit = xim::menu_item_at(layout, group, row, col, caps);
+        if (hit >= 0)
+        {
+            if (button == 0)
+            {
+                menu_selected = hit;
+                menu_dragging = true;
+                return;
+            }
+        }
+        else if (row == 0)
+        {
+            int heading = xim::menu_heading_at(col, columns, menu_group);
+            if (heading >= 0 && heading != menu_group)
+            {
+                menu_group = heading;
+                menu_selected = xim::menu_next(static_cast<xim::MenuGroup>(heading),
+                        -1, 1, caps);
+                menu_dragging = true;
+                return;
+            }
+            menu_open = false;
+            menu_dragging = false;
+            return;
+        }
+        else
+        {
+            // Press outside an open menu dismisses it; the press itself
+            // does not activate a document click (release handles it).
+            menu_open = false;
+            menu_dragging = false;
+            if (button == 2)
+            {
+                // Right-click outside still opens context Edit choices.
+                menu_open = true;
+                menu_context = true;
+                menu_group = static_cast<int>(xim::MenuGroup::edit);
+                menu_context_row = row;
+                menu_context_col = col;
+                menu_selected = xim::menu_next(xim::MenuGroup::edit, -1, 1, caps);
+                return;
+            }
+            return;
+        }
+    }
+    if (button == 2)
+    {
+        // Right-click opens native Edit choices without clearing selection.
+        menu_open = true;
+        menu_context = true;
+        menu_group = static_cast<int>(xim::MenuGroup::edit);
+        menu_context_row = row;
+        menu_context_col = col;
+        menu_selected = xim::menu_next(xim::MenuGroup::edit, -1, 1, caps);
+        return;
+    }
+    if (button == 1)
+    {
+        if (prompt != Action::ignore) return;
+        // Middle-click positions the caret then pastes through the same
+        // clipboard boundary as Ctrl-V (configured '+' or internal text).
+        xim_engine_click(row, col, 0, 1);
+        execute(Action::paste);
+        return;
+    }
+    if (prompt == Action::confirm && button == 0)
+    {
+        // Bottom-row Save/Discard/Cancel zones share the confirm path.
+        if (row == rows - 1)
+        {
+            if (col < columns / 3) xim_dispatch('s', 0);
+            else if (col < 2 * columns / 3) xim_dispatch('d', 0);
+            else xim_dispatch(27, 0);
+            return;
+        }
+    }
+    if ((prompt == Action::files || prompt == Action::buffers
+                || prompt == Action::explorer || prompt == Action::palette)
+            && button == 0)
+    {
+        if (activate_picker_row(row, columns)) return;
+        // Falls through to prompt input editing when the press is on the
+        // prompt line itself.
+        if (row == rows - 1)
+        {
+            std::string label = prompt_label();
+            int label_cells = static_cast<int>(label.size());
+            int input_col = col - label_cells;
+            if (input_col < 0) input_col = 0;
+            xim_prompt_place(input_col);
+            return;
+        }
+    }
+    else if ((prompt == Action::open || prompt == Action::save_as
+                || prompt == Action::find || prompt == Action::ex)
+            && button == 0 && row == rows - 1)
+    {
+        std::string label = prompt_label();
+        int input_col = col - static_cast<int>(label.size());
+        if (input_col < 0) input_col = 0;
+        xim_prompt_place(input_col);
+        return;
+    }
+    if (prompt != Action::ignore) return;
+    if (button != 0) return;
+    bool extend = (modifiers & XIM_SHIFT) != 0;
+    xim_engine_click(row, col, extend ? 1 : 0, clicks);
+}
+
+extern "C" void xim_mouse_drag(int row, int col, int modifiers)
+{
+    (void)modifiers;
+    int columns = xim_engine_columns();
+    int rows = screen_rows_for_mouse();
+    unsigned caps = capabilities_now();
+    if (menu_open && menu_dragging)
+    {
+        auto group = static_cast<xim::MenuGroup>(menu_group);
+        // Hover between headings switches groups while dragging.
+        if (row == 0)
+        {
+            int heading = xim::menu_heading_at(col, columns, menu_group);
+            if (heading >= 0 && heading != menu_group)
+            {
+                menu_group = heading;
+                group = static_cast<xim::MenuGroup>(menu_group);
+                menu_context = false;
+                menu_selected = xim::menu_next(group, -1, 1, caps);
+            }
+            return;
+        }
+        xim::MenuLayout layout = xim::menu_layout(group, menu_selected,
+                rows, columns,
+                menu_context ? menu_context_row : -1,
+                menu_context ? menu_context_col : 0);
+        int hit = xim::menu_item_at(layout, group, row, col, caps);
+        if (hit >= 0) menu_selected = hit;
+        return;
+    }
+    if (prompt != Action::ignore) return;
+    xim_engine_drag(row, col);
+}
+
+extern "C" void xim_mouse_release(int row, int col, int button, int modifiers)
+{
+    (void)modifiers;
+    int columns = xim_engine_columns();
+    int rows = screen_rows_for_mouse();
+    unsigned caps = capabilities_now();
+    if (menu_open && menu_dragging && button == 0)
+    {
+        auto group = static_cast<xim::MenuGroup>(menu_group);
+        xim::MenuLayout layout = xim::menu_layout(group, menu_selected,
+                rows, columns,
+                menu_context ? menu_context_row : -1,
+                menu_context ? menu_context_col : 0);
+        int hit = xim::menu_item_at(layout, group, row, col, caps);
+        menu_dragging = false;
+        if (hit >= 0)
+        {
+            activate_menu_item(group, hit);
+            return;
+        }
+        if (row == 0)
+        {
+            int heading = xim::menu_heading_at(col, columns, menu_group);
+            if (heading >= 0) return;  // keep open on bar release
+        }
+        menu_open = false;
+        return;
+    }
+    if (menu_open && button == 0)
+    {
+        // Simple click (no drag): activate on release for press-drag-release.
+        auto group = static_cast<xim::MenuGroup>(menu_group);
+        xim::MenuLayout layout = xim::menu_layout(group, menu_selected,
+                rows, columns,
+                menu_context ? menu_context_row : -1,
+                menu_context ? menu_context_col : 0);
+        int hit = xim::menu_item_at(layout, group, row, col, caps);
+        if (hit >= 0)
+        {
+            activate_menu_item(group, hit);
+            return;
+        }
+    }
+    // Document release ends any separator drag capture.
+    xim_engine_drag_end();
+}
+
+extern "C" void xim_mouse_wheel(int row, int col, int direction, int modifiers)
+{
+    (void)modifiers;
+    int columns = xim_engine_columns();
+    int rows = screen_rows_for_mouse();
+    if (menu_open)
+    {
+        auto group = static_cast<xim::MenuGroup>(menu_group);
+        unsigned caps = capabilities_now();
+        if (direction == 0) menu_selected = xim::menu_next(group, menu_selected, -1, caps);
+        else if (direction == 1) menu_selected = xim::menu_next(group, menu_selected, 1, caps);
+        (void)columns;
+        (void)rows;
+        return;
+    }
+    if (prompt == Action::files || prompt == Action::buffers
+            || prompt == Action::explorer || prompt == Action::palette)
+    {
+        if (direction == 0) xim_dispatch(XIM_UP, 0);
+        else if (direction == 1) xim_dispatch(XIM_DOWN, 0);
+        return;
+    }
+    if (prompt != Action::ignore) return;
+    xim_engine_scroll(row, col, direction);
+}
+
+extern "C" void xim_mouse_move(int row, int col, int modifiers)
+{
+    (void)modifiers;
+    if (!menu_open) return;
+    int columns = xim_engine_columns();
+    int rows = screen_rows_for_mouse();
+    unsigned caps = capabilities_now();
+    if (row == 0)
+    {
+        int heading = xim::menu_heading_at(col, columns, menu_group);
+        if (heading >= 0 && heading != menu_group)
+        {
+            menu_group = heading;
+            menu_selected = xim::menu_next(static_cast<xim::MenuGroup>(heading),
+                    -1, 1, caps);
+            menu_context = false;
+        }
+        return;
+    }
+    auto group = static_cast<xim::MenuGroup>(menu_group);
+    xim::MenuLayout layout = xim::menu_layout(group, menu_selected,
+            rows, columns,
+            menu_context ? menu_context_row : -1,
+            menu_context ? menu_context_col : 0);
+    int hit = xim::menu_item_at(layout, group, row, col, caps);
+    if (hit >= 0) menu_selected = hit;
+    (void)rows;
 }

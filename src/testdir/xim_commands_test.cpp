@@ -11,7 +11,8 @@ int main()
         {'s', XIM_CTRL, Action::save}, {'S', XIM_CTRL | XIM_SHIFT, Action::save_as},
         {XIM_LEFT, XIM_SHIFT, Action::move}, {XIM_F3, XIM_SHIFT, Action::previous},
         {XIM_BACKSPACE, 0, Action::backspace}, {XIM_IGNORE, 0, Action::ignore},
-        {'a', XIM_ALT, Action::ignore}
+        {'a', XIM_ALT, Action::ignore}, {XIM_F10, 0, Action::menu},
+        {25, 0, Action::redo}, {14, 0, Action::new_buffer}
     };
     for (const auto &test : cases)
         if (xim::resolve(test.key, test.modifiers) != test.action)

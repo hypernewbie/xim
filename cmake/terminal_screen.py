@@ -64,6 +64,25 @@ class TerminalScreen:
                             self.top = n - 1
                             self.bottom = (numbers[1] or self.rows) - 1 if len(numbers) > 1 else self.rows - 1
                             self.row = self.col = 0
+                        elif command in "STLM":
+                            # Scroll-region edits: S/T scroll, L/M insert/delete lines.
+                            if command == "S":
+                                for _ in range(n):
+                                    del self.lines[self.top]
+                                    self.lines.insert(self.bottom, [" "] * self.columns)
+                            elif command == "T":
+                                for _ in range(n):
+                                    del self.lines[self.bottom]
+                                    self.lines.insert(self.top, [" "] * self.columns)
+                            else:
+                                start = max(self.row, self.top)
+                                for _ in range(n):
+                                    if command == "L":
+                                        del self.lines[self.bottom]
+                                        self.lines.insert(start, [" "] * self.columns)
+                                    else:
+                                        del self.lines[start]
+                                        self.lines.insert(self.bottom, [" "] * self.columns)
                         elif command == "s": self.saved = (self.row, self.col)
                         elif command == "u": self.row, self.col = self.saved
                     i += len(match[0])

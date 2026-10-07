@@ -1,5 +1,5 @@
 *xim.txt*	Native non-modal terminal editing
-					Last change: 2026 Oct 05
+					Last change: 2026 Oct 06
 
 Xim's native input layer uses the existing Vim text engine.  This document
 describes the first native editing milestone.
@@ -36,6 +36,7 @@ replaces the selection.  Escape cancels selection without moving the cursor.
 Ctrl-A selects the buffer.  Selection is characterwise, including newlines.
 
 Command		Shortcut	Fallback ~
+New		Ctrl-N		menu: File > New
 Save		Ctrl-S		F4 or palette: Save
 Save as		Ctrl-Shift-S	palette: Save as
 Open		Ctrl-O		F5 or palette: Open
@@ -46,14 +47,15 @@ Copy		Ctrl-C		F6 or palette: Copy
 Cut		Ctrl-X		F7 or palette: Cut
 Paste		Ctrl-V		F8 or palette: Paste
 Undo		Ctrl-Z		F9 or palette: Undo
-Redo		Ctrl-Y		F10 or palette: Redo
+Redo		Ctrl-Y		palette: Redo
 Find		Ctrl-F		F11 or palette: Find
-Next match	Ctrl-N		F3 or palette: Next match
-Previous match	Ctrl-B		Shift-F3 or palette: Previous match
+Next match	F3		palette: Next match
+Previous match	Shift-F3	palette: Previous match
 Quick open	Ctrl-P		palette: Files
 Explorer	Ctrl-E		palette: Explorer
 Buffers	Ctrl-Shift-B	palette: Buffers
 Command palette	Ctrl-Shift-P	F1 or F2
+Menus		F10		mouse: top bar
 Refresh project			palette: Refresh project
 
 The palette filters command names by case-insensitive substring.  Up/Down
@@ -128,8 +130,31 @@ decoded characters, special keys, and Shift/Ctrl/Alt modifiers.
 Xim disables terminal Ctrl-S/Ctrl-Q flow control in native raw mode.  A
 terminal or multiplexer can still intercept shortcuts before Xim receives
 them.  Ctrl-Shift-S is indistinguishable from Ctrl-S on many terminals; use
-the palette in that case.  Unrecognized keys are ignored.  Mouse editing,
-Alt shortcuts, and platform-specific GUI input are outside this milestone.
+the palette in that case.  Unrecognized keys are ignored.  Alt-letter menu
+access works where the terminal distinguishes Alt; the mouse remains the
+primary menu pointer.  Platform-specific GUI input and operating-system
+gestures are outside the editor's reporting boundary.
+
+The top row shows File, Edit, View, Navigate and Help.  F10 opens the
+menu; Left/Right switch headings, Up/Down move, Enter runs, Escape
+dismisses.  Click a heading to open it, hover to switch while open, and
+click or press-drag-release an entry to run it.  Clicking outside
+dismisses.  Narrow terminals clip trailing headings; keyboard access still
+reaches every group.  Right-click opens Edit choices at the pointer
+without clearing the selection.  F10 was the Redo fallback; use Ctrl-Y
+for Redo.  Ctrl-N creates a new buffer; use F3 for Next match.
+
+Mouse reporting uses inherited SGR sequences and is enabled by default in
+native mode.  Click places the insertion point; Shift-click extends the
+selection; drag selects; double-click selects a word; triple-click
+selects a logical line.  The wheel scrolls the window under the pointer
+and never moves the caret or selection; typing brings the caret back into
+view.  Middle-click pastes through the clipboard boundary.  Dragging a
+window's status line or vertical separator resizes the split.  Picker rows,
+confirmation Save/Discard/Cancel zones and prompt input accept clicks;
+the wheel moves list selection.  Prompts support Left/Right, Home/End,
+Delete, Select all, clipboard and mouse placement.  Motion reporting is
+active only while a menu is open.
 
 Copy and cut require a selection.  Xim keeps an internal text clipboard when
 the inherited '+' clipboard is unavailable.  When '+' is available, Xim uses
@@ -152,6 +177,8 @@ these default links, which follow a colorscheme's target groups: >vim
 	hi default link XimPrompt Pmenu
 	hi default link XimPalette Pmenu
 	hi default link XimPaletteSel PmenuSel
+	hi default link XimMenuBar StatusLine
+	hi default link XimMenuSel PmenuSel
 <
 Users can override these groups.  Shipped themes tested include default,
 desert, slate, habamax and catppuccin.  Two local third-party Phi themes,

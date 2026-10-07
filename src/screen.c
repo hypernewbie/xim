@@ -5196,6 +5196,12 @@ draw_tabline(void)
 	return;
     redraw_tabline = FALSE;
 
+    if (xim_native_mode && xim_draw_menu_bar_ptr != NULL)
+    {
+        xim_draw_menu_bar_ptr();
+        return;
+    }
+
 #ifdef FEAT_GUI_TABLINE
     // Take care of a GUI tabline.
     if (gui_use_tabline())

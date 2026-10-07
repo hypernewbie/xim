@@ -53,9 +53,13 @@ class Session:
         os.write(self.master, text)
 
     def wait(self, marker, timeout=5):
+        # Incremental overlays may render a marker once and emit no further
+        # bytes, so check the retained screen before every read.
         output = bytearray()
         deadline = time.monotonic() + timeout
-        while marker not in output:
+        while True:
+            if marker in output or marker in self.screen.text():
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise AssertionError(f"missing {marker!r}; output: {bytes(output[-3000:])!r}")
@@ -65,8 +69,6 @@ class Session:
                     data = os.read(self.master, 65536)
                     self.screen.feed(data)
                     output.extend(data)
-                    if marker in self.screen.text():
-                        break
                 except OSError as error:
                     raise AssertionError(f"editor exited: {self.process.poll()}, {bytes(output)!r}") from error
         return bytes(output) + b"\n" + self.screen.text()
@@ -858,6 +860,181 @@ def ui_incremental(binary, root):
         print("Incremental overlay, Unicode restore and idle resize checks passed")
 
 
+def screen_rowcol(screen, marker):
+    """1-based SGR row/column of the first cell containing marker."""
+    for row, line in enumerate(screen.lines):
+        text = "".join(line)
+        if marker in text:
+            return row + 1, text.index(marker) + 1
+    raise AssertionError(f"{marker!r} not on screen: {screen.text()[-300:]!r}")
+
+
+def menu_mouse(binary, root):
+    """Top bar, F10 menus and SGR mouse use real terminal reports."""
+    with tempfile.TemporaryDirectory(prefix="xim-menu-mouse-", dir=root) as temporary:
+        directory = Path(temporary)
+        (directory / "alpha.txt").write_text("hello world\nsecond line\nthird\n")
+        (directory / "beta.txt").write_text("beta file\n")
+        session = Session(binary, directory, ("alpha.txt",))
+        try:
+            # Top bar is always visible and reserves the first row.
+            assert b"File" in session.screen.text() and b"Help" in session.screen.text()
+            # F10 opens File; arrows move; Enter runs; Escape dismisses.
+            session.send(b"\x1b[21~")
+            session.wait(b"New")
+            assert b"Ctrl-N" in session.screen.text()
+            session.send(b"\x1b")
+            session.drain(.2)
+            assert b"New" not in session.screen.text()
+            # Ctrl-N creates a new buffer; F3 still finds next match.
+            session.send(b"\x0e")
+            session.wait(b"Xim")
+            assert session.snapshot() == "\n"
+            session.send(b"dirty")
+            session.send(b"\x11")
+            session.wait(b"Save changes")
+            session.send(b"\x1b")
+            session.send(b"\x01\x7f")
+            # Redo stays on Ctrl-Y; F10 is menus, not redo.
+            session.send(b"typed")
+            assert "typed" in session.snapshot()
+            session.send(b"\x1a")
+            assert "typed" not in session.snapshot()
+            session.send(b"\x19")
+            assert "typed" in session.snapshot()
+            # SGR click positions the caret; status shows the column.
+            session.ex("call setline(1, ['hello world', 'second line', 'third'])|call cursor(1,1)")
+            session.send(b"\x1b[<0;7;2M\x1b[<0;7;2m")
+            session.wait(b"1:7")
+            # Drag selects; replacement and copy work on the selection.
+            session.send(b"\x1b[<0;2;2M")
+            session.send(b"\x1b[<32;7;2M")
+            session.send(b"\x1b[<0;7;2m")
+            session.send(b"!")
+            assert session.snapshot().startswith("h!world"), repr(session.snapshot()[:30])
+            session.send(b"\x1a")
+            # Double-click selects a word; copy then middle-click pastes it.
+            session.ex("call setline(1, ['hello world', 'second line', 'third'])|call cursor(1,1)")
+            session.drain(.6)  # let the previous multi-click state expire
+            session.send(b"\x1b[<0;3;2M\x1b[<0;3;2m\x1b[<0;3;2M\x1b[<0;3;2m")
+            session.drain(.2)
+            session.send(b"\x03")
+            session.send(b"\x1b[<1;1;3M\x1b[<1;1;3m")
+            session.drain(.3)
+            assert session.snapshot().splitlines()[1] == "hellosecond line", repr(session.snapshot())
+            session.send(b"\x1a")
+            # Triple-click selects the logical line; typing replaces it.
+            session.ex("call setline(1, ['hello world', 'second line', 'third'])|call cursor(1,1)")
+            session.drain(.6)
+            session.send(b"\x1b[<0;3;2M\x1b[<0;3;2m\x1b[<0;3;2M\x1b[<0;3;2m\x1b[<0;3;2M\x1b[<0;3;2m")
+            session.drain(.2)
+            session.send(b"Z")
+            assert session.snapshot().startswith("Z\nsecond"), repr(session.snapshot())
+            session.send(b"\x1a")
+            # Wheel keeps the caret; keyboard brings it back into view.
+            session.ex("call setline(1, map(range(1,50), 'string(v:val)'))|call cursor(1,1)")
+            session.send(b"\x1b[<65;50;10M")
+            session.drain(.3)
+            assert "".join(session.screen.lines[1]).strip() != "1", "wheel did not move the view"
+            session.ex("call writefile([string(line('w0'))], 'top')")
+            assert (directory / "top").read_text().strip() != "1", "wheel did not scroll"
+            session.ex("call writefile([string(col('.'))], 'caret')")
+            assert (directory / "caret").read_text().strip() == "1", "wheel moved caret"
+            # Clicking a heading then an entry runs the shared action.
+            session.send(b"\x1b[<0;2;1M\x1b[<0;2;1m")
+            session.wait(b"Save as")
+            row, column = screen_rowcol(session.screen, "Save as")
+            session.send(f"\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m".encode())
+            session.wait(b"Save as:")
+            session.send(b"\x1b")
+            session.drain(.2)
+            # Right-click opens Edit choices without clearing selection.
+            session.send(b"\x01")
+            session.send(b"\x1b[<2;50;12M\x1b[<2;50;12m")
+            session.wait(b"Copy")
+            session.send(b"\x1b")
+            session.drain(.2)
+            # Confirmation choices accept clicks; Cancel keeps editing.
+            session.send(b"x")
+            session.send(b"\x11")
+            session.wait(b"Save changes")
+            session.send(b"\x1b[<0;90;24M\x1b[<0;90;24m")
+            session.drain(.4)
+            assert b"Save changes" not in session.screen.text()
+            # Invalid coordinates never crash.
+            session.send(b"\x1b[<0;999;999M\x1b[<0;999;999m")
+            session.drain(.2)
+            session.send(b"ok")
+            assert "ok" in session.snapshot()
+            # Split separators resize through the owning-thread adapters.
+            session.ex("split")
+            session.drain(.3)
+            session.ex("call writefile([string(winheight(1)), string(winheight(2))], 'heights')")
+            before_split = (directory / "heights").read_text().split()
+            status_row, _ = screen_rowcol(session.screen, "Xim [No Name]")
+            session.send(f"\x1b[<0;40;{status_row}M\x1b[<32;40;{status_row + 3}M\x1b[<0;40;{status_row + 3}m".encode())
+            session.drain(.4)
+            session.ex("call writefile([string(winheight(1)), string(winheight(2))], 'heights')")
+            after_split = (directory / "heights").read_text().split()
+            assert after_split != before_split, (before_split, after_split)
+            session.ex("only")
+            session.drain(.2)
+            # A resize during pointer capture cancels safely.
+            session.send(b"\x1b[<0;10;10M")
+            session.screen = TerminalScreen(16, 80)
+            session.process.send_signal(signal.SIGWINCH)
+            session.drain(.4)
+            session.send(b"\x1b[<0;10;10m")
+            session.drain(.2)
+            session.send(b"RESIZE")
+            assert "RESIZE" in session.snapshot()
+        finally:
+            session.close()
+
+        # Project root: picker rows and lists use the rendered layout.
+        project = Session(binary, directory, arguments=(".",))
+        try:
+            project.send(b"\x10")
+            project.wait(b"Files:")
+            project.send(b"txt")
+            project.wait(b"alpha.txt")
+            project.wait(b"beta.txt")
+            # Let the pending match settle so the click cannot race it.
+            for _ in range(20):
+                before = project.screen.text()
+                project.drain(.1)
+                if project.screen.text() == before:
+                    break
+            row, column = screen_rowcol(project.screen, "beta.txt")
+            project.send(f"\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m".encode())
+            project.wait(b"beta file")
+            assert project.snapshot().startswith("beta file"), repr(project.snapshot())
+            # Wheel moves the palette list selection.
+            project.send(b"\x1bOQ")
+            project.wait(b"Command:")
+            project.drain(.3)
+            before = [line for line in project.screen.text().decode().splitlines() if line.startswith(">")]
+            project.send(b"\x1b[<65;10;18M")
+            project.drain(.3)
+            after = [line for line in project.screen.text().decode().splitlines() if line.startswith(">")]
+            assert before and after != before, (before, after)
+            project.send(b"\x1b")
+            project.drain(.2)
+        finally:
+            project.close()
+
+        # Compatibility Vim keeps its inherited screen; no native bar.
+        compat = Session(binary, directory, ("--vim", "alpha.txt"), ready=b"alpha.txt")
+        try:
+            compat.drain(.3)
+            assert b"File  Edit" not in compat.screen.text(), "compatibility mode painted the menu bar"
+            compat.send(b":qall!\r")
+            compat.drain(.3)
+        finally:
+            compat.close()
+        print("Menu bar, mouse editing, pickers and mode separation checks passed")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -880,3 +1057,4 @@ if __name__ == "__main__":
     project_background(args.binary.resolve(), args.work.resolve())
     ui_incremental(args.binary.resolve(), args.work.resolve())
     buffer_picker_identity(args.binary.resolve(), args.work.resolve())
+    menu_mouse(args.binary.resolve(), args.work.resolve())

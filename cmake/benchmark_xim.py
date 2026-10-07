@@ -22,7 +22,9 @@ function! Observe()
   let done = (g:phase == 'READY' || g:phase == 'TYPE' || g:phase == 'PASTE')
         \ ? getline(1) ==# g:expected
         \ : g:phase == 'SELECT' ? getpos('v')[2] == 1 && col('.') == 2
-        \ : g:phase == 'SCROLL' ? line('.') > 20 : 0
+        \ : g:phase == 'MOUSE' ? line('.') == 1 && col('.') == 7
+        \ : g:phase == 'DRAG' ? getpos('v')[1] == 1 && getpos('v')[2] == 2 && col('.') == 7
+        \ : g:phase == 'SCROLL' ? line('.') > 19 : 0
   if done
     if get(g:, 'delay', 0) > 0
       execute 'sleep ' . g:delay . 'm'
@@ -68,6 +70,12 @@ def sample(binary, root, native, startup_log=None, profile=None, delay=0, runtim
             session.wait(marker or ("XIM_DONE_" + phase).encode())
             return (time.perf_counter_ns() - started) / 1e6
 
+        def timed_marker(keys, marker):
+            started = time.perf_counter_ns()
+            session.send(keys)
+            session.wait(marker)
+            return (time.perf_counter_ns() - started) / 1e6
+
         try:
             elapsed = timed("READY", "X" if native else "iX")
             if delay:
@@ -84,7 +92,7 @@ def sample(binary, root, native, startup_log=None, profile=None, delay=0, runtim
             session.ex("call cursor(1,1)|let g:phase='SCROLL'")
             result["scroll"] = timed("SCROLL", b"\x1b[6~" if native else b"\x06")
             session.ex("call writefile([string(line('.'))], 'scroll')")
-            assert int((directory / "scroll").read_text()) > 20
+            assert int((directory / "scroll").read_text()) > 19
             session.ex("call cursor(1,1)|let g:phase='PASTE'|let g:expected=repeat('P',10240)..getline(1)")
             data = b"\x1b[200~" + b"P" * 10240 + b"\x1b[201~"
             result["paste_10k"] = timed("PASTE", data if native else b"i" + data)
@@ -95,6 +103,24 @@ def sample(binary, root, native, startup_log=None, profile=None, delay=0, runtim
                 session.wait(b"Ex:")
                 session.send("echo 'XIM_' . 'PALETTE_OK'\r")
                 session.wait(b"XIM_PALETTE_OK")
+                # Plan 4: menu and mouse latencies with UI-completion signals.
+                session.ex("call cursor(1,1)")
+                result["menu_open"] = timed_marker(b"\x1b[21~", b"Save as")
+                result["menu_select"] = timed_marker(b"\x1b[B", b"> Open")
+                session.send(b"\x1b")
+                session.drain(.05)
+                session.ex("call cursor(1,1)|let g:phase='MOUSE'")
+                result["mouse_click"] = timed("MOUSE", b"\x1b[<0;7;2M\x1b[<0;7;2m")
+                session.ex("call cursor(1,1)|let g:phase='DRAG'")
+                result["mouse_drag"] = timed("DRAG",
+                        b"\x1b[<0;2;2M\x1b[<32;7;2M\x1b[<0;7;2m")
+                session.send(b"\x1b")
+                session.drain(.05)
+                session.ex("call cursor(1,1)")
+                result["mouse_wheel"] = timed_marker(b"\x1b[<65;50;10M", b"BENCH_LINE_00004")
+                session.ex("call writefile([string(line('.')), string(col('.'))], 'wheel')")
+                assert (directory / "wheel").read_text().splitlines() == ["1", "1"], \
+                    "wheel moved the caret"
             else:
                 result["command_ui"] = timed("COMMAND", b"\x1b:", b":")
                 session.send("echo 'XIM_' . 'COMMAND_OK'\r")
@@ -151,7 +177,8 @@ def main():
                "configuration": "-n -X -u bench.vim -i NONE; syntax enabled, laststatus=2, selection=exclusive",
                "profiled": bool(args.profile_dir), "delayed_self_test": args.self_test,
               "summary": summary, "samples": values,
-              "command_ui_note": "Native palette versus Vim Ex prompt; different available interfaces."}
+              "command_ui_note": "Native palette versus Vim Ex prompt; different available interfaces.",
+              "native_ui_note": "Menu and mouse phases are native-only; click/drag complete on CursorMoved at the pointer position with the press anchor intact, wheel on a newly visible fixture line."}
     args.output.write_text(json.dumps(output, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
 

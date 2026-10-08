@@ -58,15 +58,36 @@ int main()
     auto help_items = xim::menu_items(MenuGroup::help);
     if (help_items.empty() || help_heading != 4) return 1;
     // Layout and hit testing use the same coordinates.
-    auto layout = xim::menu_layout(MenuGroup::file, 0, 24, 100);
+    auto layout = xim::menu_layout(MenuGroup::file, 0, 24, 100, 0);
     if (layout.row != 1 || layout.rows != 6 || layout.width <= 0) return 1;
     if (xim::menu_item_at(layout, MenuGroup::file, 1, layout.col + 1, 0) != 0) return 1;
     if (xim::menu_item_at(layout, MenuGroup::file, 0, layout.col + 1, 0) != -1) return 1;
     auto lines = xim::menu_lines(MenuGroup::file, 0, 0, layout);
     if (lines.find("New") == std::string::npos
             || lines.find("Ctrl-N") == std::string::npos) return 1;
+    // The declared width must cover the rendered text, including the
+    // disabled suffix, or the restore rectangle leaves stale columns.
+    const unsigned all = xim::kCanUndo | xim::kCanRedo | xim::kHasSelection
+        | xim::kHasClipboard;
+    auto enabled_layout = xim::menu_layout(MenuGroup::edit, 0, 24, 100, all);
+    if (enabled_layout.width != 20) return 1;  // "  Select all  Ctrl-A"
+    auto disabled_layout = xim::menu_layout(MenuGroup::edit, 0, 24, 100, 0);
+    // "  Paste  Ctrl-V (disabled)" is the widest rendered entry.
+    if (disabled_layout.width != 26) return 1;
+    auto disabled_lines = xim::menu_lines(MenuGroup::edit, 0, 0, disabled_layout);
+    std::size_t start = 0;
+    std::size_t longest = 0;
+    while (start <= disabled_lines.size())
+    {
+        std::size_t end = disabled_lines.find('\n', start);
+        if (end == std::string::npos) end = disabled_lines.size();
+        if (end - start > longest) longest = end - start;
+        if (end == disabled_lines.size()) break;
+        start = end + 1;
+    }
+    if (longest > static_cast<std::size_t>(disabled_layout.width)) return 1;
     // Context layout clamps into the visible screen.
-    auto context = xim::menu_layout(MenuGroup::edit, 0, 24, 40, 20, 35);
+    auto context = xim::menu_layout(MenuGroup::edit, 0, 24, 40, 0, 20, 35);
     if (context.col + context.width > 40 || context.row + context.rows > 24) return 1;
     return 0;
 }

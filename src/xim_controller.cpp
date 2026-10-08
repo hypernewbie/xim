@@ -1084,7 +1084,7 @@ void render_menu_popup(int columns, int menu_rows, unsigned caps)
     auto group = static_cast<xim::MenuGroup>(menu_group);
     // Approximate screen rows from menu rows helper.
     xim::MenuLayout layout = xim::menu_layout(group, menu_selected,
-            menu_rows + 2, columns,
+            menu_rows + 2, columns, caps,
             menu_context ? menu_context_row : -1,
             menu_context ? menu_context_col : 0);
     std::string lines = xim::menu_lines(group, menu_selected, caps, layout);
@@ -1191,7 +1191,7 @@ extern "C" void xim_mouse_press(int row, int col, int button, int modifiers, int
     {
         auto group = static_cast<xim::MenuGroup>(menu_group);
         xim::MenuLayout layout = xim::menu_layout(group, menu_selected,
-                rows, columns,
+                rows, columns, caps,
                 menu_context ? menu_context_row : -1,
                 menu_context ? menu_context_col : 0);
         int hit = xim::menu_item_at(layout, group, row, col, caps);
@@ -1326,7 +1326,7 @@ extern "C" void xim_mouse_drag(int row, int col, int modifiers)
             return;
         }
         xim::MenuLayout layout = xim::menu_layout(group, menu_selected,
-                rows, columns,
+                rows, columns, caps,
                 menu_context ? menu_context_row : -1,
                 menu_context ? menu_context_col : 0);
         int hit = xim::menu_item_at(layout, group, row, col, caps);
@@ -1347,7 +1347,7 @@ extern "C" void xim_mouse_release(int row, int col, int button, int modifiers)
     {
         auto group = static_cast<xim::MenuGroup>(menu_group);
         xim::MenuLayout layout = xim::menu_layout(group, menu_selected,
-                rows, columns,
+                rows, columns, caps,
                 menu_context ? menu_context_row : -1,
                 menu_context ? menu_context_col : 0);
         int hit = xim::menu_item_at(layout, group, row, col, caps);
@@ -1370,7 +1370,7 @@ extern "C" void xim_mouse_release(int row, int col, int button, int modifiers)
         // Simple click (no drag): activate on release for press-drag-release.
         auto group = static_cast<xim::MenuGroup>(menu_group);
         xim::MenuLayout layout = xim::menu_layout(group, menu_selected,
-                rows, columns,
+                rows, columns, caps,
                 menu_context ? menu_context_row : -1,
                 menu_context ? menu_context_col : 0);
         int hit = xim::menu_item_at(layout, group, row, col, caps);
@@ -1431,7 +1431,7 @@ extern "C" void xim_mouse_move(int row, int col, int modifiers)
     }
     auto group = static_cast<xim::MenuGroup>(menu_group);
     xim::MenuLayout layout = xim::menu_layout(group, menu_selected,
-            rows, columns,
+            rows, columns, caps,
             menu_context ? menu_context_row : -1,
             menu_context ? menu_context_col : 0);
     int hit = xim::menu_item_at(layout, group, row, col, caps);

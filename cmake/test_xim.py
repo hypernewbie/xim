@@ -1311,7 +1311,7 @@ def split_wheel_caret(binary, root):
 
 
 def menu_overlay_cleanup(binary, root):
-    """Menus restore short lines and clear over a live prompt (R8)."""
+    """Menus restore short lines and clear over a live prompt (R8, N1)."""
     with tempfile.TemporaryDirectory(prefix="xim-menu-clean-", dir=root) as temporary:
         directory = Path(temporary)
         (directory / "alpha.txt").write_text("short\ntiny\n")
@@ -1324,13 +1324,21 @@ def menu_overlay_cleanup(binary, root):
             assert wait_screen(session, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"), "setline did not render"
             def menu_region():
                 return session.screen.text().decode().splitlines()[1:7]
-            before = menu_region()
-            session.send(b"\x1b[21~")
-            assert wait_screen(session, b"Quit"), "menu did not open"
-            session.send(b"\x1b")
-            assert wait_screen(session, b"Quit", present=False), "menu survived Escape"
-            assert wait_drain(session, lambda: menu_region() == before), \
-                "menu dismissal left artifacts"
+            def check_dismiss(open_keys, marker):
+                before = menu_region()
+                session.send(open_keys)
+                assert wait_screen(session, marker), "menu did not open"
+                session.send(b"\x1b")
+                assert wait_screen(session, marker, present=False), "menu survived Escape"
+                assert wait_drain(session, lambda: menu_region() == before), \
+                    "menu dismissal left artifacts"
+            # The File menu has no disabled entries.
+            check_dismiss(b"\x1b[21~", b"Quit")
+            # The Edit drop-down renders " (disabled)" entries; its restore
+            # rectangle must still cover every painted column.
+            check_dismiss(b"\x1b[21~\x1b[C", b"(disabled)")
+            # The right-click context menu renders the same disabled items.
+            check_dismiss(b"\x1b[<2;5;2M\x1b[<2;5;2m", b"(disabled)")
             # A menu opened over a prompt is erased when it closes.
             session.send(b"\x0fabc")
             session.wait(b"Open: abc")

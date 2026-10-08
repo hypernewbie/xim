@@ -189,6 +189,21 @@ did not cover; the review itself is in the gitignored
   for a blank cell, the menu clear runs regardless of the prompt, and the
   shared snapshot is captured from a frame with no overlay on it (the prompt
   paints before the drop-down). Test `menu_overlay_cleanup`.
+- **Menu width (was: disabled entries painted past the restore rectangle).
+
+  A follow-up review found the overlay cleanup incomplete: the declared
+  popup width was `name + shortcut + 6`, which never counted the rendered
+  `" (disabled)"` suffix (or the full marker/checkbox cells), while the paint
+  loop writes the whole item text. The Edit, Navigate and Help drop-downs
+  and the right-click context menu left fragments on the document after
+  dismissal. `menu_layout` now takes the capabilities and sizes the popup
+  from the same cells `menu_lines()` renders, with the suffix spelled once
+  as `kDisabledLabel`; the painted text can no longer exceed the restore
+  rectangle, and hit testing uses the same rect. `menu_overlay_cleanup`
+  opens the Edit drop-down and the context menu as well as File, and the
+  `xim_menu` unit test asserts the enabled (20) and disabled (26) widths
+  and that no rendered line exceeds the declared width. The three menu
+  screendumps record the adjusted trailing fill.
 - **Horizontal wheel (was: inverted).** `K_MOUSELEFT` is the inherited name
   for wheel-right and `K_MOUSERIGHT` for wheel-left; the bridge mapped them
   the wrong way. Test `horizontal_wheel_direction`.
@@ -201,6 +216,10 @@ did not cover; the review itself is in the gitignored
   the clickable confirmation labels rather than zones.
 
 Verification after the fixes: full `build/dev` CTest 19/19 (native 5/5);
+repeated for the menu-width fix: native 5/5 on dev, 4/4 on ASan/UBSan and
+4/4 on TSan after rebuilding both presets, no new compiler warnings, and a
+10-run menu/mouse benchmark spot check inside the recorded budgets (p90
+menu open 0.51 ms, click 2.20 ms, drag 2.37 ms, wheel 2.45 ms).
 ASan/UBSan native 4/4 and TSan native 4/4; the installed PTY workflow passes;
 `git diff --check` is clean and there are no new compiler warnings. The
 60-sample native comparison was re-measured against the same reference: p90

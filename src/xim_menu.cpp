@@ -134,7 +134,7 @@ int menu_heading_at(int column, int columns, int active)
 }
 
 MenuLayout menu_layout(MenuGroup group, int selected, int rows, int columns,
-        int context_row, int context_col)
+        unsigned capabilities, int context_row, int context_col)
 {
     MenuLayout layout;
     auto items = menu_items(group);
@@ -142,7 +142,17 @@ MenuLayout menu_layout(MenuGroup group, int selected, int rows, int columns,
     int width = 0;
     for (const auto &item : items)
     {
-        int entry = static_cast<int>(item.name.size() + item.shortcut.size()) + 6;
+        // Match menu_lines() cell for cell: the marker, an optional
+        // checkbox, the name, the shortcut and the disabled suffix all
+        // occupy the popup. A width short of the painted text leaves
+        // columns outside the restore rectangle.
+        int entry = 2 + static_cast<int>(item.name.size());
+        if (item.checked != 0)
+            entry += 4;
+        if (!item.shortcut.empty())
+            entry += 2 + static_cast<int>(item.shortcut.size());
+        if (!menu_enabled(item, capabilities))
+            entry += static_cast<int>(kDisabledLabel.size());
         if (entry > width) width = entry;
     }
     if (width < 12) width = 12;
@@ -224,7 +234,7 @@ std::string menu_lines(MenuGroup group, int selected, unsigned capabilities,
             out += "  ";
             out += item.shortcut;
         }
-        if (!enabled) out += " (disabled)";
+        if (!enabled) out += kDisabledLabel;
         out += '\n';
     }
     return out;

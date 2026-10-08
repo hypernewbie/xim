@@ -47,10 +47,13 @@ std::span<const MenuItem> menu_items(MenuGroup group);
 bool menu_enabled(const MenuItem &item, unsigned capabilities);
 bool menu_checked(const MenuItem &item, unsigned capabilities);
 int menu_next(MenuGroup group, int selected, int delta, unsigned capabilities);
+// The rendered suffix for a disabled entry; both the item width and the
+// item text must derive from this one constant.
+inline constexpr std::string_view kDisabledLabel = " (disabled)";
 MenuBar menu_bar(int columns, int active);
 int menu_heading_at(int column, int columns, int active);
 MenuLayout menu_layout(MenuGroup group, int selected, int rows, int columns,
-        int context_row = -1, int context_col = 0);
+        unsigned capabilities, int context_row = -1, int context_col = 0);
 int menu_item_at(const MenuLayout &layout, MenuGroup group, int row, int column,
         unsigned capabilities);
 std::string menu_lines(MenuGroup group, int selected, unsigned capabilities,

@@ -1,5 +1,5 @@
 *xim.txt*	Native non-modal terminal editing
-					Last change: 2026 Oct 06
+					Last change: 2026 Oct 07
 
 Xim's native input layer uses the existing Vim text engine.  This document
 describes the first native editing milestone.
@@ -151,7 +151,7 @@ selects a logical line.  The wheel scrolls the window under the pointer
 and never moves the caret or selection; typing brings the caret back into
 view.  Middle-click pastes through the clipboard boundary.  Dragging a
 window's status line or vertical separator resizes the split.  Picker rows,
-confirmation Save/Discard/Cancel zones and prompt input accept clicks;
+the confirmation Save/Discard/Cancel labels and prompt input accept clicks;
 the wheel moves list selection.  Prompts support Left/Right, Home/End,
 Delete, Select all, clipboard and mouse placement.  Motion reporting is
 active only while a menu is open.

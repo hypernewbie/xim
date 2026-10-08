@@ -41,11 +41,11 @@ system or replacement renderer is included.
   split through `win_drag_status_line`/`win_drag_vsep_line`; release clears
   the capture.
 - Prompts own a UTF-8 caret with Left/Right, Home/End, Delete, Select all,
-  clipboard operations and mouse placement/selection. Picker rows and
-  confirmation Save/Discard/Cancel zones accept clicks and the wheel;
-  activation reuses the last rendered rows so clicks and Enter agree.
+  clipboard operations and mouse placement. Picker rows and the confirmation
+  Save/Discard/Cancel labels accept clicks and the wheel; activation reuses
+  the last rendered rows so clicks and Enter agree.
 - Passive motion reporting is enabled only while a menu is open. A resize
-  during pointer capture cancels safely.
+  during pointer capture keeps the selection and redraws the frame.
 
 ## Validation
 
@@ -58,7 +58,7 @@ system or replacement renderer is included.
   wheel scroll with caret preservation, F10 menus and menu-item activation,
   save protection and confirmation clicks, quick-open/palette click and
   wheel selection, prompt mouse placement, invalid coordinates, separator
-  resize, press/resize cancellation and compatibility-mode separation.
+  resize, resize during a capture and compatibility-mode separation.
 - Screen dumps cover the top bar, File/Edit/View menus (including the
   disabled entries and checked View options) and mouse selection. Earlier
   native dumps were updated for the deliberately reserved top row; inherited
@@ -143,13 +143,82 @@ and the Phase 3 comparisons show no reproducible regression.
   the palette scroll test were updated accordingly. The reference dumps keep
   the harness-trimmed trailing whitespace convention.
 
+## Review closeout
+
+An external review of revision `3113e3b93` found defects the shipped suite
+did not cover; the review itself is in the gitignored
+`temp/XIM_PLAN4_REVIEW.md`. Each finding is fixed with a regression test:
+
+- **Capture lifetime (was: heap-use-after-free).** A separator drag captured
+  a `win_T *` and used it until mouse release. If the window closed first
+  (native Ctrl-W, `:only`, a buffer close), the next drag read freed memory.
+  `xim_engine_drag` now validates the capture with `win_valid` and drops the
+  drag when the window is gone. Test `capture_lifetime` covers both paths and
+  runs under ASan/UBSan in the sanitizer preset.
+- **Confirmation labels (was: clicking Cancel discarded work).** Confirmation
+  clicks were split into screen thirds, so the rendered Save and Cancel
+  labels both fell in the Discard third. Clicks now hit-test the rendered
+  label tokens in `kConfirmPrompt`. Test `confirm_label_clicks` clicks each
+  label.
+- **Picker row activation (was: the wrong row opened).** A click set
+  `selected` and then reused Enter, which preferred the row selected at the
+  last paint. Both paths now resolve one explicit index through
+  `open_picker_item`, and a click maps its row through the rendered scroll
+  origin. Test `picker_unselected_click` clicks an unselected row.
+- **Shift-click (was: decoded as a wheel).** SGR encodes modifiers in the
+  button code, so `0x24` is Shift+Left; the inherited rxvt-wheel
+  compatibility path read it as a scroll, so the click never arrived. That
+  mapping is now limited to the legacy protocols. Test
+  `shift_click_placement` covers a click with and without a selection.
+- **New over a modified buffer (was: saved then deleted the buffer).** New
+  reused Close's continuation, which runs `bdelete` after the save. It now
+  has its own continuation that runs `:enew`, so the saved buffer stays
+  listed. Test `new_buffer_dirty`.
+- **Buffer switching and About (was: E37 and E15).** `bnext`/`bprevious`
+  now run under `:hide`, and About passes its message as the whole command so
+  the filename-escaping adapter cannot mangle it. Test
+  `buffer_switch_and_about`.
+- **Same-buffer split wheel (was: the other window's caret moved).** The
+  wheel saved the current window's cursor and restored it by buffer identity,
+  so a split showing one buffer moved the wrong caret. It now saves and
+  restores the scrolled window's own cursor. Test `split_wheel_caret`.
+- **Overlay cleanup (was: menu artifacts and a stale drop-down).** Blank
+  snapshot cells store NUL and were skipped on restore, so menu filler
+  survived dismissal; a menu opened over a prompt was never cleaned up
+  because the clear was guarded by the prompt. Restore now repaints a space
+  for a blank cell, the menu clear runs regardless of the prompt, and the
+  shared snapshot is captured from a frame with no overlay on it (the prompt
+  paints before the drop-down). Test `menu_overlay_cleanup`.
+- **Horizontal wheel (was: inverted).** `K_MOUSELEFT` is the inherited name
+  for wheel-right and `K_MOUSERIGHT` for wheel-left; the bridge mapped them
+  the wrong way. Test `horizontal_wheel_direction`.
+- **Undo/Redo availability (was: enabled with no history).** The capability
+  now reports the real undo state rather than "modifiable", so Redo on a
+  fresh buffer is disabled. Test `undo_redo_availability`; the
+  `Test_xim_menu_edit` screendump now records the disabled rendering.
+- **Documentation.** The resize-during-capture and prompt-selection claims
+  in `XIM_INPUT.md` and this file now match behavior, and `xim.txt` names
+  the clickable confirmation labels rather than zones.
+
+Verification after the fixes: full `build/dev` CTest 19/19 (native 5/5);
+ASan/UBSan native 4/4 and TSan native 4/4; the installed PTY workflow passes;
+`git diff --check` is clean and there are no new compiler warnings. The
+60-sample native comparison was re-measured against the same reference: p90
+menu open 1.94 ms, menu move 0.30 ms, mouse click 1.94 ms, drag 2.14 ms,
+wheel 2.29 ms, typing 0.74 ms and first accepted edit 23.48 ms, all inside
+the recorded budgets and within run-to-run noise. The PTY harness confirms
+Ex completion through a file because a redraw can clear the message line
+under load. The `build/default` configuration has no `+job`, so its
+inherited `vim_scripts_i_m` (`test_null_job`) failure is a baseline
+configuration difference, not a regression.
+
 ## Remaining boundaries
 
 - A terminal or multiplexer can still intercept mouse reports, wheel
   gestures or Alt sequences before the editor sees them. Pinch, pixel and
   operating-system gestures are outside the reporting boundary.
-- A terminal resize during a pointer capture cancels the drag; the capture is
-  not resumed at the new geometry.
+- A terminal resize during a pointer capture keeps the selection and the
+  capture; the drag continues at the new geometry.
 - Narrow terminals clip trailing headings and long drop-downs scroll; there
   is no horizontal menu scrolling.
 - Horizontal wheel is a no-op for wrapped text and only applies to unwrapped
@@ -172,3 +241,8 @@ Under `build/plan4/`: `full-tests.log` (19/19), `asan-tests.log` and
 menu and mouse), `project-perf-final.json` (60 starts), `ui-probe.log`
 (idle/overlay), `bench-check.json`, `asan-configure.log`, `tsan-configure.log`
 and build logs. `temp/XIM_PLAN4.md` records the authorized plan.
+
+The review closeout re-measurements are under `build/plan4-fixes/`:
+`installed-tests.log`, `native-comparison-final.json` (60 samples against the
+same reference) and `benchmark.log`. `temp/XIM_PLAN4_REVIEW.md` records the
+review.

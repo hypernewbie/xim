@@ -73,6 +73,15 @@ class Session:
                     raise AssertionError(f"editor exited: {self.process.poll()}, {bytes(output)!r}") from error
         return bytes(output) + b"\n" + self.screen.text()
 
+    def wait_for_file(self, path, contents, timeout=5):
+        """Wait for a file the editor writes, draining the terminal meanwhile."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.drain(.1)
+            if path.exists() and path.read_text().strip() == contents:
+                return True
+        return path.exists() and path.read_text().strip() == contents
+
     def drain(self, timeout=.5):
         """Read whatever arrives within the timeout without requiring a marker."""
         output = bytearray()
@@ -90,11 +99,19 @@ class Session:
 
     def ex(self, command):
         self.serial += 1
-        marker = f"XIM_ACK_{self.serial}".encode()
+        # Confirm completion through a file: a redraw can clear the message
+        # line before an echo marker is read, which made this wait slow.
+        ack = Path(tempfile.gettempdir()) / f"xim_ack_{os.getpid()}_{self.serial}"
+        try:
+            ack.unlink()
+        except FileNotFoundError:
+            pass
         self.send(b"\x1bOPEx command\r")
         self.wait(b"Ex:")
-        self.send(command + f"|echo 'XIM_' . 'ACK_{self.serial}'\r")
-        return self.wait(marker)
+        self.send(command + f"|call writefile(['{self.serial}'], '{ack}')\r")
+        if not self.wait_for_file(ack, str(self.serial), timeout=15):
+            raise AssertionError(f"Ex command did not finish: {command!r}")
+        return b""
 
     def snapshot(self):
         self.ex("call writefile(getline(1, '$'), 'snapshot')")
@@ -869,6 +886,36 @@ def screen_rowcol(screen, marker):
     raise AssertionError(f"{marker!r} not on screen: {screen.text()[-300:]!r}")
 
 
+def wait_until(predicate, timeout=5):
+    """Poll a predicate so slow sanitizer builds do not need longer sleeps."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(.05)
+    return predicate()
+
+
+def wait_screen(session, marker, present=True, timeout=5):
+    """Wait until marker is present (or gone) on the tracked screen."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        session.drain(.1)
+        if (marker in session.screen.text()) == present:
+            return True
+    return (marker in session.screen.text()) == present
+
+
+def wait_drain(session, predicate, timeout=5):
+    """Wait for a predicate while draining the terminal, so slow builds settle."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        session.drain(.1)
+        if predicate():
+            return True
+    return predicate()
+
+
 def menu_mouse(binary, root):
     """Top bar, F10 menus and SGR mouse use real terminal reports."""
     with tempfile.TemporaryDirectory(prefix="xim-menu-mouse-", dir=root) as temporary:
@@ -958,7 +1005,8 @@ def menu_mouse(binary, root):
             session.send(b"x")
             session.send(b"\x11")
             session.wait(b"Save changes")
-            session.send(b"\x1b[<0;90;24M\x1b[<0;90;24m")
+            row, column = screen_rowcol(session.screen, "[Esc] Cancel")
+            session.send(f"\x1b[<0;{column + 2};{row}M\x1b[<0;{column + 2};{row}m".encode())
             session.drain(.4)
             assert b"Save changes" not in session.screen.text()
             # Invalid coordinates never crash.
@@ -979,7 +1027,8 @@ def menu_mouse(binary, root):
             assert after_split != before_split, (before_split, after_split)
             session.ex("only")
             session.drain(.2)
-            # A resize during pointer capture cancels safely.
+            # A resize during pointer capture keeps the selection and does
+            # not corrupt the editor.
             session.send(b"\x1b[<0;10;10M")
             session.screen = TerminalScreen(16, 80)
             session.process.send_signal(signal.SIGWINCH)
@@ -1035,6 +1084,331 @@ def menu_mouse(binary, root):
         print("Menu bar, mouse editing, pickers and mode separation checks passed")
 
 
+def capture_lifetime(binary, root):
+    """A separator capture must not outlive the window it captured (R1)."""
+    config = ("--cmd", "set t_u7= t_RB= t_RF= t_RV= t_RK=")
+    with tempfile.TemporaryDirectory(prefix="xim-capture-", dir=root) as temporary:
+        directory = Path(temporary)
+        (directory / "a.txt").write_text("AAA\n")
+        (directory / "b.txt").write_text("BBB\n")
+        # Native Close (Ctrl-W) removes a window while a separator is captured.
+        session = Session(binary, directory, config + ("a.txt",))
+        try:
+            session.ex("vsplit b.txt")
+            session.drain(.2)
+            session.send(b"\x1b[<0;51;5M")
+            session.drain(.2)
+            session.send(b"\x17")
+            session.drain(.2)
+            session.send(b"\x1b[<32;55;5M")
+            session.drain(.3)
+            assert session.process.poll() is None, "editor died after a mid-capture close"
+            session.send(b"ok")
+            assert "ok" in session.snapshot()
+        finally:
+            session.close()
+        # Ex path: :only removes the captured window before the drag.
+        session = Session(binary, directory, config + ("a.txt",))
+        try:
+            session.ex("split")
+            session.drain(.2)
+            session.send(b"\x1b[<0;40;5M")
+            session.drain(.2)
+            session.ex("wincmd j|only")
+            session.drain(.2)
+            session.send(b"\x1b[<32;40;8M")
+            session.drain(.3)
+            assert session.process.poll() is None, "editor died after :only during a capture"
+            session.send(b"ok")
+            assert "ok" in session.snapshot()
+        finally:
+            session.close()
+    print("Separator capture lifetime checks passed")
+
+
+def confirm_label_clicks(binary, root):
+    """A click chooses the confirmation label it lands on (R2)."""
+    def run(choice, label, expect_exit, expected_disk):
+        with tempfile.TemporaryDirectory(prefix="xim-confirm-", dir=root) as temporary:
+            directory = Path(temporary)
+            (directory / "alpha.txt").write_text("old contents\n")
+            session = Session(binary, directory, ("alpha.txt",))
+            try:
+                session.send(b"UNSAVED")
+                session.send(b"\x11")
+                session.wait(b"Save changes")
+                session.drain(.2)
+                row, column = screen_rowcol(session.screen, label)
+                session.send(f"\x1b[<0;{column + 2};{row}M\x1b[<0;{column + 2};{row}m".encode())
+                if expect_exit:
+                    assert wait_until(lambda: session.process.poll() is not None), \
+                        (choice, "editor did not exit")
+                    assert (directory / "alpha.txt").read_text() == expected_disk, choice
+                else:
+                    session.drain(.4)
+                    assert session.process.poll() is None, (choice, "editor exited")
+                    session.send(b"Z")
+                    assert "UNSAVEDZ" in session.snapshot(), choice
+            finally:
+                session.close()
+    run("save", "[s] Save", True, "UNSAVEDold contents\n")
+    run("discard", "[d] Discard", True, "old contents\n")
+    run("cancel", "[Esc] Cancel", False, None)
+    print("Confirmation label click checks passed")
+
+
+def picker_unselected_click(binary, root):
+    """Clicking an unselected picker row opens that row (R3)."""
+    with tempfile.TemporaryDirectory(prefix="xim-picker-unsel-", dir=root) as temporary:
+        directory = Path(temporary)
+        (directory / "alpha.txt").write_text("alpha beta\nsecond line\nthird\n")
+        (directory / "beta.txt").write_text("BETA_ONLY\n")
+        session = Session(binary, directory, arguments=(".",))
+        try:
+            session.send(b"\x10txt")
+            session.wait(b"Files: txt")
+            session.wait(b"beta.txt")
+            for _ in range(20):
+                before = session.screen.text()
+                session.drain(.1)
+                if session.screen.text() == before:
+                    break
+            rows = {}
+            selected_name = None
+            for name in ("alpha.txt", "beta.txt"):
+                row, column = screen_rowcol(session.screen, name)
+                rows[name] = (row, column)
+                if session.screen.text().decode().splitlines()[row - 1].lstrip().startswith(">"):
+                    selected_name = name
+            assert selected_name is not None, session.screen.text()[-300:]
+            other = "beta.txt" if selected_name == "alpha.txt" else "alpha.txt"
+            row, column = rows[other]
+            session.send(f"\x1b[<0;{column + 1};{row}M\x1b[<0;{column + 1};{row}m".encode())
+            session.drain(.4)
+            expected = "BETA_ONLY" if other == "beta.txt" else "alpha beta"
+            assert session.snapshot().startswith(expected), (other, session.snapshot()[:40])
+        finally:
+            session.close()
+    print("Unselected picker row click check passed")
+
+
+def shift_click_placement(binary, root):
+    """Shift-click must position and extend, not decode as a wheel (R4)."""
+    with tempfile.TemporaryDirectory(prefix="xim-shift-", dir=root) as temporary:
+        directory = Path(temporary)
+        (directory / "alpha.txt").write_text("alpha beta\nsecond line\nthird\n")
+        session = Session(binary, directory, ("alpha.txt",))
+        try:
+            # Shift-click with no selection places the caret at the click.
+            session.send(b"\x1b[<4;7;2M\x1b[<4;7;2m")
+            session.drain(.2)
+            session.send(b"!")
+            assert session.snapshot().startswith("alpha !beta"), repr(session.snapshot()[:20])
+            # Shift-click with an existing selection extends it from the
+            # anchor to the click instead of inserting at the line start.
+            session.ex("call setline(1, 'abcdefghij')|call cursor(1,1)")
+            session.drain(.5)
+            session.send(b"\x1b[1;2C")
+            session.drain(.1)
+            session.send(b"\x1b[<4;5;2M\x1b[<4;5;2m")
+            session.drain(.2)
+            session.send(b"Z")
+            assert session.snapshot().startswith("Zefghij"), repr(session.snapshot()[:20])
+        finally:
+            session.close()
+    print("Shift-click placement and extension checks passed")
+
+
+def new_buffer_dirty(binary, root):
+    """New over a modified buffer saves it and keeps it listed (R5)."""
+    with tempfile.TemporaryDirectory(prefix="xim-new-", dir=root) as temporary:
+        directory = Path(temporary)
+        (directory / "alpha.txt").write_text("alpha\n")
+        (directory / "beta.txt").write_text("beta\n")
+        session = Session(binary, directory, ("alpha.txt",))
+        try:
+            session.ex("badd beta.txt")
+            session.send(b"X")
+            session.send(b"\x0e")
+            session.wait(b"Save changes")
+            session.drain(.2)
+            session.send(b"s")
+            assert wait_until(lambda: (directory / "alpha.txt").read_text() == "Xalpha\n"), \
+                "dirty buffer was not saved"
+            session.ex("call writefile([expand('%:t'), string(bufnr('%')), "
+                       "string(map(getbufinfo(), '[v:val.bufnr, v:val.name, v:val.listed]'))], 'state')")
+            lines = (directory / "state").read_text().split("\n")
+            assert lines[0] == "", ("New did not reach a fresh buffer", lines)
+            assert "alpha.txt" in lines[2], ("saved buffer left the list", lines)
+        finally:
+            session.close()
+    print("New over a modified buffer check passed")
+
+
+def buffer_switch_and_about(binary, root):
+    """Next buffer survives dirt; About does not raise E15 (R6)."""
+    with tempfile.TemporaryDirectory(prefix="xim-switch-", dir=root) as temporary:
+        directory = Path(temporary)
+        (directory / "alpha.txt").write_text("alpha\n")
+        (directory / "beta.txt").write_text("beta\n")
+        session = Session(binary, directory, ("alpha.txt",))
+        try:
+            session.ex("badd beta.txt")
+            session.send(b"DIRTY")
+            # Navigate > Next buffer.
+            session.send(b"\x1b[21~")
+            session.wait(b"New")
+            for _ in range(3):
+                session.send(b"\x1b[C")
+            session.drain(.2)
+            for _ in range(2):
+                session.send(b"\x1b[B")
+            session.drain(.2)
+            session.send(b"\r")
+            session.ex("call writefile([expand('%:t')], 'cur')")
+            assert (directory / "cur").read_text().strip() == "beta.txt", (directory / "cur").read_text()
+            # Help > About.
+            session.send(b"\x1b[21~")
+            session.wait(b"New")
+            for _ in range(4):
+                session.send(b"\x1b[C")
+            session.drain(.2)
+            session.send(b"\x1b[B")
+            session.drain(.2)
+            session.send(b"\r")
+            session.wait(b"one-run terminal editor")
+            assert b"E15" not in session.screen.text(), "About raised E15"
+        finally:
+            session.close()
+    print("Next buffer and About checks passed")
+
+
+def split_wheel_caret(binary, root):
+    """Wheel in a same-buffer split leaves both carets alone (R7)."""
+    with tempfile.TemporaryDirectory(prefix="xim-split-wheel-", dir=root) as temporary:
+        directory = Path(temporary)
+        lines = "\n".join(f"line{i:03d} abcdefghijklmnopqrstuvwxyz" for i in range(1, 121))
+        (directory / "alpha.txt").write_text(lines + "\n")
+        session = Session(binary, directory, ("alpha.txt",))
+        try:
+            session.ex("split")
+            session.ex("call cursor(30,5)")
+            session.ex("wincmd j")
+            session.ex("call cursor(1,1)")
+            session.drain(.3)
+            command = "call writefile([string(getcurpos(1)), string(getcurpos(2))], 'pos')"
+            session.ex(command)
+            before = (directory / "pos").read_text()
+            for row in (3, 20):
+                session.send(f"\x1b[<65;20;{row}M".encode())
+                session.drain(.4)
+                session.ex(command)
+                after = (directory / "pos").read_text()
+                assert after == before, ("wheel moved a caret", row, before, after)
+        finally:
+            session.close()
+    print("Same-buffer split wheel caret check passed")
+
+
+def menu_overlay_cleanup(binary, root):
+    """Menus restore short lines and clear over a live prompt (R8)."""
+    with tempfile.TemporaryDirectory(prefix="xim-menu-clean-", dir=root) as temporary:
+        directory = Path(temporary)
+        (directory / "alpha.txt").write_text("short\ntiny\n")
+        session = Session(binary, directory, ("alpha.txt",))
+        try:
+            session.ex("call setline(1, repeat(['ABCDEFGHIJKLMNOPQRSTUVWXYZ'], 30))")
+            # Wait for the edit to render, then compare the rows the menu
+            # covers; the message line keeps the Ex acknowledgement and is
+            # not part of the artifact claim.
+            assert wait_screen(session, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"), "setline did not render"
+            def menu_region():
+                return session.screen.text().decode().splitlines()[1:7]
+            before = menu_region()
+            session.send(b"\x1b[21~")
+            assert wait_screen(session, b"Quit"), "menu did not open"
+            session.send(b"\x1b")
+            assert wait_screen(session, b"Quit", present=False), "menu survived Escape"
+            assert wait_drain(session, lambda: menu_region() == before), \
+                "menu dismissal left artifacts"
+            # A menu opened over a prompt is erased when it closes.
+            session.send(b"\x0fabc")
+            session.wait(b"Open: abc")
+            session.drain(.2)
+            session.send(b"\x1b[<0;2;1M\x1b[<0;2;1m")
+            assert wait_screen(session, b"Quit"), "menu did not open over the prompt"
+            session.send(b"\x1b")
+            assert wait_screen(session, b"Quit", present=False), \
+                "menu survived Escape over a prompt"
+            session.send(b"\x1b")
+            session.drain(.2)
+        finally:
+            session.close()
+    print("Menu overlay cleanup checks passed")
+
+
+def horizontal_wheel_direction(binary, root):
+    """Wheel-left moves the view left and wheel-right right (R9)."""
+    with tempfile.TemporaryDirectory(prefix="xim-hwheel-", dir=root) as temporary:
+        directory = Path(temporary)
+        (directory / "alpha.txt").write_text(("x" * 200) + "\nsecond\n")
+        session = Session(binary, directory, ("alpha.txt",))
+        try:
+            session.ex("set nowrap")
+            # Put the caret near the end so the view scrolls right and
+            # 'leftcol' is non-zero before the wheel moves it.
+            session.ex("call cursor(1, 200)")
+            session.drain(.2)
+            command = "call writefile([string(winsaveview().leftcol)], 'leftcol')"
+            session.ex(command)
+            before = int((directory / "leftcol").read_text().strip())
+            session.send(b"\x1b[<66;20;10M")
+            session.drain(.3)
+            session.ex(command)
+            left = int((directory / "leftcol").read_text().strip())
+            assert left < before, ("wheel left should move the view left", before, left)
+            session.send(b"\x1b[<67;20;10M")
+            session.drain(.3)
+            session.ex(command)
+            right = int((directory / "leftcol").read_text().strip())
+            assert right > left, ("wheel right should move the view right", left, right)
+        finally:
+            session.close()
+    print("Horizontal wheel direction check passed")
+
+
+def undo_redo_availability(binary, root):
+    """Edit menu disables Undo/Redo with no history (R10)."""
+    with tempfile.TemporaryDirectory(prefix="xim-undo-", dir=root) as temporary:
+        directory = Path(temporary)
+        session = Session(binary, directory)
+        try:
+            # Fresh buffer: neither Undo nor Redo can run.
+            session.send(b"\x1b[21~")
+            session.wait(b"New")
+            session.send(b"\x1b[C")
+            session.drain(.2)
+            session.send(b"\x1b[B")
+            session.drain(.2)
+            session.send(b"\r")
+            session.drain(.3)
+            assert b"Already at newest change" not in session.screen.text()
+            assert b"Already at oldest change" not in session.screen.text()
+            # After a change Undo becomes reachable and works.
+            session.send(b"abc")
+            session.drain(.2)
+            session.send(b"\x1b[21~")
+            session.wait(b"New")
+            session.send(b"\x1b[C")
+            session.drain(.2)
+            session.send(b"\r")
+            session.drain(.4)
+            assert session.snapshot() == "\n", "Undo did not run from the Edit menu"
+        finally:
+            session.close()
+    print("Undo/redo availability checks passed")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -1058,3 +1432,13 @@ if __name__ == "__main__":
     ui_incremental(args.binary.resolve(), args.work.resolve())
     buffer_picker_identity(args.binary.resolve(), args.work.resolve())
     menu_mouse(args.binary.resolve(), args.work.resolve())
+    capture_lifetime(args.binary.resolve(), args.work.resolve())
+    confirm_label_clicks(args.binary.resolve(), args.work.resolve())
+    picker_unselected_click(args.binary.resolve(), args.work.resolve())
+    shift_click_placement(args.binary.resolve(), args.work.resolve())
+    new_buffer_dirty(args.binary.resolve(), args.work.resolve())
+    buffer_switch_and_about(args.binary.resolve(), args.work.resolve())
+    split_wheel_caret(args.binary.resolve(), args.work.resolve())
+    menu_overlay_cleanup(args.binary.resolve(), args.work.resolve())
+    horizontal_wheel_direction(args.binary.resolve(), args.work.resolve())
+    undo_redo_availability(args.binary.resolve(), args.work.resolve())

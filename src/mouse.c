@@ -2819,6 +2819,11 @@ check_termcode_mouse(
 #   ifdef FEAT_GUI
 		&& !gui.in_use
 #   endif
+		// SGR encodes modifiers in the button code, so 0x24 is
+		// Shift+Left there, not an rxvt wheel notch. Only the legacy
+		// protocols use the 0x23/0x24 mapping.
+		&& key_name[0] != KS_SGR_MOUSE
+		&& key_name[0] != KS_SGR_MOUSE_RELEASE
 		&& (mouse_code == 0x23 || mouse_code == 0x24
 		    || mouse_code == 0x40 || mouse_code == 0x41))
 	{

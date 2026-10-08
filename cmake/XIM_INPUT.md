@@ -47,11 +47,11 @@ and middle/right buttons run through owning-thread adapters using
 `mouse_find_win`, `mouse_comp_pos` and `coladvance`; the wheel never moves
 the caret or selection. Right-click opens Edit choices without clearing
 selection; middle-click positions then pastes through the clipboard
-boundary. Press-drag-release pairs press/drag/release, including
-cancellation and resize; a separator press arms `win_drag_status_line` or
-`win_drag_vsep_line` and the document release clears the capture. Passive
-motion reporting is enabled only while a
-menu is open. Narrow bars clip trailing headings but keep every command
+boundary. Press-drag-release pairs press/drag/release; a terminal resize
+during a capture keeps the selection and redraws the frame. A separator
+press arms `win_drag_status_line` or `win_drag_vsep_line` and the document
+release clears the capture. Passive motion reporting is enabled only while
+a menu is open. Narrow bars clip trailing headings but keep every command
 reachable by keyboard.
 
 Native defaults precede explicit configuration. No implicit native config

@@ -38,6 +38,35 @@ struct DeferredInput
 };
 std::vector<DeferredInput> deferred_keys;
 constexpr std::size_t kMaxDeferredKeys = 256;
+
+// The confirmation line is rendered verbatim by xim_render(); the click
+// handler hit-tests these same tokens so a click lands on the label the user
+// sees. The labels are not evenly spaced, so dividing the line into screen
+// thirds (the previous behavior) maps Save and Cancel onto Discard.
+constexpr std::string_view kConfirmPrompt =
+    "Save changes? [s] Save  [d] Discard  [Esc] Cancel";
+
+// Return the key a confirmation label activates for a click at cell "col",
+// or 0 when the click is not on a label. The prompt is ASCII, so byte and
+// cell offsets agree.
+int confirm_choice_at(int col)
+{
+    static constexpr struct
+    {
+        std::string_view token;
+        int key;
+    } choices[] = {
+        {"[s] Save", 's'}, {"[d] Discard", 'd'}, {"[Esc] Cancel", 27}};
+    for (const auto &choice : choices)
+    {
+        auto start = kConfirmPrompt.find(choice.token);
+        if (start == std::string_view::npos) continue;
+        int first = static_cast<int>(start);
+        int last = first + static_cast<int>(choice.token.size());
+        if (col >= first && col < last) return choice.key;
+    }
+    return 0;
+}
 std::vector<std::string> file_rows;
 std::string file_rows_query;
 // Menu state: F10 or bar click opens a real drop-down. Right-click opens the
@@ -60,6 +89,7 @@ int last_picker_selected = 0;
 void perform_pending(bool discard)
 {
     const char *command = pending == Action::quit ? (discard ? "qall!" : "qall")
+        : pending == Action::new_buffer ? (discard ? "enew!" : "enew")
         : pending == Action::close ? (discard ? "bdelete!" : "bdelete")
         : (discard ? "edit!" : "edit");
     prompt = Action::ignore;
@@ -351,17 +381,21 @@ void execute(Action action)
             }
             break;
         case Action::new_buffer:
-            if (xim_engine_unsaved(0)) protect(Action::close);
-            else xim_engine_command("enew", "", 0);
+            // New protects the current buffer like Close, but continues with
+            // :enew so the saved buffer stays listed instead of being
+            // deleted by a bdelete.
+            protect(Action::new_buffer);
             break;
         case Action::toggle_wrap: xim_engine_toggle_option("wrap"); break;
         case Action::toggle_number: xim_engine_toggle_option("number"); break;
         case Action::toggle_mouse: xim_engine_toggle_option("mouse"); break;
-        case Action::next_buffer: xim_engine_command("bnext", "", 0); break;
-        case Action::prev_buffer: xim_engine_command("bprevious", "", 0); break;
+        case Action::next_buffer: xim_engine_command("hide bnext", "", 0); break;
+        case Action::prev_buffer: xim_engine_command("hide bprevious", "", 0); break;
         case Action::help: xim_engine_command("help", "xim", 0); break;
         case Action::about:
-            xim_engine_command("echo", "'Xim: one-run terminal editor'", 0);
+            // Pass the whole command line: the argument path filename-escapes
+            // its text, which turns the quoted message into an Ex error.
+            xim_engine_command("echo 'Xim: one-run terminal editor'", "", 0);
             break;
         case Action::copy: case Action::cut:
         {
@@ -459,6 +493,69 @@ bool handle_menu_key(int key, int modifiers)
     return false;
 }
 
+// Open one already-resolved picker item. Shared by Enter and by a row click,
+// so both activate exactly the row they name. The caller supplies the list
+// and the absolute index; this never consults render-time selection state.
+bool open_picker_item(Action current, const std::vector<std::string> &list,
+        std::size_t index)
+{
+    if (list.empty())
+    {
+        prompt = current;
+        return false;
+    }
+    auto item = list[index % list.size()];
+    if (current == Action::buffers)
+    {
+        auto number = item.substr(0, item.find(':'));
+        xim_engine_command("hide buffer", number.c_str(), 0);
+    }
+    else if (current == Action::explorer)
+    {
+        char *path = nullptr;
+        xim_project_explorer_activate(item.c_str(), &path);
+        if (path != nullptr)
+        {
+            std::unique_ptr<char, decltype(&xim_project_free)> guard(
+                    path, xim_project_free);
+            char *resolved = xim_project_resolve(path);
+            if (resolved != nullptr)
+            {
+                std::unique_ptr<char, decltype(&xim_project_free)> resolved_guard(
+                        resolved, xim_project_free);
+                xim_engine_command("hide edit", resolved, 0);
+            }
+            else
+                xim_engine_command("hide edit", path, 0);
+        }
+        else
+        {
+            prompt = current;
+            return false;
+        }
+    }
+    else
+    {
+        char *resolved = xim_project_resolve(item.c_str());
+        if (resolved != nullptr)
+        {
+            std::unique_ptr<char, decltype(&xim_project_free)> guard(
+                    resolved, xim_project_free);
+            xim_engine_command("hide edit", resolved, 0);
+        }
+        else
+            xim_engine_command("hide edit", item.c_str(), 0);
+    }
+    if (prompt == Action::ignore)
+    {
+        xim_project_cancel_query();
+        input.clear();
+        input_cursor = 0;
+        clear_prompt_selection();
+    }
+    return true;
+}
+
 bool activate_current_row(Action current)
 {
     if (current == Action::palette)
@@ -482,66 +579,9 @@ bool activate_current_row(Action current)
             && !last_picker_items.empty() ? last_picker_items
             : project_items(current, input);
         if (list.empty()) list = project_items(current, input);
-        if (!list.empty())
-        {
-            std::size_t row = last_picker_action == current
-                ? static_cast<std::size_t>(last_picker_selected) : selected;
-            auto item = list[row % list.size()];
-            if (current == Action::buffers)
-            {
-                auto number = item.substr(0, item.find(':'));
-                xim_engine_command("hide buffer", number.c_str(), 0);
-            }
-            else if (current == Action::explorer)
-            {
-                char *path = nullptr;
-                xim_project_explorer_activate(item.c_str(), &path);
-                if (path != nullptr)
-                {
-                    std::unique_ptr<char, decltype(&xim_project_free)> guard(
-                            path, xim_project_free);
-                    char *resolved = xim_project_resolve(path);
-                    if (resolved != nullptr)
-                    {
-                        std::unique_ptr<char, decltype(&xim_project_free)> resolved_guard(
-                                resolved, xim_project_free);
-                        xim_engine_command("hide edit", resolved, 0);
-                    }
-                    else
-                        xim_engine_command("hide edit", path, 0);
-                }
-                else
-                {
-                    prompt = current;
-                    return false;
-                }
-            }
-            else
-            {
-                char *resolved = xim_project_resolve(item.c_str());
-                if (resolved != nullptr)
-                {
-                    std::unique_ptr<char, decltype(&xim_project_free)> guard(
-                            resolved, xim_project_free);
-                    xim_engine_command("hide edit", resolved, 0);
-                }
-                else
-                    xim_engine_command("hide edit", item.c_str(), 0);
-            }
-        }
-        else
-        {
-            prompt = current;
-            return false;
-        }
-        if (prompt == Action::ignore)
-        {
-            xim_project_cancel_query();
-            input.clear();
-            input_cursor = 0;
-            clear_prompt_selection();
-        }
-        return true;
+        std::size_t row = last_picker_action == current
+            ? static_cast<std::size_t>(last_picker_selected) : selected;
+        return open_picker_item(current, list, row);
     }
     return false;
 }
@@ -969,32 +1009,17 @@ extern "C" void xim_menu_bar_text(char *buf, size_t len, int columns,
     if (sel_width) *sel_width = bar.selected_width;
 }
 
-extern "C" void xim_render()
+namespace
 {
-    int columns = xim_engine_columns();
-    int menu_rows = xim_engine_menu_rows();
-    unsigned caps = capabilities_now();
-    // Menu bar is drawn by the tabline hook; the drop-down is an overlay.
-    if (menu_open)
-    {
-        auto group = static_cast<xim::MenuGroup>(menu_group);
-        // Approximate screen rows from menu rows helper.
-        xim::MenuLayout layout = xim::menu_layout(group, menu_selected,
-                menu_rows + 2, columns,
-                menu_context ? menu_context_row : -1,
-                menu_context ? menu_context_col : 0);
-        std::string lines = xim::menu_lines(group, menu_selected, caps, layout);
-        int selected_row = menu_selected - layout.first;
-        xim_engine_menu_popup(lines.c_str(), layout.row, layout.col,
-                layout.width, layout.rows, selected_row, 0);
-    }
-    if (prompt == Action::ignore) return;
+void render_prompt_overlay(int menu_rows)
+{
     if (prompt == Action::confirm)
     {
         auto error = pending_error.empty() ? "" : pending_error + "\n";
-        xim_engine_overlay("Save changes? [s] Save  [d] Discard  [Esc] Cancel", error.c_str(), true);
+        xim_engine_overlay(std::string(kConfirmPrompt).c_str(), error.c_str(), true);
         return;
     }
+    if (prompt == Action::ignore) return;
     std::string label = prompt_label();
     std::string items;
     if (prompt == Action::palette)
@@ -1053,6 +1078,36 @@ extern "C" void xim_render()
     xim_engine_overlay((label + input).c_str(), items.c_str(), false);
 }
 
+void render_menu_popup(int columns, int menu_rows, unsigned caps)
+{
+    if (!menu_open) return;
+    auto group = static_cast<xim::MenuGroup>(menu_group);
+    // Approximate screen rows from menu rows helper.
+    xim::MenuLayout layout = xim::menu_layout(group, menu_selected,
+            menu_rows + 2, columns,
+            menu_context ? menu_context_row : -1,
+            menu_context ? menu_context_col : 0);
+    std::string lines = xim::menu_lines(group, menu_selected, caps, layout);
+    int selected_row = menu_selected - layout.first;
+    xim_engine_menu_popup(lines.c_str(), layout.row, layout.col,
+            layout.width, layout.rows, selected_row, 0);
+}
+}
+
+extern "C" void xim_render()
+{
+    int columns = xim_engine_columns();
+    int menu_rows = xim_engine_menu_rows();
+    unsigned caps = capabilities_now();
+    // The prompt overlay paints before the drop-down so the shared
+    // background snapshot is captured from the frame with no overlay on it.
+    // Drawing the menu first made the prompt recapture the painted menu,
+    // which then survived the menu's dismissal. The drop-down is the top
+    // layer and paints last.
+    render_prompt_overlay(menu_rows);
+    render_menu_popup(columns, menu_rows, caps);
+}
+
 // Mouse handling: menus and visible prompts first, documents via the engine.
 namespace
 {
@@ -1079,29 +1134,30 @@ bool activate_picker_row(int row, int columns)
     int top = rows - 2 - visible;
     if (row < top || row >= rows - 1) return false;
     std::size_t index = 0;
-    if (prompt == Action::palette)
+    // The rendered window is the authority: the user clicked a row that was
+    // on screen. Prefer the scroll origin captured at the last paint over
+    // recomputing it from the current selection, which a click may not match.
+    Action current = prompt;
+    int rendered_rows = xim_engine_menu_rows();
+    int first = last_picker_action == current
+        ? last_picker_first
+        : (selected >= static_cast<std::size_t>(rendered_rows)
+            ? static_cast<int>(selected - rendered_rows + 1) : 0);
+    index = static_cast<std::size_t>(first) + (row - top);
+    if (current == Action::palette)
     {
         auto list = filtered();
-        auto first = selected >= static_cast<std::size_t>(xim_engine_menu_rows())
-            ? selected - xim_engine_menu_rows() + 1 : 0;
-        index = first + (row - top);
         if (index >= list.size()) return false;
         prompt = Action::ignore;
         execute(list[index]->action);
         return true;
     }
-    auto list = project_items(prompt, input);
-    auto first = selected >= static_cast<std::size_t>(xim_engine_menu_rows())
-        ? selected - xim_engine_menu_rows() + 1 : 0;
-    index = first + (row - top);
+    auto list = project_items(current, input);
     if (index >= list.size()) return false;
     selected = index;
-    Action current = prompt;
     prompt = Action::ignore;
-    // Reuse Enter activation so clicks and keys share one path.
-    prompt = current;
-    xim_dispatch('\r', 0);
-    return true;
+    // Open the clicked row through the same path Enter uses.
+    return open_picker_item(current, list, index);
 }
 }
 
@@ -1205,12 +1261,12 @@ extern "C" void xim_mouse_press(int row, int col, int button, int modifiers, int
     }
     if (prompt == Action::confirm && button == 0)
     {
-        // Bottom-row Save/Discard/Cancel zones share the confirm path.
+        // Only the rendered label rectangles activate a choice; a click on
+        // the rest of the line does nothing.
         if (row == rows - 1)
         {
-            if (col < columns / 3) xim_dispatch('s', 0);
-            else if (col < 2 * columns / 3) xim_dispatch('d', 0);
-            else xim_dispatch(27, 0);
+            int choice = confirm_choice_at(col);
+            if (choice != 0) xim_dispatch(choice, 0);
             return;
         }
     }

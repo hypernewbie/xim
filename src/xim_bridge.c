@@ -8,8 +8,15 @@ static int selection_buffer = 0;
 static int typing_count = 0;
 static int overlay_visible = FALSE;
 static int overlay_top = 0;
-static int overlay_rows = 0;
-static int overlay_columns = 0;
+// Size of the frame the shared background snapshot was captured from. A
+// terminal resize invalidates the snapshot; an ordinary redraw does not, so
+// the snapshot is not recaptured from a screen that still holds overlay
+// pixels.
+static int overlay_frame_rows = 0;
+static int overlay_frame_columns = 0;
+// Set while a recapture forces the document to repaint, so the redraw hook
+// does not re-enter itself.
+static int overlay_redraw_guard = FALSE;
 static int menu_visible = FALSE;
 static int menu_top = 0;
 static int menu_left = 0;
@@ -378,14 +385,18 @@ xim_engine_has_selection(void)
     int
 xim_engine_can_undo(int redo)
 {
-    (void)redo;
-    // Do not call undo_allowed() here: it emits E21 when 'modifiable' is
-    // off, which would spam every menu render and prompt key. Undo/redo
-    // availability is reported without side effects; the engine itself
-    // refuses the operation when the buffer cannot be changed.
+    // Report real undo state without side effects. undo_allowed() is not
+    // called here: it emits E21 when 'modifiable' is off, which would spam
+    // every menu render and prompt key. The engine still refuses the
+    // operation when the buffer cannot be changed.
     if (!curbuf->b_p_ma)
         return FALSE;
-    return TRUE;
+    if (redo)
+        return curbuf->b_u_curhead != NULL;
+    if (curbuf->b_u_curhead != NULL)
+        // More to undo when another header lies past the current one.
+        return curbuf->b_u_curhead->uh_next.ptr != NULL;
+    return curbuf->b_u_newhead != NULL;
 }
 
     int
@@ -599,6 +610,15 @@ xim_engine_drag(int row, int col)
     win_T *wp;
     int tmp_row = row;
     int tmp_col = col;
+    // A captured window can close before the release arrives (native Ctrl-W,
+    // :only, a buffer close). Validate the pointer against the live window
+    // list before using it, so a stale capture cannot read freed memory.
+    if (xim_sep_window != NULL && !win_valid(xim_sep_window))
+    {
+        // The captured window is gone; the drag has nothing to resize.
+        xim_sep_window = NULL;
+        return;
+    }
     // Separator drags resize the owning frame; the inherited helpers do the
     // frame math and redraw scheduling on this thread.
     if (xim_sep_window != NULL)
@@ -714,13 +734,18 @@ xim_engine_scroll(int row, int col, int direction)
     int tmp_col = col;
     win_T *wp = mouse_find_win(&tmp_row, &tmp_col, FIND_POPUP);
     win_T *old = curwin;
-    pos_T saved = curwin->w_cursor;
-    int saved_buf = curbuf->b_fnum;
+    if (wp == NULL)
+        return;
+    // Save the scrolled window's own cursor and the global selection. A
+    // same-buffer split keeps one cursor per window, so saving only the
+    // current window's cursor and restoring it by buffer identity moved the
+    // other window's insertion point.
+    pos_T saved_cursor = wp->w_cursor;
     pos_T saved_anchor = selection_anchor;
     int saved_selbuf = selection_buffer;
     int saved_visual = VIsual_active;
-    if (wp == NULL)
-        return;
+    pos_T saved_visual_pos = VIsual;
+    int saved_visual_mode = VIsual_mode;
     curwin = wp;
     curbuf = wp->w_buffer;
     // Follow 'mousescroll' so a wheel notch scrolls like the inherited path.
@@ -747,12 +772,13 @@ xim_engine_scroll(int row, int col, int direction)
             set_leftcol(curwin->w_leftcol + (colnr_T)hor_step);
     }
     // Wheel motion never moves the insertion point or selection.
-    if (curbuf->b_fnum == saved_buf)
-        curwin->w_cursor = saved;
+    wp->w_cursor = saved_cursor;
     selection_anchor = saved_anchor;
     selection_buffer = saved_selbuf;
     VIsual_active = saved_visual;
-    curwin->w_redr_status = TRUE;
+    VIsual = saved_visual_pos;
+    VIsual_mode = saved_visual_mode;
+    wp->w_redr_status = TRUE;
     redraw_curbuf_later(UPD_VALID);
     curwin = old;
     curbuf = curwin->w_buffer;
@@ -961,12 +987,13 @@ xim_engine_menu_popup(const char *items, int row, int col, int width, int rows,
     }
     if (!menu_visible)
     {
-        vim_free(overlay_background);
         // Share one full-screen snapshot for prompts and menus so a
         // top drop-down and a bottom prompt do not overwrite each other.
-        // The snapshot is refreshed only when neither overlay is visible.
+        // The snapshot is refreshed only when neither overlay is visible;
+        // freeing it while the prompt still owns it left a dangling pointer.
         if (!overlay_visible)
         {
+            vim_free(overlay_background);
             overlay_background = ALLOC_CLEAR_MULT(xim_cell_T, (size_t)Rows * Columns);
             if (overlay_background != NULL)
                 for (int rr = 0; rr < Rows; ++rr)
@@ -975,6 +1002,8 @@ xim_engine_menu_popup(const char *items, int row, int col, int width, int rows,
                         xim_cell_T *cell = &overlay_background[(size_t)rr * Columns + cc];
                         screen_getbytes(rr, cc, cell->bytes, &cell->attr);
                     }
+            overlay_frame_rows = Rows;
+            overlay_frame_columns = Columns;
         }
     }
     else if (row != menu_top || col != menu_left || rows != menu_height
@@ -989,6 +1018,8 @@ xim_engine_menu_popup(const char *items, int row, int col, int width, int rows,
                     xim_cell_T *cell = &overlay_background[(size_t)r * Columns + cc];
                     if (*cell->bytes != NUL)
                         screen_puts(cell->bytes, r, cc, cell->attr);
+                    else
+                        screen_putchar(' ', r, cc, cell->attr);
                 }
         else
         {
@@ -1003,8 +1034,6 @@ xim_engine_menu_popup(const char *items, int row, int col, int width, int rows,
     menu_width = width;
     menu_rows = Rows;
     menu_columns = Columns;
-    overlay_rows = Rows;
-    overlay_columns = Columns;
     r = row;
     for (p = items; *p != NUL && r < row + rows; p = end + 1, ++r)
     {
@@ -1035,8 +1064,12 @@ xim_clear_menu_popup(void)
             for (int cc = menu_left; cc < menu_left + menu_width && cc < Columns; ++cc)
             {
                 xim_cell_T *cell = &overlay_background[(size_t)r * Columns + cc];
+                // A blank position stores NUL; repaint it as a space so menu
+                // filler over blank cells does not survive dismissal.
                 if (*cell->bytes != NUL)
                     screen_puts(cell->bytes, r, cc, cell->attr);
+                else
+                    screen_putchar(' ', r, cc, cell->attr);
             }
     else
     {
@@ -1062,12 +1095,6 @@ xim_engine_overlay(const char *prompt, const char *items, int error)
     row -= count < row ? count : row;
     xim_drawing_overlay = TRUE;
     term_set_sync_output(TERM_SYNC_OUTPUT_ENABLE);
-    if (overlay_visible && (overlay_rows != Rows || overlay_columns != Columns))
-    {
-        redraw_all_later(UPD_NOT_VALID);
-        update_screen(0);
-        overlay_visible = FALSE;
-    }
     if (!overlay_visible)
     {
         vim_free(overlay_background);
@@ -1079,6 +1106,8 @@ xim_engine_overlay(const char *prompt, const char *items, int error)
                     xim_cell_T *cell = &overlay_background[(size_t)r * Columns + col];
                     screen_getbytes(r, col, cell->bytes, &cell->attr);
                 }
+        overlay_frame_rows = Rows;
+        overlay_frame_columns = Columns;
     }
     else if (row > overlay_top)
     {
@@ -1092,6 +1121,8 @@ xim_engine_overlay(const char *prompt, const char *items, int error)
                     xim_cell_T *cell = &overlay_background[(size_t)r * Columns + col];
                     if (*cell->bytes != NUL)
                         screen_puts(cell->bytes, r, col, cell->attr);
+                    else
+                        screen_putchar(' ', r, col, cell->attr);
                 }
         else
         {
@@ -1101,8 +1132,6 @@ xim_engine_overlay(const char *prompt, const char *items, int error)
     }
     overlay_visible = TRUE;
     overlay_top = row;
-    overlay_rows = Rows;
-    overlay_columns = Columns;
     for (p = items; *p != NUL && row < Rows - 2; p = end + 1, ++row)
     {
         int item_attr = error ? syn_name2attr((char_u *)"ErrorMsg")
@@ -1145,16 +1174,28 @@ xim_engine_overlay(const char *prompt, const char *items, int error)
     static void
 xim_redraw_overlay(void)
 {
-    if (!xim_prompt_active())
+    if (!xim_prompt_active() && !xim_menu_active())
     {
         if (menu_visible)
             xim_clear_menu_popup();
         return;
     }
-    // The engine has produced a fresh underlying frame. Capture that
-    // frame rather than retaining a snapshot from before the resize.
-    overlay_visible = FALSE;
-    menu_visible = FALSE;
+    if (overlay_redraw_guard)
+        return;
+    if (overlay_frame_rows != Rows || overlay_frame_columns != Columns)
+    {
+        // A resize invalidates the stored frame and both overlay layouts.
+        // Repaint the document before recapturing, or the snapshot would
+        // hold the overlay pixels instead of the editor underneath.
+        overlay_visible = FALSE;
+        menu_visible = FALSE;
+        overlay_redraw_guard = TRUE;
+        redraw_all_later(UPD_NOT_VALID);
+        update_screen(0);
+        overlay_redraw_guard = FALSE;
+    }
+    // The engine has produced a frame. Repaint the overlays on top of it;
+    // the snapshot is only refreshed above, on a size change.
     xim_render();
 }
 
@@ -1306,10 +1347,13 @@ received:
             xim_mouse_wheel(mouse_row, mouse_col, 0, m_modifiers);
         else if (c == K_MOUSEUP)
             xim_mouse_wheel(mouse_row, mouse_col, 1, m_modifiers);
+        // K_MOUSELEFT is the inherited name for wheel-right and
+        // K_MOUSERIGHT for wheel-left; map each to its view direction so
+        // the gesture matches the movement.
         else if (c == K_MOUSELEFT)
-            xim_mouse_wheel(mouse_row, mouse_col, 2, m_modifiers);
-        else if (c == K_MOUSERIGHT)
             xim_mouse_wheel(mouse_row, mouse_col, 3, m_modifiers);
+        else if (c == K_MOUSERIGHT)
+            xim_mouse_wheel(mouse_row, mouse_col, 2, m_modifiers);
         else if (c == K_MOUSEMOVE)
             xim_mouse_move(mouse_row, mouse_col, m_modifiers);
         got_int = FALSE;
@@ -1318,18 +1362,17 @@ received:
         curwin->w_redr_status = TRUE;
         redraw_curbuf_later(UPD_VALID);
         xim_set_hover(xim_menu_active());
-        if (!xim_prompt_active())
+        // A menu dismissed while a prompt is open still has to be erased;
+        // the shared snapshot stays valid for the prompt's own rows.
+        if (!xim_menu_active() && menu_visible)
+            xim_clear_menu_popup();
+        if (!xim_prompt_active() && overlay_visible && !menu_visible)
         {
-            if (overlay_visible && !menu_visible)
-            {
-                redraw_all_later(UPD_NOT_VALID);
-                clear_cmdline = TRUE;
-                redraw_cmdline = TRUE;
-                overlay_visible = FALSE;
-                VIM_CLEAR(overlay_background);
-            }
-            if (!xim_menu_active() && menu_visible)
-                xim_clear_menu_popup();
+            redraw_all_later(UPD_NOT_VALID);
+            clear_cmdline = TRUE;
+            redraw_cmdline = TRUE;
+            overlay_visible = FALSE;
+            VIM_CLEAR(overlay_background);
         }
         return;
     }
@@ -1387,6 +1430,10 @@ received:
     if (key != XIM_UP && key != XIM_DOWN)
         curwin->w_set_curswant = TRUE;
     xim_set_hover(xim_menu_active());
+    // Clear a dismissed menu even while a prompt is open. The prompt snapshot
+    // remains valid for its own rows, so only the menu rectangle is restored.
+    if (!xim_menu_active() && menu_visible)
+        xim_clear_menu_popup();
     if (!xim_prompt_active())
     {
         curwin->w_redr_status = TRUE;
@@ -1398,13 +1445,6 @@ received:
             redraw_cmdline = TRUE;
             overlay_visible = FALSE;
             VIM_CLEAR(overlay_background);
-        }
-        if (!xim_menu_active() && menu_visible)
-            xim_clear_menu_popup();
-        if (!xim_menu_active() && overlay_visible && menu_visible)
-        {
-            // Both overlays shared one snapshot; the menu is gone but the
-            // prompt snapshot remains valid for its own rows.
         }
     }
 }

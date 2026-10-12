@@ -32,12 +32,12 @@ search or external tools (grep, ripgrep) are included.
   match in one undo block; Ctrl-R replaces the match at or after the caret and
   advances. A read-only or non-modifiable buffer refuses and the prompt shows
   the error state.
-- Search project runs on a third persistent worker that reads the indexed
-  files. It reuses the smart-case rule, waits for a completed scan, caps
-  results at 1000 matches or 200 files, skips files larger than 1 MiB and
-  files with a NUL byte in the first block, and reports the skipped and
-  truncated counts as one summary row. Enter or a click opens the file at the
-  match.
+- Search project runs on a third worker that starts on the first project
+  search and reads the indexed files. It reuses the smart-case rule, waits for
+  a completed scan, caps results at 1000 matches or 200 files, skips files
+  larger than 1 MiB and files with a NUL byte in the first block, and reports
+  the skipped and truncated counts as one summary row. Enter or a click opens
+  the file at the match.
 - The overlay adapter grew an optional right-aligned info field and takes the
   caret cell from the controller, so a two-field prompt places the caret in
   either field and the terminal cursor stays where the design requires.
@@ -63,7 +63,7 @@ search or external tools (grep, ripgrep) are included.
 ## Correctness gates
 
 - Full `build/dev` CTest suite: 19/19 registrations pass, including the
-  inherited Vim-script batches (665.9 s), native unit tests, project tests,
+  inherited Vim-script batches (700.0 s), native unit tests, project tests,
   PTY checks and the screen functions.
 - Native suites: `build/dev` 5/5 (commands, menu, project, PTY and the screen
   functions). ASan/UBSan native 4/4 and TSan native 4/4 (commands, menu,

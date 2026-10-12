@@ -29,7 +29,8 @@ product, release, and compiler policies do not override this file.
 Local notes are in `temp/XIM_DESIGN.md`, `temp/XIM_PLAN0.md`,
 `temp/XIM_PLAN0_REVIEW.md`, `temp/XIM_PLAN1.md`, `temp/XIM_PLAN1_REVIEW.md`,
 `temp/XIM_PLAN1_FULL_INITIAL_FAILURE.md`, `temp/XIM_PLAN2.md`,
-`temp/XIM_PLAN2_REVIEW.md`, `temp/XIM_PLAN3.md`, and `temp/XIM_PLAN4.md`.
+`temp/XIM_PLAN2_REVIEW.md`, `temp/XIM_PLAN3.md`, `temp/XIM_PLAN4.md`,
+`temp/XIM_ROADMAP.md` and `temp/XIM_PLAN5.md`.
 Read them when present. `temp/` is gitignored, so these files can be absent
 in other checkouts. The requirements in this file do not depend on those notes.
 

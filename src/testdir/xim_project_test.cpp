@@ -58,6 +58,22 @@ void seed(std::vector<std::string> paths)
     current_query.fetch_add(1);
     query_active = false;
 }
+
+std::string completed_content(const std::string &query, bool case_sensitive)
+{
+    xim_project_free(xim_project_content(query.c_str(), case_sensitive ? 1 : 0));
+    auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (xim_project_content_pending())
+    {
+        require(std::chrono::steady_clock::now() < until, "content completion timed out");
+        pollfd event{xim_project_wake_fd(), POLLIN, 0};
+        poll(&event, 1, 100);
+        xim_project_poll();
+    }
+    std::unique_ptr<char, decltype(&xim_project_free)> text(
+        xim_project_content(query.c_str(), case_sensitive ? 1 : 0), xim_project_free);
+    return text ? text.get() : "";
+}
 }
 
 int main(int argc, char **argv)
@@ -117,6 +133,30 @@ int main(int argc, char **argv)
         for (int i = 0; i < 100; ++i) xim_project_refresh();
         wait_scan();
         require(completed("fresh").empty(), "refresh restored superseded root");
+        // Project content search: literal matches, skip summary and smart case.
+        {
+            auto content = fixture / "content";
+            std::filesystem::create_directories(content);
+            std::ofstream(content / "a.txt") << "hello world\nsecond hello\n";
+            std::ofstream(content / "b.txt") << "Hello again\n";
+            std::ofstream(content / "big.bin") << std::string(2 * 1024 * 1024, 'x');
+            const char binary[] = {'h', 'e', 'l', 'l', 'o', '\0', 'w', '\n'};
+            std::ofstream(content / "bin.dat", std::ios::binary)
+                .write(binary, sizeof(binary));
+            xim_project_init(content.c_str());
+            wait_scan();
+            auto rows = completed_content("hello", false);
+            require(rows.find("a.txt\t") != std::string::npos, "content header missing");
+            require(rows.find("1: hello world") != std::string::npos, "content match missing");
+            require(rows.find("2: second hello") != std::string::npos, "content match missing");
+            require(rows.find("skipped 2 large or binary files") != std::string::npos,
+                "skip summary missing");
+            auto sensitive = completed_content("Hello", true);
+            require(sensitive.find("Hello again") != std::string::npos,
+                "case-sensitive match missing");
+            require(sensitive.find("hello world") == std::string::npos,
+                "case-sensitive search matched lowercase");
+        }
         xim_project_disable();
         require(std::string(xim_project_status()).empty(), "disabled project reports indexing");
         require(completed("alpha").empty(), "disabled project retained index");

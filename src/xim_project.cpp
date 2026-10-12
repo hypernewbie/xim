@@ -5,11 +5,13 @@
 #include <cctype>
 #include <cerrno>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <fcntl.h>
 #include <memory>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <set>
@@ -498,6 +500,259 @@ std::vector<std::string> match_paths(const Index &paths, std::string_view query,
     return matches;
 }
 
+// ---------------------------------------------------------------------------
+// Project content search. A third worker reads indexed files and reports
+// literal matches. Large and binary files are skipped and counted once.
+// ---------------------------------------------------------------------------
+constexpr std::size_t kMaxContentMatches = 1000;
+constexpr std::size_t kMaxContentFiles = 200;
+constexpr std::uintmax_t kMaxContentFileSize = 1u << 20; // 1 MiB
+
+struct ContentMatch
+{
+    std::string path;
+    int lnum;
+    int col;
+    std::string text;
+};
+
+struct ContentResults
+{
+    std::vector<ContentMatch> matches;
+    unsigned files_skipped = 0;
+    bool truncated = false;
+    bool complete = false;
+};
+
+const auto empty_content = std::make_shared<const ContentResults>();
+
+std::condition_variable content_changed;
+std::atomic<unsigned> current_content{0};
+bool content_requested = false;
+bool content_active = false;
+std::string content_query_text;
+bool content_case = false;
+std::shared_ptr<const ContentResults> content_snapshot = empty_content;
+unsigned content_result_revision = 0;
+std::thread content_worker;
+
+// Decode one UTF-8 codepoint at `pos`; return its byte length (0 on a bad
+// lead byte) and store the codepoint. Only enough folding for the smart-case
+// rule and Latin-1 text; other scripts compare case-sensitively.
+std::size_t decode_utf8(std::string_view text, std::size_t pos, std::uint32_t &out)
+{
+    if (pos >= text.size())
+        return 0;
+    unsigned char first = static_cast<unsigned char>(text[pos]);
+    if (first < 0x80)
+    {
+        out = first;
+        return 1;
+    }
+    std::size_t length = 0;
+    std::uint32_t value = 0;
+    if ((first & 0xE0) == 0xC0) { length = 2; value = first & 0x1F; }
+    else if ((first & 0xF0) == 0xE0) { length = 3; value = first & 0x0F; }
+    else if ((first & 0xF8) == 0xF0) { length = 4; value = first & 0x07; }
+    else return 0;
+    if (pos + length > text.size())
+        return 0;
+    for (std::size_t i = 1; i < length; ++i)
+    {
+        unsigned char next = static_cast<unsigned char>(text[pos + i]);
+        if ((next & 0xC0) != 0x80)
+            return 0;
+        value = (value << 6) | (next & 0x3F);
+    }
+    out = value;
+    return length;
+}
+
+std::uint32_t fold_codepoint(std::uint32_t value)
+{
+    if (value >= 'A' && value <= 'Z')
+        return value + 32;
+    if (value >= 0xC0 && value <= 0xDE && value != 0xD7)
+        return value + 32;
+    return value;
+}
+
+// First case-aware literal match of `needle` in `hay`, or -1. Scanning starts
+// only at codepoint boundaries so a match never begins mid-character.
+int find_literal(std::string_view hay, std::string_view needle, bool case_sensitive)
+{
+    if (needle.empty())
+        return -1;
+    for (std::size_t i = 0; i < hay.size(); )
+    {
+        std::size_t h = i;
+        std::size_t n = 0;
+        bool matched = true;
+        while (n < needle.size())
+        {
+            std::uint32_t hc = 0;
+            std::uint32_t nc = 0;
+            std::size_t hl = decode_utf8(hay, h, hc);
+            std::size_t nl = decode_utf8(needle, n, nc);
+            if (hl == 0 || nl == 0)
+            {
+                matched = false;
+                break;
+            }
+            std::uint32_t left = case_sensitive ? hc : fold_codepoint(hc);
+            std::uint32_t right = case_sensitive ? nc : fold_codepoint(nc);
+            if (left != right)
+            {
+                matched = false;
+                break;
+            }
+            h += hl;
+            n += nl;
+        }
+        if (matched)
+            return static_cast<int>(i);
+        std::uint32_t skip = 0;
+        std::size_t step = decode_utf8(hay, i, skip);
+        i += step == 0 ? 1 : step;
+    }
+    return -1;
+}
+
+std::shared_ptr<const ContentResults>
+search_content(const std::filesystem::path &base, const Index &paths,
+        const std::string &query, bool case_sensitive, unsigned generation,
+        unsigned revision)
+{
+    auto results = std::make_shared<ContentResults>();
+    if (query.empty())
+    {
+        results->complete = true;
+        return results;
+    }
+    std::size_t matched_files = 0;
+    for (const auto &entry : paths)
+    {
+        if (obsolete(generation)
+                || revision != current_content.load(std::memory_order_relaxed))
+            return empty_content;
+        std::error_code error;
+        auto full = base / std::filesystem::path(entry.path);
+        auto size = std::filesystem::file_size(full, error);
+        if (error || size > kMaxContentFileSize)
+        {
+            ++results->files_skipped;
+            continue;
+        }
+        std::ifstream stream(full, std::ios::binary);
+        if (!stream.is_open())
+        {
+            ++results->files_skipped;
+            continue;
+        }
+        std::string content((std::istreambuf_iterator<char>(stream)),
+                std::istreambuf_iterator<char>());
+        if (content.find('\0') != std::string::npos)
+        {
+            // A NUL in the first block marks a binary file; skip it whole.
+            ++results->files_skipped;
+            continue;
+        }
+        std::size_t start = 0;
+        int lnum = 1;
+        bool file_matched = false;
+        while (start <= content.size())
+        {
+            if (revision != current_content.load(std::memory_order_relaxed))
+                return empty_content;
+            auto end = content.find('\n', start);
+            std::size_t length = end == std::string::npos
+                ? content.size() - start : end - start;
+            std::string_view line(content.data() + start, length);
+            if (!line.empty() && line.back() == '\r')
+                line.remove_suffix(1);
+            int col = find_literal(line, query, case_sensitive);
+            if (col >= 0)
+            {
+                if (results->matches.size() >= kMaxContentMatches)
+                {
+                    results->truncated = true;
+                    break;
+                }
+                results->matches.push_back(
+                        {entry.path, lnum, col, std::string(line)});
+                file_matched = true;
+            }
+            if (end == std::string::npos)
+                break;
+            start = end + 1;
+            ++lnum;
+        }
+        if (results->truncated)
+            break;
+        if (file_matched)
+        {
+            ++matched_files;
+            if (matched_files >= kMaxContentFiles)
+            {
+                results->truncated = true;
+                break;
+            }
+        }
+    }
+    results->complete = true;
+    return results;
+}
+
+// Encode results as newline-separated rows: DISPLAY \t PATH \t LNUM \t COL.
+// A file header row carries an empty PATH. Sanitize tabs so a row splits into
+// exactly four fields.
+char *duplicate_content_rows(const ContentResults &results)
+{
+    std::string combined;
+    std::string current;
+    for (const auto &match : results.matches)
+    {
+        if (match.path != current)
+        {
+            current = match.path;
+            combined += current;
+            combined += "\t\t0\t0\n";
+        }
+        std::string text = match.text;
+        for (char &c : text)
+            if (c == '\t') c = ' ';
+        combined += "  ";
+        combined += std::to_string(match.lnum);
+        combined += ": ";
+        combined += text;
+        combined += '\t';
+        combined += match.path;
+        combined += '\t';
+        combined += std::to_string(match.lnum);
+        combined += '\t';
+        combined += std::to_string(match.col);
+        combined += '\n';
+    }
+    if (results.files_skipped > 0 || results.truncated)
+    {
+        combined += results.truncated ? "  results truncated" : "  skipped";
+        if (results.files_skipped > 0)
+        {
+            combined += " ";
+            combined += std::to_string(results.files_skipped);
+            combined += " large or binary file";
+            if (results.files_skipped != 1) combined += "s";
+        }
+        combined += "\t\t0\t0\n";
+    }
+    auto *result = static_cast<char *>(std::malloc(combined.size() + 1));
+    if (result == nullptr)
+        return nullptr;
+    combined.copy(result, combined.size());
+    result[combined.size()] = '\0';
+    return result;
+}
+
 void scan_loop()
 {
     for (;;)
@@ -542,12 +797,18 @@ void scan_loop()
             query_requested = true;
             query_changed.notify_one();
         }
+        if (content_active)
+        {
+            content_requested = true;
+            content_changed.notify_one();
+        }
         notify_editor();
         lock.unlock();
     }
 }
 
 void query_loop();
+void content_loop();
 
 bool ensure_workers()
 {
@@ -571,6 +832,7 @@ bool ensure_workers()
     {
         scan_worker = std::thread(scan_loop);
         query_worker = std::thread(query_loop);
+        content_worker = std::thread(content_loop);
     }
     catch (const std::system_error &)
     {
@@ -579,7 +841,9 @@ bool ensure_workers()
             stopping.store(true);
         }
         scan_changed.notify_one();
+        content_changed.notify_one();
         if (scan_worker.joinable()) scan_worker.join();
+        if (content_worker.joinable()) content_worker.join();
         for (int &owned : wake_pipe) { close(owned); owned = -1; }
         worker_error = "Project worker startup failed";
         return false;
@@ -651,6 +915,11 @@ xim_project_disable(void)
     expanded_directories.clear();
     retire_snapshot();
     results.clear();
+    current_content.fetch_add(1);
+    content_active = false;
+    content_requested = false;
+    content_snapshot = empty_content;
+    content_changed.notify_one();
 }
 
 extern "C" void
@@ -668,8 +937,10 @@ xim_project_shutdown(void)
     }
     scan_changed.notify_one();
     query_changed.notify_one();
+    content_changed.notify_one();
     if (scan_worker.joinable()) scan_worker.join();
     if (query_worker.joinable()) query_worker.join();
+    if (content_worker.joinable()) content_worker.join();
     for (int &fd : wake_pipe)
     {
         if (fd >= 0) close(fd);
@@ -697,6 +968,11 @@ extern "C" void xim_project_cancel_query(void)
     query_active = false;
     query_requested = false;
     results.clear();
+    current_content.fetch_add(1);
+    content_active = false;
+    content_requested = false;
+    content_snapshot = empty_content;
+    content_changed.notify_one();
 }
 
 extern "C" int xim_project_pending(void)
@@ -810,6 +1086,48 @@ void query_loop()
         lock.unlock(); // releasing an old shared index must not hold state_lock
     }
 }
+
+// Content worker: waits for a ready index, then scans indexed files for a
+// literal match. Results are generation- and revision-checked.
+void content_loop()
+{
+    for (;;)
+    {
+        std::unique_lock lock(state_lock);
+        content_changed.wait(lock, [] {
+            return stopping.load()
+                || (content_requested && (scan_complete || !active));
+        });
+        if (stopping.load()) return;
+        if (!content_requested)
+            continue;
+        auto paths = snapshot;
+        auto base = root;
+        auto text = content_query_text;
+        bool case_sensitive = content_case;
+        bool ready = scan_complete || !active;
+        unsigned generation = current_generation.load();
+        unsigned revision = current_content.load();
+        content_requested = false;
+        lock.unlock();
+        if (!ready)
+            continue;
+        auto results = search_content(base, *paths, text, case_sensitive,
+                generation, revision);
+        lock.lock();
+        if (obsolete(generation) || revision != current_content.load()
+                || !content_active || paths != snapshot)
+        {
+            lock.unlock();
+            continue;
+        }
+        content_snapshot = std::move(results);
+        content_result_revision = revision;
+        completion = true;
+        notify_editor();
+        lock.unlock();
+    }
+}
 }
 
 extern "C" char *
@@ -831,6 +1149,56 @@ xim_project_files(const char *query)
             || result_revision != current_query.load() || result_query != text)
         return nullptr;
     return duplicate_lines(results);
+}
+
+// Project content search. Nonblocking: starts or restarts the content query
+// and returns rows only when the current query has completed. Rows are
+// DISPLAY \t PATH \t LNUM \t COL; a file header has an empty PATH.
+extern "C" char *
+xim_project_content(const char *query, int case_sensitive)
+{
+    if (!ensure_workers()) return nullptr;
+    std::string_view text = query == nullptr ? "" : query;
+    std::lock_guard lock(state_lock);
+    if (!active)
+    {
+        ContentResults empty;
+        content_active = false;
+        return duplicate_content_rows(empty);
+    }
+    if (!content_active || content_query_text != text
+            || content_case != (case_sensitive != 0))
+    {
+        content_query_text = text;
+        content_case = case_sensitive != 0;
+        current_content.fetch_add(1);
+        content_active = true;
+        content_requested = true;
+        content_snapshot = empty_content;
+        content_changed.notify_one();
+    }
+    if (content_result_revision != current_content.load()
+            || !content_snapshot->complete)
+        return nullptr;
+    return duplicate_content_rows(*content_snapshot);
+}
+
+extern "C" int
+xim_project_content_pending(void)
+{
+    std::lock_guard lock(state_lock);
+    return content_active && !content_snapshot->complete ? 1 : 0;
+}
+
+extern "C" const char *
+xim_project_content_status(void)
+{
+    static thread_local std::string text;
+    std::lock_guard lock(state_lock);
+    text = worker_error != nullptr ? worker_error
+        : !active ? ""
+        : content_active && !content_snapshot->complete ? "Searching project..." : "";
+    return text.c_str();
 }
 
 extern "C" char *

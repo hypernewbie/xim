@@ -171,6 +171,13 @@ func Test_xim_project_pickers()
   call WaitForAssert({-> assert_match('src/alpha\.cpp', s:Screen(buf))})
   call s:Dump(buf, 'Test_xim_explorer')
   call term_sendkeys(buf, "\<Esc>")
+  " Project content search lists file headers with their matched lines.
+  call term_sendkeys(buf, "\<F1>Search project\<CR>")
+  call WaitForAssert({-> assert_match('Search:', s:Screen(buf))})
+  call term_sendkeys(buf, "alpha")
+  call WaitForAssert({-> assert_match('1: alpha', s:Screen(buf))})
+  call s:Dump(buf, 'Test_xim_project_search')
+  call term_sendkeys(buf, "\<Esc>")
   call s:StopXim(buf)
   call delete('Xximproj', 'rf')
 endfunc

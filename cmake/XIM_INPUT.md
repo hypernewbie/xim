@@ -71,10 +71,15 @@ runtime or prefix-relative installed runtime, with VIMRUNTIME overrides.
 The current executable-location implementation targets Linux (`/proc/self/exe`).
 
 Engine adapters remain synchronous and main-thread-only. The project module
-has two persistent workers: a scanner with an owned root and a matcher with
-an immutable shared path snapshot. Requests coalesce and completion uses one
-latest-result slot plus a scan-change flag. Generations and query revisions
-reject obsolete results, with cancellation checks during walking and matching.
+has three persistent workers: a scanner with an owned root, a path matcher
+with an immutable shared path snapshot, and a content matcher that reads the
+indexed files. Requests coalesce and completion uses one latest-result slot
+plus a scan-change flag. Generations and query revisions reject obsolete
+results, with cancellation checks during walking, path matching and file
+reads. The content worker waits for a completed scan, skips files larger than
+1 MiB and files with a NUL byte in the first block, and caps results at 1000
+matches or 200 files. It reports skipped and truncated counts as one summary
+row rather than per file.
 Refresh never joins the old scan on the editor thread. Retired large indexes
 are freed by workers outside the state mutex, not during a main-thread refresh
 or a completion-slot update. Shutdown cancels first,

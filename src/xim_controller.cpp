@@ -103,6 +103,16 @@ int confirm_choice_at(int col)
 }
 std::vector<std::string> file_rows;
 std::string file_rows_query;
+// Project content results. Display rows feed the picker; the parallel meta
+// list resolves a row to a file, line and column on activation.
+struct ContentMeta
+{
+    std::string path;
+    int lnum = 0;
+    int col = 0;
+};
+std::vector<std::string> content_rows;
+std::vector<ContentMeta> content_meta;
 // Menu state: F10 or bar click opens a real drop-down. Right-click opens the
 // Edit group as a context menu at the pointer. Keyboard and mouse share the
 // same pure hit layout in xim_menu.
@@ -270,6 +280,13 @@ bool prompt_is_find_like()
     return prompt == Action::find || prompt == Action::replace;
 }
 
+// Find, replace and project search share the smart-case rule and the Alt-C
+// toggle; only find and replace drive the buffer highlight.
+bool prompt_supports_case()
+{
+    return prompt_is_find_like() || prompt == Action::search_project;
+}
+
 // Smart case: an uppercase letter in the query makes the match case-sensitive.
 bool prompt_case_sensitive()
 {
@@ -326,6 +343,8 @@ void clear_find_highlight()
 // Right-aligned prompt status: match count and the active case rule.
 std::string prompt_info()
 {
+    if (prompt == Action::search_project)
+        return std::string("[") + case_label() + "]";
     if (!prompt_is_find_like())
         return {};
     std::string info = std::to_string(find_match_count);
@@ -391,6 +410,10 @@ std::vector<std::string> project_items(Action action, const std::string &text)
         case Action::files: sources = xim_project_files(text.c_str()); break;
         case Action::explorer: sources = xim_project_explorer(text.c_str()); break;
         case Action::buffers: sources = xim_engine_buffers(); break;
+        case Action::search_project:
+            sources = xim_project_content(text.c_str(),
+                    prompt_case_sensitive() ? 1 : 0);
+            break;
         default: break;
     }
     std::vector<std::string> items;
@@ -410,14 +433,46 @@ std::vector<std::string> project_items(Action action, const std::string &text)
         std::unique_ptr<char, decltype(&xim_project_free)> guard(sources, xim_project_free);
         text_all = guard.get();
     }
+    if (action == Action::search_project)
+        content_meta.clear();
     std::size_t start = 0;
     for (;;)
     {
         auto end = text_all.find('\n', start);
         if (end == std::string::npos)
             break;
-        items.push_back(text_all.substr(start, end - start));
+        std::string row = text_all.substr(start, end - start);
         start = end + 1;
+        if (action != Action::search_project)
+        {
+            items.push_back(std::move(row));
+            continue;
+        }
+        // Split DISPLAY \t PATH \t LNUM \t COL. A header has an empty PATH.
+        auto first = row.find('\t');
+        if (first == std::string::npos)
+        {
+            items.push_back(std::move(row));
+            content_meta.push_back(ContentMeta{});
+            continue;
+        }
+        ContentMeta meta;
+        auto second = row.find('\t', first + 1);
+        auto third = second == std::string::npos
+            ? std::string::npos : row.find('\t', second + 1);
+        if (second != std::string::npos && third != std::string::npos)
+        {
+            meta.path = row.substr(first + 1, second - first - 1);
+            meta.lnum = std::atoi(row.substr(second + 1, third - second - 1).c_str());
+            meta.col = std::atoi(row.substr(third + 1).c_str());
+        }
+        items.push_back(row.substr(0, first));
+        content_meta.push_back(std::move(meta));
+    }
+    if (action == Action::search_project)
+    {
+        content_rows = items;
+        return items;
     }
     if (action == Action::files)
     {
@@ -430,6 +485,37 @@ std::vector<std::string> project_items(Action action, const std::string &text)
         file_rows_query = text;
     }
     return items;
+}
+
+// The content list interleaves file headers and a summary row with the
+// activatable matches. Return the next row that names a file.
+std::size_t first_activatable(std::size_t from)
+{
+    if (content_meta.empty())
+        return from;
+    for (std::size_t i = 0; i < content_meta.size(); ++i)
+    {
+        std::size_t index = (from + i) % content_meta.size();
+        if (!content_meta[index].path.empty())
+            return index;
+    }
+    return from;
+}
+
+std::size_t next_activatable(std::size_t from, int delta)
+{
+    if (content_meta.empty())
+        return from;
+    std::size_t count = content_meta.size();
+    std::size_t step = delta > 0 ? 1 : count - 1;
+    std::size_t index = from;
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        index = (index + step) % count;
+        if (!content_meta[index].path.empty())
+            return index;
+    }
+    return from;
 }
 
 void begin(Action action)
@@ -656,7 +742,32 @@ bool open_picker_item(Action current, const std::vector<std::string> &list,
         return false;
     }
     auto item = list[index % list.size()];
-    if (current == Action::buffers)
+    if (current == Action::search_project)
+    {
+        // A content row resolves through the parallel metadata list; a header
+        // or the summary row is not activatable.
+        if (index >= content_meta.size())
+            return false;
+        const ContentMeta meta = content_meta[index];
+        if (meta.path.empty())
+        {
+            prompt = current;
+            return false;
+        }
+        char *resolved = xim_project_resolve(meta.path.c_str());
+        if (resolved != nullptr)
+        {
+            std::unique_ptr<char, decltype(&xim_project_free)> guard(
+                    resolved, xim_project_free);
+            xim_engine_command("hide edit", resolved, 0);
+        }
+        else
+            xim_engine_command("hide edit", meta.path.c_str(), 0);
+        std::string jump = "call cursor(" + std::to_string(meta.lnum) + ", "
+            + std::to_string(meta.col + 1) + ")";
+        xim_engine_command(jump.c_str(), "", 0);
+    }
+    else if (current == Action::buffers)
     {
         auto number = item.substr(0, item.find(':'));
         xim_engine_command("hide buffer", number.c_str(), 0);
@@ -722,6 +833,17 @@ bool activate_current_row(Action current)
         if (!query.empty())
             xim_engine_find(query.c_str(), false, query_case_sensitive);
         return true;
+    }
+    if (current == Action::search_project)
+    {
+        // The content list is indexed by absolute row; the last render kept
+        // the scroll origin so a click and Enter resolve the same row.
+        std::vector<std::string> list = project_items(current, input);
+        std::size_t row = last_picker_action == current
+            ? static_cast<std::size_t>(last_picker_first + last_picker_selected)
+            : selected;
+        if (row >= content_meta.size()) return false;
+        return open_picker_item(current, list, row);
     }
     if (current == Action::files || current == Action::buffers
             || current == Action::explorer)
@@ -819,7 +941,7 @@ extern "C" void xim_dispatch(int key, int modifiers)
             // Terminals that do not enable modifyOtherKeys deliver Alt-C as
             // Escape followed by 'c'. Claim the pending letter as the case
             // toggle before treating Escape as a cancel.
-            if (prompt_is_find_like())
+            if (prompt_supports_case())
             {
                 int next = xim_engine_peek_key();
                 if (next == 'c' || next == 'C')
@@ -915,10 +1037,13 @@ extern "C" void xim_dispatch(int key, int modifiers)
                             query_case_sensitive);
                 return;
             }
-            if (current == Action::files)
+            if (current == Action::files || current == Action::search_project)
             {
                 (void)project_items(current, input);
-                if (xim_project_pending())
+                bool pending = current == Action::files
+                    ? xim_project_pending() != 0
+                    : xim_project_content_pending() != 0;
+                if (pending)
                 {
                     accept_when_ready = true;
                     return;
@@ -1013,13 +1138,20 @@ extern "C" void xim_dispatch(int key, int modifiers)
         // List selection with arrows.
         if ((key == XIM_UP || key == XIM_DOWN)
                 && (prompt == Action::palette || prompt == Action::files
-                    || prompt == Action::buffers || prompt == Action::explorer))
+                    || prompt == Action::buffers || prompt == Action::explorer
+                    || prompt == Action::search_project))
         {
             std::size_t count = 0;
             if (prompt == Action::palette) count = filtered().size();
             else count = project_items(prompt, input).size();
             if (count > 0)
-                selected = (selected + count + (key == XIM_UP ? -1 : 1)) % count;
+            {
+                if (prompt == Action::search_project)
+                    selected = next_activatable(selected % count,
+                            key == XIM_UP ? -1 : 1);
+                else
+                    selected = (selected + count + (key == XIM_UP ? -1 : 1)) % count;
+            }
             return;
         }
         // Prompt caret editing: arrows, Home/End, Delete and clipboard.
@@ -1159,7 +1291,11 @@ extern "C" int xim_input_blocked() { return deferred_keys.size() >= kMaxDeferred
 extern "C" int xim_background()
 {
     if (!xim_project_poll()) return 0;
-    if (prompt == Action::files && accept_when_ready && !xim_project_pending())
+    bool picker = prompt == Action::files || prompt == Action::search_project;
+    bool ready = prompt == Action::files ? !xim_project_pending()
+        : prompt == Action::search_project ? !xim_project_content_pending()
+        : false;
+    if (picker && accept_when_ready && ready)
     {
         accept_when_ready = false;
         xim_dispatch('\r', 0);
@@ -1175,11 +1311,11 @@ extern "C" int xim_background()
 
 extern "C" int xim_prompt_place(int screen_col)
 {
-    // screen_col counts cells from the start of the input (after "Label: ").
+    // screen_col counts cells from the start of the active field.
     if (prompt == Action::ignore) return 0;
     if (screen_col < 0) screen_col = 0;
-    std::size_t bytes = bytes_for_cells(input, screen_col);
-    input_cursor = bytes;
+    std::size_t bytes = bytes_for_cells(field_text(), screen_col);
+    field_cursor() = bytes;
     clear_prompt_selection();
     return static_cast<int>(bytes);
 }
@@ -1274,12 +1410,14 @@ void render_prompt_overlay(int menu_rows)
         }
     }
     else if (prompt == Action::files || prompt == Action::buffers
-            || prompt == Action::explorer)
+            || prompt == Action::explorer || prompt == Action::search_project)
     {
         auto list = project_items(prompt, input);
         if (list.empty())
         {
-            const char *status = prompt == Action::files ? xim_project_status() : nullptr;
+            const char *status = prompt == Action::files ? xim_project_status()
+                : prompt == Action::search_project ? xim_project_content_status()
+                : nullptr;
             if (status != nullptr && *status != '\0')
                 items = std::string("  ") + status + "\n";
             last_picker_items.clear();
@@ -1288,6 +1426,8 @@ void render_prompt_overlay(int menu_rows)
         else
         {
             selected = selected % list.size();
+            if (prompt == Action::search_project)
+                selected = first_activatable(selected);
             auto rows = static_cast<std::size_t>(menu_rows);
             auto first = selected >= rows ? selected - rows + 1 : 0;
             auto last = std::min(list.size(), first + rows);
@@ -1374,7 +1514,8 @@ bool activate_picker_row(int row, int columns)
 {
     (void)columns;
     if (prompt != Action::files && prompt != Action::buffers
-            && prompt != Action::explorer && prompt != Action::palette)
+            && prompt != Action::explorer && prompt != Action::palette
+            && prompt != Action::search_project)
         return false;
     int rows = screen_rows_for_mouse();
     // Recompute the overlay geometry used by xim_engine_overlay: items end
@@ -1524,7 +1665,8 @@ extern "C" void xim_mouse_press(int row, int col, int button, int modifiers, int
         }
     }
     if ((prompt == Action::files || prompt == Action::buffers
-                || prompt == Action::explorer || prompt == Action::palette)
+                || prompt == Action::explorer || prompt == Action::palette
+                || prompt == Action::search_project)
             && button == 0)
     {
         if (activate_picker_row(row, columns)) return;
@@ -1541,13 +1683,32 @@ extern "C" void xim_mouse_press(int row, int col, int button, int modifiers, int
         }
     }
     else if ((prompt == Action::open || prompt == Action::save_as
-                || prompt == Action::find || prompt == Action::ex)
+                || prompt == Action::find || prompt == Action::ex
+                || prompt == Action::search_project)
             && button == 0 && row == rows - 1)
     {
         std::string label = prompt_label();
         int input_col = col - static_cast<int>(label.size());
         if (input_col < 0) input_col = 0;
         xim_prompt_place(input_col);
+        return;
+    }
+    else if (prompt == Action::replace && button == 0 && row == rows - 1)
+    {
+        // Place the caret in whichever field was clicked.
+        int find_cells = 6;    // "Find: "
+        int repl_cells = 11;   // "   Replace: "
+        int find_end = find_cells + cells_before(input, input.size());
+        if (col <= find_end)
+        {
+            active_field = 0;
+            xim_prompt_place(col - find_cells);
+        }
+        else
+        {
+            active_field = 1;
+            xim_prompt_place(col - find_end - repl_cells);
+        }
         return;
     }
     if (prompt != Action::ignore) return;

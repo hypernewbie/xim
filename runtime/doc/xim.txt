@@ -57,6 +57,7 @@ Explorer	Ctrl-E		palette: Explorer
 Buffers	Ctrl-Shift-B	palette: Buffers
 Command palette	Ctrl-Shift-P	F1 or F2
 Menus		F10		mouse: top bar
+Search project	Ctrl-Shift-F	Navigate > Search project
 Refresh project			palette: Refresh project
 
 The palette filters command names by case-insensitive substring.  Up/Down
@@ -118,6 +119,23 @@ without a Save/Discard prompt and keeps any unsaved buffer in the buffer
 list.  Buffer rows show a stable number, '*' for the active buffer and '+' for
 unsaved changes.  Long paths are shortened in the middle so the filename stays
 visible.  Two unnamed buffers remain separate choices.
+
+Project search
+								*xim-search*
+Search project finds literal text in the indexed files.  It reuses the smart
+case rule and the Alt-C toggle.  Results list each file as a header with its
+matched lines beneath; Enter or a click opens the file at that match.  The
+search runs on a third background worker over the file index.  Files larger
+than 1 MiB and binary files (a NUL byte in the first block) are skipped; the
+count of skipped files is reported once as a summary line, not per file.
+Results start capped at 1000 matches or 200 files, whichever comes first, and
+report truncation.  Only the latest query is searched; obsolete work is
+cancelled through a generation check.  A file argument opens a single buffer
+and disables the project, so project search is available only for a directory
+or a bare start.
+
+Content search reads the on-disk text of indexed files.  Unsaved buffer
+changes are not searched; save the buffer first to search the edited text.
 
 Save on an unnamed buffer opens Save as.  The explicit Open prompt, Close,
 and Quit protect modified buffers with Save, Discard, and Cancel choices.

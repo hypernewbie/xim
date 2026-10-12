@@ -17,6 +17,12 @@ void xim_project_cancel_query(void);
 /* Nonblocking: requests a query and returns only its current completion. */
 char *xim_project_files(const char *query);
 char *xim_project_explorer(const char *query);
+/* Project content search. Nonblocking like xim_project_files; rows are
+ * DISPLAY \t PATH \t LNUM \t COL with an empty PATH on a file header row.
+ * The result must be freed with xim_project_free. */
+char *xim_project_content(const char *query, int case_sensitive);
+int xim_project_content_pending(void);
+const char *xim_project_content_status(void);
 int xim_project_explorer_activate(const char *item, char **selected);
 const char *xim_project_status(void);
 void xim_project_free(char *value);

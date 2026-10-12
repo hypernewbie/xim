@@ -1528,6 +1528,74 @@ def find_replace(binary, root):
     print("Replace-all undo block and read-only refusal checks passed")
 
 
+def project_content_search(binary, root):
+    """Project content search lists matches and opens them (Plan 5)."""
+    with tempfile.TemporaryDirectory(prefix="xim-content-", dir=root) as temporary:
+        directory = Path(temporary)
+        (directory / "a.txt").write_text("hello world\nsecond hello\n")
+        (directory / "b.txt").write_text("Hello again\n")
+        (directory / "big.bin").write_bytes(b"x" * (2 * 1024 * 1024))
+        (directory / "bin.dat").write_bytes(b"hello\x00world\n")
+        session = Session(binary, directory)
+        try:
+            session.send(b"\x1bOP")  # palette
+            session.drain(.2)
+            session.send("Search project")
+            session.drain(.2)
+            session.send(b"\r")
+            session.drain(1.2)
+            assert wait_screen(session, b"Search:"), session.screen.text()
+            # Smart case: an uppercase query matches only the exact case.
+            session.send("Hello")
+            session.drain(1.2)
+            assert wait_screen(session, b"1: Hello again"), session.screen.text()
+            assert b"hello world" not in session.screen.text(), session.screen.text()
+            # Alt-C relaxes the rule and finds the other files.
+            session.send(b"\x1bc")
+            session.drain(1.2)
+            assert wait_screen(session, b"1: hello world"), session.screen.text()
+            assert wait_screen(session, b"2: second hello"), session.screen.text()
+            # Large and binary files are reported once, not per file.
+            assert wait_screen(session, b"skipped 2 large or binary files"), \
+                session.screen.text()
+            session.send(b"\x1b")
+            session.drain(.3)
+            # Enter opens the selected match at its line.
+            session.send(b"\x1bOP")
+            session.drain(.2)
+            session.send("Search project")
+            session.drain(.2)
+            session.send(b"\r")
+            session.drain(1.2)
+            session.send("hello")
+            session.drain(1.2)
+            session.send(b"\r")
+            session.drain(.5)
+            session.ex("call writefile([string(getcurpos()) . ' ' . expand('%:t')], 'open')")
+            assert (directory / "open").read_text().strip() == "[0, 1, 1, 0, 1] a.txt", \
+                (directory / "open").read_text()
+            # A click on a match row opens it as well. Use a marker that only
+            # appears in the results, not in the currently open buffer.
+            session.send(b"\x1bOP")
+            session.drain(.2)
+            session.send("Search project")
+            session.drain(.2)
+            session.send(b"\r")
+            session.drain(1.2)
+            session.send("again")
+            session.drain(1.2)
+            assert wait_screen(session, b"1: Hello again"), session.screen.text()
+            row, column = screen_rowcol(session.screen, "Hello again")
+            session.send(f"\x1b[<0;{column + 1};{row}M\x1b[<0;{column + 1};{row}m".encode())
+            session.drain(.5)
+            session.ex("call writefile([string(getcurpos()) . ' ' . expand('%:t')], 'click')")
+            assert (directory / "click").read_text().strip() == "[0, 1, 7, 0, 7] b.txt", \
+                (directory / "click").read_text()
+        finally:
+            session.close()
+    print("Project content search checks passed")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -1563,3 +1631,4 @@ if __name__ == "__main__":
     undo_redo_availability(args.binary.resolve(), args.work.resolve())
     find_highlight(args.binary.resolve(), args.work.resolve())
     find_replace(args.binary.resolve(), args.work.resolve())
+    project_content_search(args.binary.resolve(), args.work.resolve())

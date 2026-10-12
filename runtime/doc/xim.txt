@@ -1,5 +1,5 @@
 *xim.txt*	Native non-modal terminal editing
-					Last change: 2026 Oct 07
+					Last change: 2026 Oct 11
 
 Xim's native input layer uses the existing Vim text engine.  This document
 describes the first native editing milestone.
@@ -48,9 +48,10 @@ Cut		Ctrl-X		F7 or palette: Cut
 Paste		Ctrl-V		F8 or palette: Paste
 Undo		Ctrl-Z		F9 or palette: Undo
 Redo		Ctrl-Y		palette: Redo
-Find		Ctrl-F		F11 or palette: Find
-Next match	F3		palette: Next match
-Previous match	Shift-F3	palette: Previous match
+Find		Ctrl-F		F11 or Edit > Find
+Replace		Ctrl-H		Edit > Replace
+Next match	F3		Navigate > Next match
+Previous match	Shift-F3	Navigate > Previous match
 Quick open	Ctrl-P		palette: Files
 Explorer	Ctrl-E		palette: Explorer
 Buffers	Ctrl-Shift-B	palette: Buffers
@@ -61,9 +62,23 @@ Refresh project			palette: Refresh project
 The palette filters command names by case-insensitive substring.  Up/Down
 move the selection in every list prompt (palette, quick open, explorer,
 buffers); Enter runs or opens it.  The list scrolls to keep the selection in
-view.  Open, Save as, and Find accept text at the bottom of the screen.  Enter
-accepts; Escape cancels.  Find uses literal text and follows the buffer's
-existing case and wrap-search options.
+view.  Open, Save as, Find and Replace accept text at the bottom of the screen.
+Enter accepts; Escape cancels.  Find and Replace use literal text, so a query
+never acts as a regular expression.
+
+Find highlights every literal match as the query is typed and does not move
+the caret until you navigate.  Enter and F3 go to the next match, Shift-Enter
+and Shift-F3 to the previous.  Escape closes the prompt and clears the
+highlight.  Case is smart by default: the query is case-insensitive until it
+contains an uppercase letter.  Alt-C cycles smart, insensitive and sensitive,
+and the active rule and the match count show at the right of the prompt line.
+The native highlight is window-local match state; it never changes 'hlsearch',
+so the compatibility path is unaffected.
+
+Replace opens two fields on one line.  Tab and Shift-Tab move between the find
+and replace fields.  Enter replaces every match in one undo block; Ctrl-R
+replaces the current match and advances to the next.  A read-only or
+non-modifiable buffer refuses the change and the prompt shows "read-only".
 
 Files
 								*xim-files*

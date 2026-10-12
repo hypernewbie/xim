@@ -19,6 +19,25 @@ std::size_t input_cursor = 0;
 bool prompt_has_selection = false;
 std::size_t prompt_sel_start = 0;
 std::size_t prompt_sel_end = 0;
+// Replace prompt second field and the active field index (0 find, 1 replace).
+std::string replace_input;
+std::size_t replace_cursor = 0;
+bool replace_has_selection = false;
+std::size_t replace_sel_start = 0;
+std::size_t replace_sel_end = 0;
+int active_field = 0;
+// Set when a replace is refused (read-only buffer); the prompt shows the
+// error state until the next edit.
+bool replace_error = false;
+
+// The prompt-editing primitives operate on whichever field is active so the
+// find and replace fields share one caret/selection model. Field 0 keeps the
+// historical `input` state used by every other prompt.
+std::string &field_text() { return active_field == 1 ? replace_input : input; }
+std::size_t &field_cursor() { return active_field == 1 ? replace_cursor : input_cursor; }
+bool &field_has_selection() { return active_field == 1 ? replace_has_selection : prompt_has_selection; }
+std::size_t &field_sel_start() { return active_field == 1 ? replace_sel_start : prompt_sel_start; }
+std::size_t &field_sel_end() { return active_field == 1 ? replace_sel_end : prompt_sel_end; }
 std::string clipboard;
 std::string query;
 Action prompt = Action::ignore;
@@ -242,8 +261,8 @@ std::size_t bytes_for_cells(const std::string &text, int cells)
 
 void clear_prompt_selection()
 {
-    prompt_has_selection = false;
-    prompt_sel_start = prompt_sel_end = 0;
+    field_has_selection() = false;
+    field_sel_start() = field_sel_end() = 0;
 }
 
 bool prompt_is_find_like()
@@ -272,13 +291,14 @@ void prompt_input_changed();
 
 void delete_prompt_selection()
 {
-    if (!prompt_has_selection) return;
-    std::size_t start = std::min(prompt_sel_start, prompt_sel_end);
-    std::size_t end = std::max(prompt_sel_start, prompt_sel_end);
-    if (start > input.size()) start = input.size();
-    if (end > input.size()) end = input.size();
-    input.erase(start, end - start);
-    input_cursor = start;
+    if (!field_has_selection()) return;
+    std::string &text = field_text();
+    std::size_t start = std::min(field_sel_start(), field_sel_end());
+    std::size_t end = std::max(field_sel_start(), field_sel_end());
+    if (start > text.size()) start = text.size();
+    if (end > text.size()) end = text.size();
+    text.erase(start, end - start);
+    field_cursor() = start;
     clear_prompt_selection();
     prompt_input_changed();
 }
@@ -287,8 +307,14 @@ void delete_prompt_selection()
 // highlight is window-local match state; it never touches 'hlsearch'.
 void prompt_input_changed()
 {
-    if (prompt_is_find_like())
-        xim_engine_highlight(input.c_str(), prompt_case_sensitive(), &find_match_count);
+    // Any prompt edit clears a previous read-only refusal.
+    replace_error = false;
+    if (!prompt_is_find_like())
+        return;
+    // Editing the replace field does not change the highlight.
+    if (prompt == Action::replace && active_field != 0)
+        return;
+    xim_engine_highlight(input.c_str(), prompt_case_sensitive(), &find_match_count);
 }
 
 void clear_find_highlight()
@@ -306,7 +332,47 @@ std::string prompt_info()
     info += find_match_count == 1 ? " match  [" : " matches  [";
     info += case_label();
     info += "]";
+    if (replace_error && prompt == Action::replace)
+        info += "  read-only";
     return info;
+}
+
+// Replace-all runs as one undo block and keeps the prompt open so the user
+// can see the remaining match count. A read-only buffer sets the error state.
+void perform_replace_all()
+{
+    query = input;
+    query_case_sensitive = prompt_case_sensitive();
+    if (query.empty())
+        return;
+    if (!xim_engine_modifiable())
+    {
+        replace_error = true;
+        return;
+    }
+    int count = 0;
+    xim_engine_replace_all(query.c_str(), replace_input.c_str(),
+            query_case_sensitive, &count);
+    replace_error = false;
+    xim_engine_highlight(query.c_str(), query_case_sensitive, &find_match_count);
+}
+
+// Replace-one replaces the match at or after the caret and advances it.
+void perform_replace_one()
+{
+    query = input;
+    query_case_sensitive = prompt_case_sensitive();
+    if (query.empty())
+        return;
+    if (!xim_engine_modifiable())
+    {
+        replace_error = true;
+        return;
+    }
+    xim_engine_replace_one(query.c_str(), replace_input.c_str(),
+            query_case_sensitive);
+    replace_error = false;
+    xim_engine_highlight(query.c_str(), query_case_sensitive, &find_match_count);
 }
 
 std::vector<const xim::Command *> filtered()
@@ -377,6 +443,12 @@ void begin(Action action)
     input.clear();
     input_cursor = 0;
     clear_prompt_selection();
+    replace_input.clear();
+    replace_cursor = 0;
+    replace_has_selection = false;
+    replace_sel_start = replace_sel_end = 0;
+    active_field = 0;
+    replace_error = false;
     file_rows.clear();
     file_rows_query.clear();
     selected = 0;
@@ -468,11 +540,11 @@ void execute(Action action)
             break;
         case Action::copy: case Action::cut:
         {
-            if (prompt != Action::ignore && prompt_has_selection)
+            if (prompt != Action::ignore && field_has_selection())
             {
-                std::size_t start = std::min(prompt_sel_start, prompt_sel_end);
-                std::size_t end = std::max(prompt_sel_start, prompt_sel_end);
-                clipboard = input.substr(start, end - start);
+                std::size_t start = std::min(field_sel_start(), field_sel_end());
+                std::size_t end = std::max(field_sel_start(), field_sel_end());
+                clipboard = field_text().substr(start, end - start);
                 if (action == Action::cut) delete_prompt_selection();
                 break;
             }
@@ -490,9 +562,10 @@ void execute(Action action)
             {
                 if (*payload == '\0') break;
                 delete_prompt_selection();
-                std::size_t pos = std::min(input_cursor, input.size());
-                input.insert(pos, payload);
-                input_cursor = pos + std::string(payload).size();
+                std::string &text = field_text();
+                std::size_t pos = std::min(field_cursor(), text.size());
+                text.insert(pos, payload);
+                field_cursor() = pos + std::string(payload).size();
                 selected = 0;
                 prompt_input_changed();
             }
@@ -764,6 +837,12 @@ extern "C" void xim_dispatch(int key, int modifiers)
             input.clear();
             input_cursor = 0;
             clear_prompt_selection();
+            replace_input.clear();
+            replace_cursor = 0;
+            replace_has_selection = false;
+            replace_sel_start = replace_sel_end = 0;
+            active_field = 0;
+            replace_error = false;
             save_then_continue = false;
             pending = Action::ignore;
             pending_path.clear();
@@ -798,9 +877,33 @@ extern "C" void xim_dispatch(int key, int modifiers)
             }
             return;
         }
+        if (prompt == Action::replace)
+        {
+            if (key == '\t')
+            {
+                // Tab and Shift-Tab move between the find and replace fields.
+                active_field = 1 - active_field;
+                prompt_has_selection = replace_has_selection = false;
+                prompt_sel_start = prompt_sel_end = 0;
+                replace_sel_start = replace_sel_end = 0;
+                return;
+            }
+            if (key == 18)
+            {
+                // Ctrl-R replaces the current match and advances.
+                perform_replace_one();
+                return;
+            }
+        }
         if (key == '\r' || key == '\n')
         {
             Action current = prompt;
+            if (current == Action::replace)
+            {
+                // Enter replaces every match in one undo block.
+                perform_replace_all();
+                return;
+            }
             if (current == Action::find)
             {
                 // Enter finds the next match, Shift-Enter the previous, and
@@ -923,39 +1026,42 @@ extern "C" void xim_dispatch(int key, int modifiers)
         if (key == XIM_LEFT || key == XIM_RIGHT)
         {
             bool select = (modifiers & XIM_SHIFT) != 0;
+            std::string &text = field_text();
             if (!select) clear_prompt_selection();
-            else if (!prompt_has_selection)
+            else if (!field_has_selection())
             {
-                prompt_has_selection = true;
-                prompt_sel_start = prompt_sel_end = input_cursor;
+                field_has_selection() = true;
+                field_sel_start() = field_sel_end() = field_cursor();
             }
-            input_cursor = key == XIM_LEFT ? utf8_prev(input, input_cursor)
-                : utf8_next(input, input_cursor);
-            if (select) prompt_sel_end = input_cursor;
+            field_cursor() = key == XIM_LEFT ? utf8_prev(text, field_cursor())
+                : utf8_next(text, field_cursor());
+            if (select) field_sel_end() = field_cursor();
             else clear_prompt_selection();
             return;
         }
         if (key == XIM_HOME || key == XIM_END)
         {
             bool select = (modifiers & XIM_SHIFT) != 0;
+            std::string &text = field_text();
             if (!select) clear_prompt_selection();
-            else if (!prompt_has_selection)
+            else if (!field_has_selection())
             {
-                prompt_has_selection = true;
-                prompt_sel_start = prompt_sel_end = input_cursor;
+                field_has_selection() = true;
+                field_sel_start() = field_sel_end() = field_cursor();
             }
-            input_cursor = key == XIM_HOME ? 0 : input.size();
-            if (select) prompt_sel_end = input_cursor;
+            field_cursor() = key == XIM_HOME ? 0 : text.size();
+            if (select) field_sel_end() = field_cursor();
             else clear_prompt_selection();
             return;
         }
         if (action == Action::erase)
         {
-            if (prompt_has_selection) delete_prompt_selection();
-            else if (input_cursor < input.size())
+            std::string &text = field_text();
+            if (field_has_selection()) delete_prompt_selection();
+            else if (field_cursor() < text.size())
             {
-                std::size_t next = utf8_next(input, input_cursor);
-                input.erase(input_cursor, next - input_cursor);
+                std::size_t next = utf8_next(text, field_cursor());
+                text.erase(field_cursor(), next - field_cursor());
                 prompt_input_changed();
             }
             selected = 0;
@@ -963,12 +1069,13 @@ extern "C" void xim_dispatch(int key, int modifiers)
         }
         if (action == Action::backspace)
         {
-            if (prompt_has_selection) delete_prompt_selection();
-            else if (input_cursor > 0)
+            std::string &text = field_text();
+            if (field_has_selection()) delete_prompt_selection();
+            else if (field_cursor() > 0)
             {
-                std::size_t prev = utf8_prev(input, input_cursor);
-                input.erase(prev, input_cursor - prev);
-                input_cursor = prev;
+                std::size_t prev = utf8_prev(text, field_cursor());
+                text.erase(prev, field_cursor() - prev);
+                field_cursor() = prev;
                 prompt_input_changed();
             }
             selected = 0;
@@ -976,10 +1083,10 @@ extern "C" void xim_dispatch(int key, int modifiers)
         }
         if (action == Action::select_all)
         {
-            prompt_has_selection = true;
-            prompt_sel_start = 0;
-            prompt_sel_end = input.size();
-            input_cursor = input.size();
+            field_has_selection() = true;
+            field_sel_start() = 0;
+            field_sel_end() = field_text().size();
+            field_cursor() = field_text().size();
             return;
         }
         if (action == Action::copy || action == Action::cut)
@@ -996,9 +1103,10 @@ extern "C" void xim_dispatch(int key, int modifiers)
         {
             delete_prompt_selection();
             std::string piece = encode_utf8(key);
-            std::size_t pos = std::min(input_cursor, input.size());
-            input.insert(pos, piece);
-            input_cursor = pos + piece.size();
+            std::string &text = field_text();
+            std::size_t pos = std::min(field_cursor(), text.size());
+            text.insert(pos, piece);
+            field_cursor() = pos + piece.size();
             selected = 0;
             prompt_input_changed();
             return;
@@ -1033,10 +1141,12 @@ extern "C" void xim_accept_paste(const char *text)
     {
         accept_when_ready = false;
         delete_prompt_selection();
-        std::size_t pos = std::min(input_cursor, input.size());
-        input.insert(pos, text);
-        input_cursor = pos + std::string(text).size();
+        std::string &field = field_text();
+        std::size_t pos = std::min(field_cursor(), field.size());
+        field.insert(pos, text);
+        field_cursor() = pos + std::string(text).size();
         selected = 0;
+        prompt_input_changed();
     }
 }
 
@@ -1102,10 +1212,12 @@ static std::string prompt_label()
     if (prompt == Action::open) return "Open: ";
     if (prompt == Action::save_as) return "Save as: ";
     if (prompt == Action::find) return "Find: ";
+    if (prompt == Action::replace) return "Find: ";
     if (prompt == Action::ex) return "Ex: ";
     if (prompt == Action::files) return "Files: ";
     if (prompt == Action::buffers) return "Buffers: ";
     if (prompt == Action::explorer) return "Explorer: ";
+    if (prompt == Action::search_project) return "Search: ";
     return "Command: ";
 }
 
@@ -1194,6 +1306,24 @@ void render_prompt_overlay(int menu_rows)
     // Cursor cells are resolved by the bridge for terminal placement. The
     // controller reports the caret cell inside the full prompt text so the
     // two-field replace prompt can place it in either field.
+    if (prompt == Action::replace)
+    {
+        const std::string find_label = "Find: ";
+        const std::string replace_label = "   Replace: ";
+        rendered_prompt_text = find_label + input + replace_label + replace_input;
+        if (active_field == 1)
+            rendered_prompt_cursor = static_cast<int>(
+                    (find_label + input + replace_label).size())
+                + cells_before(replace_input,
+                        std::min(replace_cursor, replace_input.size()));
+        else
+            rendered_prompt_cursor = static_cast<int>(find_label.size())
+                + cells_before(input, std::min(input_cursor, input.size()));
+        std::string info = prompt_info();
+        xim_engine_overlay(rendered_prompt_text.c_str(), items.c_str(),
+                info.c_str(), replace_error ? 1 : 0);
+        return;
+    }
     rendered_prompt_text = label + input;
     rendered_prompt_cursor = static_cast<int>(label.size())
         + cells_before(input, std::min(input_cursor, input.size()));

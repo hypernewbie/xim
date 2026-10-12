@@ -46,6 +46,12 @@ void xim_engine_highlight(const char *text, int case_sensitive, int *count);
 void xim_engine_clear_highlight(void);
 /* Peek the next decoded key without consuming it (Alt-letter detection). */
 int xim_engine_peek_key(void);
+/* Replace adapters: main-thread only, one undo block, UTF-8 aware. */
+int xim_engine_modifiable(void);
+int xim_engine_replace_all(const char *find, const char *replace,
+        int case_sensitive, int *count);
+int xim_engine_replace_one(const char *find, const char *replace,
+        int case_sensitive);
 void xim_engine_overlay(const char *prompt, const char *items, const char *info,
         int error);
 int xim_engine_menu_rows(void);

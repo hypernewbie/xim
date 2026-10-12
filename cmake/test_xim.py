@@ -1467,6 +1467,67 @@ def find_highlight(binary, root):
     print("Find highlight, case and navigation checks passed")
 
 
+def find_replace(binary, root):
+    """Replace-all is one undo block and read-only buffers refuse (Plan 5)."""
+    with tempfile.TemporaryDirectory(prefix="xim-replace-", dir=root) as temporary:
+        directory = Path(temporary)
+        (directory / "alpha.txt").write_text("alpha Beta gamma\nALPHA beta\n")
+        session = Session(binary, directory, ("alpha.txt",))
+        try:
+            session.send(b"\x08")  # Ctrl-H opens Replace
+            assert wait_screen(session, b"Replace:"), session.screen.text()
+            session.send("a")
+            assert wait_screen(session, b"8 matches  [Smart]"), session.screen.text()
+            session.send(b"\t")  # move to the replace field
+            session.send("X")
+            assert wait_screen(session, b"Replace: X"), session.screen.text()
+            session.send(b"\r")  # replace every match
+            assert wait_screen(session, b"0 matches"), session.screen.text()
+            session.send(b"\x1b")
+            session.ex("call writefile(getline(1, '$'), 'buffer')")
+            assert (directory / "buffer").read_text().splitlines() == \
+                ["XlphX BetX gXmmX", "XLPHX betX"], (directory / "buffer").read_text()
+            # One undo block restores the whole replace-all.
+            session.send(b"\x1a")  # Ctrl-Z
+            session.drain(.3)
+            session.ex("call writefile(getline(1, '$'), 'restored')")
+            assert (directory / "restored").read_text().splitlines() == \
+                ["alpha Beta gamma", "ALPHA beta"], (directory / "restored").read_text()
+            # Ctrl-R replaces one match at a time and advances.
+            session.send(b"\x08")
+            assert wait_screen(session, b"Replace:")
+            session.send("a")
+            session.send(b"\t")
+            session.send("X")
+            session.send(b"\x12")  # Ctrl-R
+            session.drain(.3)
+            session.send(b"\x12")
+            session.drain(.3)
+            session.send(b"\x1b")
+            session.ex("call writefile(getline(1, '$'), 'one')")
+            assert (directory / "one").read_text().splitlines() == \
+                ["XlphX Beta gamma", "ALPHA beta"], (directory / "one").read_text()
+        finally:
+            session.close()
+        # Read-only buffers refuse the replace and keep the error state.
+        session = Session(binary, directory, ("-R", "alpha.txt"))
+        try:
+            session.send(b"\x08")
+            assert wait_screen(session, b"Replace:"), session.screen.text()
+            session.send("a")
+            session.send(b"\t")
+            session.send("X")
+            session.send(b"\r")
+            assert wait_screen(session, b"read-only"), session.screen.text()
+            session.send(b"\x1b")
+            session.ex("call writefile(getline(1, '$'), 'buffer')")
+            assert (directory / "buffer").read_text().splitlines() == \
+                ["alpha Beta gamma", "ALPHA beta"], (directory / "buffer").read_text()
+        finally:
+            session.close()
+    print("Replace-all undo block and read-only refusal checks passed")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -1501,3 +1562,4 @@ if __name__ == "__main__":
     horizontal_wheel_direction(args.binary.resolve(), args.work.resolve())
     undo_redo_availability(args.binary.resolve(), args.work.resolve())
     find_highlight(args.binary.resolve(), args.work.resolve())
+    find_replace(args.binary.resolve(), args.work.resolve())

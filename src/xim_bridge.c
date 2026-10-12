@@ -914,6 +914,13 @@ xim_engine_find(const char *text, int backward, int case_sensitive)
     redraw_curbuf_later(UPD_NOT_VALID);
 }
 
+    static int
+xim_match_at(char_u *line, char_u *needle, size_t nlen, int case_sensitive)
+{
+    return case_sensitive ? STRNCMP(line, needle, nlen) == 0
+                          : mb_strnicmp2(line, needle, nlen, nlen) == 0;
+}
+
     /*
      * Count literal matches of text in the current buffer under the case rule,
      * capped so a huge match set cannot run away.  Non-overlapping, matching
@@ -937,9 +944,7 @@ xim_count_matches(const char *text, int case_sensitive, long cap)
         while (col < len)
         {
             if ((colnr_T)nlen <= len - col
-                    && (case_sensitive
-                        ? STRNCMP(line + col, needle, nlen) == 0
-                        : mb_strnicmp2(line + col, needle, nlen, nlen) == 0))
+                    && xim_match_at(line + col, needle, nlen, case_sensitive))
             {
                 ++count;
                 if (count >= cap)
@@ -1014,6 +1019,135 @@ xim_engine_highlight(const char *text, int case_sensitive, int *count)
     if (rettv.vval.v_number > 0)
         xim_find_match_id = (int)rettv.vval.v_number;
     redraw_curbuf_later(UPD_NOT_VALID);
+}
+
+    int
+xim_engine_modifiable(void)
+{
+    return curbuf->b_p_ma && !curbuf->b_p_ro ? 1 : 0;
+}
+
+    /*
+     * Replace every literal match of find with replace in the current buffer.
+     * All replacements form one undo block; matching is UTF-8 aware and uses
+     * the explicit case rule.  Returns the replacement count.
+     */
+    int
+xim_engine_replace_all(const char *find, const char *replace, int case_sensitive,
+        int *count)
+{
+    long replaced = 0;
+    size_t flen = STRLEN(find);
+    size_t rlen = STRLEN(replace);
+    linenr_T lnum;
+    garray_T newline;
+
+    if (count != NULL)
+        *count = 0;
+    if (flen == 0 || !xim_engine_modifiable())
+        return 0;
+    ++no_u_sync;
+    for (lnum = 1; lnum <= curbuf->b_ml.ml_line_count; ++lnum)
+    {
+        char_u *line = ml_get(lnum);
+        colnr_T len = ml_get_buf_len(curbuf, lnum);
+        colnr_T col = 0;
+        int changed = FALSE;
+
+        ga_init2(&newline, 1, (int)len + (int)rlen + 16);
+        while (col < len)
+        {
+            if ((colnr_T)flen <= len - col
+                    && xim_match_at(line + col, (char_u *)find, flen,
+                        case_sensitive))
+            {
+                if (rlen > 0)
+                    ga_concat_len(&newline, (char_u *)replace, rlen);
+                col += (colnr_T)flen;
+                ++replaced;
+                changed = TRUE;
+                continue;
+            }
+            ga_concat_len(&newline, line + col, (size_t)(*mb_ptr2len)(line + col));
+            col += (*mb_ptr2len)(line + col);
+        }
+        if (changed && newline.ga_data != NULL)
+        {
+            ga_append(&newline, NUL);
+            if (u_savesub(lnum) == OK)
+                ml_replace(lnum, newline.ga_data, TRUE);
+        }
+        ga_clear(&newline);
+    }
+    --no_u_sync;
+    u_sync(TRUE);
+    if (replaced > 0)
+    {
+        changed_lines(1, 0, curbuf->b_ml.ml_line_count + 1, 0);
+        redraw_curbuf_later(UPD_NOT_VALID);
+    }
+    if (count != NULL)
+        *count = (int)replaced;
+    return (int)replaced;
+}
+
+    /*
+     * Replace the first literal match at or after the cursor and leave the
+     * cursor after the replacement.  One undo block; UTF-8 aware.
+     */
+    int
+xim_engine_replace_one(const char *find, const char *replace, int case_sensitive)
+{
+    size_t flen = STRLEN(find);
+    size_t rlen = STRLEN(replace);
+    linenr_T lnum;
+    colnr_T start_col;
+
+    if (flen == 0 || !xim_engine_modifiable())
+        return 0;
+    lnum = curwin->w_cursor.lnum;
+    start_col = curwin->w_cursor.col;
+    for (; lnum <= curbuf->b_ml.ml_line_count; ++lnum, start_col = 0)
+    {
+        char_u *line = ml_get(lnum);
+        colnr_T len = ml_get_buf_len(curbuf, lnum);
+        colnr_T col = start_col;
+
+        while (col < len)
+        {
+            if ((colnr_T)flen <= len - col
+                    && xim_match_at(line + col, (char_u *)find, flen,
+                        case_sensitive))
+            {
+                garray_T newline;
+
+                ga_init2(&newline, 1, (int)len + (int)rlen + 16);
+                ga_concat_len(&newline, line, (size_t)col);
+                if (rlen > 0)
+                    ga_concat_len(&newline, (char_u *)replace, rlen);
+                ga_concat_len(&newline, line + col + flen,
+                        (size_t)(len - col - flen));
+                ga_append(&newline, NUL);
+                if (u_savesub(lnum) != OK)
+                {
+                    ga_clear(&newline);
+                    return 0;
+                }
+                ml_replace(lnum, newline.ga_data, TRUE);
+                ga_clear(&newline);
+                curwin->w_cursor.lnum = lnum;
+                curwin->w_cursor.col = col + (colnr_T)rlen;
+                check_cursor_col();
+                curwin->w_set_curswant = TRUE;
+                u_sync(TRUE);
+                changed_lines(lnum, 0, lnum + 1, 0);
+                redraw_curbuf_later(UPD_NOT_VALID);
+                return 1;
+            }
+            col += (*mb_ptr2len)(line + col);
+        }
+    }
+    return 0;
 }
 
     int
@@ -1545,6 +1679,8 @@ received:
         case K_PAGEDOWN: key = XIM_PAGE_DOWN; break;
         case K_DEL: case K_KDEL: key = XIM_DELETE; break;
         case K_BS: key = XIM_BACKSPACE; break;
+        case K_S_TAB: modifiers |= XIM_SHIFT; /* FALLTHROUGH */
+        case K_TAB: key = '\t'; break;
         case K_F1: key = XIM_F1; break;
         case K_F2: key = XIM_F2; break;
         case K_F3: key = XIM_F3; break;

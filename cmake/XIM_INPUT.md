@@ -41,6 +41,17 @@ UTF-8 caret with Left/Right, Home/End, Delete, Select all, clipboard and
 mouse placement. Picker activation reuses the last rendered rows so clicks
 and Enter agree.
 
+Find highlights every literal match through a window-local match list, not
+'hlsearch', so `xim --vim` and the compatibility dispatch are untouched. It
+reports a match count and a smart/insensitive/sensitive case rule at the
+right of the prompt row and never moves the caret while typing. Alt-C cycles
+the rule; a terminal without modifyOtherKeys delivers it as Escape followed
+by 'c', which the seam claims as the case toggle before treating Escape as a
+cancel. Replace edits a find field and a replace field on one line; Tab and
+Shift-Tab move between them. Replace-all and replace-one run through
+`u_savesub` as one undo block. A read-only or non-modifiable buffer refuses
+the change and the prompt enters its error state.
+
 Mouse input reuses the inherited SGR decoder; no second parser and no modal
 key injection exist. Click, Shift-click, drag, double/triple-click, wheel
 and middle/right buttons run through owning-thread adapters using

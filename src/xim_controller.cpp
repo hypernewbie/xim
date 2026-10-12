@@ -326,6 +326,12 @@ void prompt_input_changed()
 {
     // Any prompt edit clears a previous read-only refusal.
     replace_error = false;
+    if (prompt == Action::search_project)
+    {
+        // A new query starts from the first match.
+        selected = 0;
+        return;
+    }
     if (!prompt_is_find_like())
         return;
     // Editing the replace field does not change the highlight.

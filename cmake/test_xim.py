@@ -1509,6 +1509,23 @@ def find_replace(binary, root):
                 ["XlphX Beta gamma", "ALPHA beta"], (directory / "one").read_text()
         finally:
             session.close()
+        # Multibyte replace is UTF-8 safe.
+        (directory / "utf.txt").write_text("café café\n")
+        session = Session(binary, directory, ("utf.txt",))
+        try:
+            session.send(b"\x08")
+            assert wait_screen(session, b"Replace:"), session.screen.text()
+            session.send("é")
+            session.send(b"\t")
+            session.send("E")
+            session.send(b"\r")
+            session.drain(.3)
+            session.send(b"\x1b")
+            session.ex("call writefile(getline(1, '$'), 'utf')")
+            assert (directory / "utf").read_text().splitlines() == ["cafE cafE"], \
+                (directory / "utf").read_text()
+        finally:
+            session.close()
         # Read-only buffers refuse the replace and keep the error state.
         session = Session(binary, directory, ("-R", "alpha.txt"))
         try:
@@ -1596,6 +1613,32 @@ def project_content_search(binary, root):
     print("Project content search checks passed")
 
 
+def compatibility_unchanged(binary, root):
+    """xim --vim keeps inherited dispatch; native prompts never appear."""
+    with tempfile.TemporaryDirectory(prefix="xim-vim-", dir=root) as temporary:
+        directory = Path(temporary)
+        (directory / "alpha.txt").write_text(
+            "\n".join(f"line {i}" for i in range(1, 80)) + "\n")
+        session = Session(binary, directory, ("--vim", "alpha.txt"),
+                          ready=b"alpha.txt")
+        try:
+            # Ctrl-F is the inherited page-forward, not the native find prompt.
+            session.send(b"\x06")
+            session.drain(.4)
+            assert b"Find:" not in session.screen.text(), session.screen.text()
+            command = ("call writefile([string(line('.')) . ' ' "
+                       ". string(len(getmatches())) . ' ' . string(&hlsearch)], 'state')")
+            session.send(b":" + command.encode() + b"\r")
+            session.drain(.6)
+            line, matches, hlsearch = (directory / "state").read_text().strip().split()
+            assert int(line) > 1, (line, session.screen.text()[-200:])
+            assert matches == "0", matches
+            assert hlsearch == "0", hlsearch
+        finally:
+            session.close()
+    print("xim --vim compatibility checks passed")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -1632,3 +1675,4 @@ if __name__ == "__main__":
     find_highlight(args.binary.resolve(), args.work.resolve())
     find_replace(args.binary.resolve(), args.work.resolve())
     project_content_search(args.binary.resolve(), args.work.resolve())
+    compatibility_unchanged(args.binary.resolve(), args.work.resolve())

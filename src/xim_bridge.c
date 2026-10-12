@@ -915,10 +915,37 @@ xim_engine_find(const char *text, int backward, int case_sensitive)
 }
 
     static int
-xim_match_at(char_u *line, char_u *needle, size_t nlen, int case_sensitive)
+xim_ascii_needle(char_u *needle, size_t nlen)
 {
-    return case_sensitive ? STRNCMP(line, needle, nlen) == 0
-                          : mb_strnicmp2(line, needle, nlen, nlen) == 0;
+    size_t i;
+    for (i = 0; i < nlen; ++i)
+        if (needle[i] >= 0x80)
+            return FALSE;
+    return TRUE;
+}
+
+    static int
+xim_match_at(char_u *line, char_u *needle, size_t nlen, int case_sensitive,
+        int ascii)
+{
+    size_t i;
+    if (case_sensitive)
+        return STRNCMP(line, needle, nlen) == 0;
+    if (ascii)
+    {
+        // An all-ASCII needle can only match ASCII bytes, so fold bytes
+        // directly and skip the UTF-8 decode on the common path.
+        for (i = 0; i < nlen; ++i)
+        {
+            int left = line[i] >= 'A' && line[i] <= 'Z' ? line[i] + 32 : line[i];
+            int right = needle[i] >= 'A' && needle[i] <= 'Z'
+                ? needle[i] + 32 : needle[i];
+            if (left != right)
+                return FALSE;
+        }
+        return TRUE;
+    }
+    return mb_strnicmp2(line, needle, nlen, nlen) == 0;
 }
 
     /*
@@ -933,9 +960,11 @@ xim_count_matches(const char *text, int case_sensitive, long cap)
     size_t nlen = STRLEN(text);
     char_u *needle = (char_u *)text;
     linenr_T lnum;
+    int ascii;
 
     if (nlen == 0)
         return 0;
+    ascii = xim_ascii_needle(needle, nlen);
     for (lnum = 1; lnum <= curbuf->b_ml.ml_line_count; ++lnum)
     {
         char_u *line = ml_get(lnum);
@@ -944,7 +973,8 @@ xim_count_matches(const char *text, int case_sensitive, long cap)
         while (col < len)
         {
             if ((colnr_T)nlen <= len - col
-                    && xim_match_at(line + col, needle, nlen, case_sensitive))
+                    && xim_match_at(line + col, needle, nlen, case_sensitive,
+                        ascii))
             {
                 ++count;
                 if (count >= cap)
@@ -952,7 +982,9 @@ xim_count_matches(const char *text, int case_sensitive, long cap)
                 col += (colnr_T)nlen;
                 continue;
             }
-            col += (*mb_ptr2len)(line + col);
+            // An all-ASCII needle can only match ASCII bytes, so a byte step
+            // is safe and avoids the multibyte length lookup.
+            col += ascii ? 1 : (*mb_ptr2len)(line + col);
         }
     }
     return count;
@@ -1041,11 +1073,13 @@ xim_engine_replace_all(const char *find, const char *replace, int case_sensitive
     size_t rlen = STRLEN(replace);
     linenr_T lnum;
     garray_T newline;
+    int ascii;
 
     if (count != NULL)
         *count = 0;
     if (flen == 0 || !xim_engine_modifiable())
         return 0;
+    ascii = xim_ascii_needle((char_u *)find, flen);
     ++no_u_sync;
     for (lnum = 1; lnum <= curbuf->b_ml.ml_line_count; ++lnum)
     {
@@ -1059,7 +1093,7 @@ xim_engine_replace_all(const char *find, const char *replace, int case_sensitive
         {
             if ((colnr_T)flen <= len - col
                     && xim_match_at(line + col, (char_u *)find, flen,
-                        case_sensitive))
+                        case_sensitive, ascii))
             {
                 if (rlen > 0)
                     ga_concat_len(&newline, (char_u *)replace, rlen);
@@ -1068,8 +1102,8 @@ xim_engine_replace_all(const char *find, const char *replace, int case_sensitive
                 changed = TRUE;
                 continue;
             }
-            ga_concat_len(&newline, line + col, (size_t)(*mb_ptr2len)(line + col));
-            col += (*mb_ptr2len)(line + col);
+            ga_concat_len(&newline, line + col, (size_t)(ascii ? 1 : (*mb_ptr2len)(line + col)));
+            col += ascii ? 1 : (*mb_ptr2len)(line + col);
         }
         if (changed && newline.ga_data != NULL)
         {
@@ -1102,9 +1136,11 @@ xim_engine_replace_one(const char *find, const char *replace, int case_sensitive
     size_t rlen = STRLEN(replace);
     linenr_T lnum;
     colnr_T start_col;
+    int ascii;
 
     if (flen == 0 || !xim_engine_modifiable())
         return 0;
+    ascii = xim_ascii_needle((char_u *)find, flen);
     lnum = curwin->w_cursor.lnum;
     start_col = curwin->w_cursor.col;
     for (; lnum <= curbuf->b_ml.ml_line_count; ++lnum, start_col = 0)
@@ -1117,7 +1153,7 @@ xim_engine_replace_one(const char *find, const char *replace, int case_sensitive
         {
             if ((colnr_T)flen <= len - col
                     && xim_match_at(line + col, (char_u *)find, flen,
-                        case_sensitive))
+                        case_sensitive, ascii))
             {
                 garray_T newline;
 
@@ -1144,7 +1180,7 @@ xim_engine_replace_one(const char *find, const char *replace, int case_sensitive
                 redraw_curbuf_later(UPD_NOT_VALID);
                 return 1;
             }
-            col += (*mb_ptr2len)(line + col);
+            col += ascii ? 1 : (*mb_ptr2len)(line + col);
         }
     }
     return 0;

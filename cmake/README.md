@@ -118,6 +118,18 @@ at link time. Supply `--profile-dir PATH` to preserve gprof data; quit is
 orderly in that mode. Instrumented timings are diagnostic, not acceptance
 numbers. Inspect them with `gprof -p BINARY PATH/*.gmon`.
 
+For the native find, replace and project-search operations:
+
+```sh
+python3 cmake/benchmark_xim_search.py --binary build/dev/src/xim \
+    --work build/plan5/perf --runs 30 --output build/plan5/search-perf.json
+```
+
+It builds a 100000-line file and a 10000-file project, then measures the
+find keystrokes-to-highlight, replace-all, cold and warm project-search
+completion, and a one-second idle sample. `--self-test` runs one sample of
+each. Run it serially.
+
 ## Compatibility performance comparison
 
 Build the inherited reference with `make CC=clang` from `src/`, then build the

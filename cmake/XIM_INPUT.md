@@ -71,9 +71,9 @@ runtime or prefix-relative installed runtime, with VIMRUNTIME overrides.
 The current executable-location implementation targets Linux (`/proc/self/exe`).
 
 Engine adapters remain synchronous and main-thread-only. The project module
-has three persistent workers: a scanner with an owned root, a path matcher
-with an immutable shared path snapshot, and a content matcher that reads the
-indexed files. Requests coalesce and completion uses one latest-result slot
+has a scanner with an owned root and a path matcher with an immutable shared
+path snapshot; a third content matcher reads the indexed files and starts on
+the first project search. Requests coalesce and completion uses one latest-result slot
 plus a scan-change flag. Generations and query revisions reject obsolete
 results, with cancellation checks during walking, path matching and file
 reads. The content worker waits for a completed scan, skips files larger than

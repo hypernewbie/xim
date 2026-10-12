@@ -810,6 +810,24 @@ void scan_loop()
 void query_loop();
 void content_loop();
 
+// The content worker starts on the first project search so ordinary startup
+// does not pay for a thread it may never use.
+bool ensure_content_worker()
+{
+    if (content_worker.joinable()) return true;
+    if (worker_error != nullptr) return false;
+    try
+    {
+        content_worker = std::thread(content_loop);
+    }
+    catch (const std::system_error &)
+    {
+        worker_error = "Content worker startup failed";
+        return false;
+    }
+    return true;
+}
+
 bool ensure_workers()
 {
     if (scan_worker.joinable()) return true;
@@ -832,7 +850,6 @@ bool ensure_workers()
     {
         scan_worker = std::thread(scan_loop);
         query_worker = std::thread(query_loop);
-        content_worker = std::thread(content_loop);
     }
     catch (const std::system_error &)
     {
@@ -1158,6 +1175,7 @@ extern "C" char *
 xim_project_content(const char *query, int case_sensitive)
 {
     if (!ensure_workers()) return nullptr;
+    if (!ensure_content_worker()) return nullptr;
     std::string_view text = query == nullptr ? "" : query;
     std::lock_guard lock(state_lock);
     if (!active)

@@ -139,6 +139,7 @@ int main(int argc, char **argv)
             std::filesystem::create_directories(content);
             std::ofstream(content / "a.txt") << "hello world\nsecond hello\n";
             std::ofstream(content / "b.txt") << "Hello again\n";
+            std::ofstream(content / "u.txt") << "caf\xc3\xa9 caf\xc3\xa9\n";
             std::ofstream(content / "big.bin") << std::string(2 * 1024 * 1024, 'x');
             const char binary[] = {'h', 'e', 'l', 'l', 'o', '\0', 'w', '\n'};
             std::ofstream(content / "bin.dat", std::ios::binary)
@@ -156,6 +157,35 @@ int main(int argc, char **argv)
                 "case-sensitive match missing");
             require(sensitive.find("hello world") == std::string::npos,
                 "case-sensitive search matched lowercase");
+            auto utf = completed_content("\xc3\xa9", false);
+            require(utf.find("caf\xc3\xa9") != std::string::npos,
+                "UTF-8 content match missing");
+            require(utf.find("u.txt\t") != std::string::npos, "UTF-8 header missing");
+            // Match cap: 1500 matches in one file truncate at 1000.
+            {
+                std::ofstream stream(content / "many.txt");
+                for (int i = 0; i < 1500; ++i)
+                    stream << "cap needle " << i << "\n";
+            }
+            xim_project_init(content.c_str());
+            wait_scan();
+            auto capped = completed_content("cap needle", false);
+            std::size_t match_rows = 0;
+            for (std::size_t start = 0; start < capped.size(); )
+            {
+                auto end = capped.find('\n', start);
+                std::size_t stop = end == std::string::npos ? capped.size() : end;
+                auto tab = capped.find('\t', start);
+                // A match row carries a non-empty path after the display field.
+                if (tab != std::string::npos && tab < stop && tab + 1 < stop
+                        && capped[tab + 1] != '\t')
+                    ++match_rows;
+                if (end == std::string::npos) break;
+                start = end + 1;
+            }
+            require(match_rows == 1000, "content match cap not enforced");
+            require(capped.find("results truncated") != std::string::npos,
+                "truncation summary missing");
         }
         xim_project_disable();
         require(std::string(xim_project_status()).empty(), "disabled project reports indexing");

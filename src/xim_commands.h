@@ -10,7 +10,8 @@ enum class Action
     undo, redo, save, save_as, open, close, quit, find, next, previous,
     palette, ex, confirm, files, buffers, explorer, refresh, menu,
     new_buffer, toggle_wrap, toggle_number, toggle_mouse,
-    next_buffer, prev_buffer, help, about
+    next_buffer, prev_buffer, help, about, replace, search_project,
+    toggle_case, replace_one
 };
 Action resolve(int key, int modifiers);
 struct Command { std::string_view name; Action action; };
@@ -18,7 +19,9 @@ inline constexpr Command commands[] = {
     {"Save", Action::save}, {"Save as", Action::save_as},
     {"Open", Action::open}, {"Close", Action::close}, {"Quit", Action::quit},
     {"New", Action::new_buffer},
-    {"Find", Action::find}, {"Next match", Action::next},
+    {"Find", Action::find}, {"Replace", Action::replace},
+    {"Search project", Action::search_project},
+    {"Next match", Action::next},
     {"Previous match", Action::previous}, {"Select all", Action::select_all},
     {"Copy", Action::copy}, {"Cut", Action::cut}, {"Paste", Action::paste},
     {"Undo", Action::undo}, {"Redo", Action::redo}, {"Ex command", Action::ex},

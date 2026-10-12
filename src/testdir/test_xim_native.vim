@@ -90,7 +90,7 @@ endfunc
 
 func Test_xim_palette_scroll()
   let buf = s:StartXim()
-  call term_sendkeys(buf, "\<F1>" .. repeat("\<Down>", 15))
+  call term_sendkeys(buf, "\<F1>" .. repeat("\<Down>", 17))
   call WaitForAssert({-> assert_match('> Ex command', term_getline(buf, 8))}, 1000)
   call s:Dump(buf, 'Test_xim_palette_scroll')
   call term_sendkeys(buf, "\<Esc>")

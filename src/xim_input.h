@@ -38,8 +38,16 @@ char *xim_engine_clipboard(void);
 void xim_engine_free(char *text);
 int xim_engine_command(const char *command, const char *argument, int preserve_position);
 const char *xim_engine_error(void);
-void xim_engine_find(const char *text, int backward);
-void xim_engine_overlay(const char *prompt, const char *items, int error);
+void xim_engine_find(const char *text, int backward, int case_sensitive);
+/* Native all-match highlight: window-local match list, never 'hlsearch'.
+ * Updates the highlight for text and reports the match count. Main thread
+ * only; does not move the caret or selection. */
+void xim_engine_highlight(const char *text, int case_sensitive, int *count);
+void xim_engine_clear_highlight(void);
+/* Peek the next decoded key without consuming it (Alt-letter detection). */
+int xim_engine_peek_key(void);
+void xim_engine_overlay(const char *prompt, const char *items, const char *info,
+        int error);
 int xim_engine_menu_rows(void);
 int xim_engine_columns(void);
 void xim_engine_boundary(void);

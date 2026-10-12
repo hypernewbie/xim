@@ -23,6 +23,21 @@ std::string clipboard;
 std::string query;
 Action prompt = Action::ignore;
 std::size_t selected = 0;
+// Native find/replace case rule and all-match highlight state. The case rule
+// is smart by default: insensitive until the query contains an uppercase
+// letter. Alt-C cycles it explicitly.
+enum class CaseRule { smart, insensitive, sensitive };
+CaseRule prompt_case = CaseRule::smart;
+int find_match_count = 0;
+// Case rule used by F3/Shift-F3 after the find prompt has closed.
+bool query_case_sensitive = false;
+// A letter that follows Escape and has already been claimed as an Alt
+// shortcut; the next decoded key with this value is dropped.
+int swallow_key = 0;
+// The full prompt text and caret cell reported to the bridge for the frame;
+// the two-field replace prompt cannot derive the caret from the input alone.
+std::string rendered_prompt_text;
+int rendered_prompt_cursor = 0;
 Action pending = Action::ignore;
 std::string pending_path;
 std::string pending_error;
@@ -231,6 +246,30 @@ void clear_prompt_selection()
     prompt_sel_start = prompt_sel_end = 0;
 }
 
+bool prompt_is_find_like()
+{
+    return prompt == Action::find || prompt == Action::replace;
+}
+
+// Smart case: an uppercase letter in the query makes the match case-sensitive.
+bool prompt_case_sensitive()
+{
+    if (prompt_case == CaseRule::sensitive) return true;
+    if (prompt_case == CaseRule::insensitive) return false;
+    for (unsigned char c : input)
+        if (c >= 'A' && c <= 'Z') return true;
+    return false;
+}
+
+std::string case_label()
+{
+    if (prompt_case == CaseRule::sensitive) return "Aa";
+    if (prompt_case == CaseRule::insensitive) return "aa";
+    return "Smart";
+}
+
+void prompt_input_changed();
+
 void delete_prompt_selection()
 {
     if (!prompt_has_selection) return;
@@ -241,6 +280,33 @@ void delete_prompt_selection()
     input.erase(start, end - start);
     input_cursor = start;
     clear_prompt_selection();
+    prompt_input_changed();
+}
+
+// Update the all-match highlight whenever the find query changes. Native
+// highlight is window-local match state; it never touches 'hlsearch'.
+void prompt_input_changed()
+{
+    if (prompt_is_find_like())
+        xim_engine_highlight(input.c_str(), prompt_case_sensitive(), &find_match_count);
+}
+
+void clear_find_highlight()
+{
+    xim_engine_clear_highlight();
+    find_match_count = 0;
+}
+
+// Right-aligned prompt status: match count and the active case rule.
+std::string prompt_info()
+{
+    if (!prompt_is_find_like())
+        return {};
+    std::string info = std::to_string(find_match_count);
+    info += find_match_count == 1 ? " match  [" : " matches  [";
+    info += case_label();
+    info += "]";
+    return info;
 }
 
 std::vector<const xim::Command *> filtered()
@@ -305,6 +371,8 @@ void begin(Action action)
     xim_project_cancel_query();
     accept_when_ready = false;
     xim_engine_boundary();
+    clear_find_highlight();
+    prompt_case = CaseRule::smart;
     prompt = action;
     input.clear();
     input_cursor = 0;
@@ -363,6 +431,7 @@ void execute(Action action)
             else begin(Action::save_as);
             break;
         case Action::save_as: case Action::open: case Action::find:
+        case Action::replace: case Action::search_project:
         case Action::palette: case Action::ex: case Action::files:
         case Action::buffers: case Action::explorer: begin(action); break;
         case Action::refresh: xim_project_refresh(); break;
@@ -425,6 +494,7 @@ void execute(Action action)
                 input.insert(pos, payload);
                 input_cursor = pos + std::string(payload).size();
                 selected = 0;
+                prompt_input_changed();
             }
             else
                 xim_engine_paste(payload);
@@ -432,8 +502,16 @@ void execute(Action action)
         }
         case Action::undo: case Action::redo: xim_engine_undo(action == Action::redo); break;
         case Action::next: case Action::previous:
-            if (!query.empty()) xim_engine_find(query.c_str(), action == Action::previous);
+            if (!query.empty())
+                xim_engine_find(query.c_str(), action == Action::previous,
+                        query_case_sensitive);
             else begin(Action::find);
+            break;
+        case Action::toggle_case:
+            prompt_case = prompt_case == CaseRule::smart ? CaseRule::insensitive
+                : prompt_case == CaseRule::insensitive ? CaseRule::sensitive
+                : CaseRule::smart;
+            prompt_input_changed();
             break;
         default: break;
     }
@@ -567,7 +645,9 @@ bool activate_current_row(Action current)
     if (current == Action::find)
     {
         query = input;
-        xim_engine_find(query.c_str(), false);
+        query_case_sensitive = prompt_case_sensitive();
+        if (!query.empty())
+            xim_engine_find(query.c_str(), false, query_case_sensitive);
         return true;
     }
     if (current == Action::files || current == Action::buffers
@@ -635,6 +715,11 @@ extern "C" int xim_menu_active() { return menu_open ? 1 : 0; }
 extern "C" void xim_dispatch(int key, int modifiers)
 {
     auto action = xim::resolve(key, modifiers);
+    if (swallow_key != 0 && key == swallow_key)
+    {
+        swallow_key = 0;
+        return;
+    }
     if (handle_menu_key(key, modifiers)) return;
     if (menu_open && action == Action::cancel)
     {
@@ -658,9 +743,23 @@ extern "C" void xim_dispatch(int key, int modifiers)
     {
         if (action == Action::cancel)
         {
+            // Terminals that do not enable modifyOtherKeys deliver Alt-C as
+            // Escape followed by 'c'. Claim the pending letter as the case
+            // toggle before treating Escape as a cancel.
+            if (prompt_is_find_like())
+            {
+                int next = xim_engine_peek_key();
+                if (next == 'c' || next == 'C')
+                {
+                    swallow_key = next;
+                    execute(Action::toggle_case);
+                    return;
+                }
+            }
             xim_project_cancel_query();
             accept_when_ready = false;
             deferred_keys.clear();
+            clear_find_highlight();
             prompt = Action::ignore;
             input.clear();
             input_cursor = 0;
@@ -702,6 +801,17 @@ extern "C" void xim_dispatch(int key, int modifiers)
         if (key == '\r' || key == '\n')
         {
             Action current = prompt;
+            if (current == Action::find)
+            {
+                // Enter finds the next match, Shift-Enter the previous, and
+                // keeps the prompt open so the highlight stays live.
+                query = input;
+                query_case_sensitive = prompt_case_sensitive();
+                if (!query.empty())
+                    xim_engine_find(query.c_str(), (modifiers & XIM_SHIFT) != 0,
+                            query_case_sensitive);
+                return;
+            }
             if (current == Action::files)
             {
                 (void)project_items(current, input);
@@ -846,6 +956,7 @@ extern "C" void xim_dispatch(int key, int modifiers)
             {
                 std::size_t next = utf8_next(input, input_cursor);
                 input.erase(input_cursor, next - input_cursor);
+                prompt_input_changed();
             }
             selected = 0;
             return;
@@ -858,6 +969,7 @@ extern "C" void xim_dispatch(int key, int modifiers)
                 std::size_t prev = utf8_prev(input, input_cursor);
                 input.erase(prev, input_cursor - prev);
                 input_cursor = prev;
+                prompt_input_changed();
             }
             selected = 0;
             return;
@@ -888,6 +1000,7 @@ extern "C" void xim_dispatch(int key, int modifiers)
             input.insert(pos, piece);
             input_cursor = pos + piece.size();
             selected = 0;
+            prompt_input_changed();
             return;
         }
         if (action == Action::move)
@@ -963,10 +1076,11 @@ extern "C" int xim_prompt_place(int screen_col)
 
 extern "C" void xim_prompt_get(int *cursor_cells, int *length_cells)
 {
-    int cursor = cells_before(input, std::min(input_cursor, input.size()));
-    int length = cells_before(input, input.size());
-    if (cursor_cells) *cursor_cells = cursor;
-    if (length_cells) *length_cells = length;
+    // Absolute caret cell inside the rendered prompt text, set by the last
+    // render pass. The bridge places the terminal cursor here.
+    if (cursor_cells) *cursor_cells = rendered_prompt_cursor;
+    if (length_cells)
+        *length_cells = cells_before(rendered_prompt_text, rendered_prompt_text.size());
 }
 
 extern "C" void xim_prompt_selection(int *start_cells, int *end_cells)
@@ -1016,7 +1130,10 @@ void render_prompt_overlay(int menu_rows)
     if (prompt == Action::confirm)
     {
         auto error = pending_error.empty() ? "" : pending_error + "\n";
-        xim_engine_overlay(std::string(kConfirmPrompt).c_str(), error.c_str(), true);
+        rendered_prompt_text = kConfirmPrompt;
+        // Keep the terminal cursor at the end of the confirmation line.
+        rendered_prompt_cursor = static_cast<int>(kConfirmPrompt.size());
+        xim_engine_overlay(rendered_prompt_text.c_str(), error.c_str(), "", true);
         return;
     }
     if (prompt == Action::ignore) return;
@@ -1074,8 +1191,14 @@ void render_prompt_overlay(int menu_rows)
             }
         }
     }
-    // Cursor cells are resolved by the bridge for terminal placement.
-    xim_engine_overlay((label + input).c_str(), items.c_str(), false);
+    // Cursor cells are resolved by the bridge for terminal placement. The
+    // controller reports the caret cell inside the full prompt text so the
+    // two-field replace prompt can place it in either field.
+    rendered_prompt_text = label + input;
+    rendered_prompt_cursor = static_cast<int>(label.size())
+        + cells_before(input, std::min(input_cursor, input.size()));
+    std::string info = prompt_info();
+    xim_engine_overlay(rendered_prompt_text.c_str(), items.c_str(), info.c_str(), false);
 }
 
 void render_menu_popup(int columns, int menu_rows, unsigned caps)

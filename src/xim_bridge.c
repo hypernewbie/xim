@@ -866,20 +866,41 @@ xim_engine_error(void)
     return (const char *)get_vim_var_str(VV_ERRMSG);
 }
 
+    /*
+     * Build the literal search pattern for native find/replace.  The text is
+     * taken verbatim (\V very nomagic) with backslashes escaped; the case rule
+     * is explicit (\c case-insensitive, \C case-sensitive) so it never depends
+     * on the 'ignorecase' option.  Caller frees the result.
+     */
+    static char_u *
+xim_literal_pattern(const char *text, int case_sensitive)
+{
+    char_u *escaped = vim_strsave_escaped((char_u *)text, (char_u *)"\\");
+    char_u *pattern;
+    if (escaped == NULL)
+        return NULL;
+    pattern = alloc(STRLEN(escaped) + 5);
+    if (pattern == NULL)
+    {
+        vim_free(escaped);
+        return NULL;
+    }
+    STRCPY(pattern, (char_u *)"\\V");
+    STRCAT(pattern, (char_u *)(case_sensitive ? "\\C" : "\\c"));
+    STRCAT(pattern, escaped);
+    vim_free(escaped);
+    return pattern;
+}
+
     void
-xim_engine_find(const char *text, int backward)
+xim_engine_find(const char *text, int backward, int case_sensitive)
 {
     pos_T result = curwin->w_cursor;
-    char_u *escaped;
     char_u *pattern;
     if (*text == NUL)
         return;
     xim_engine_cancel();
-    escaped = vim_strsave_escaped((char_u *)text, (char_u *)"\\");
-    if (escaped == NULL)
-        return;
-    pattern = concat_str((char_u *)"\\V", escaped);
-    vim_free(escaped);
+    pattern = xim_literal_pattern(text, case_sensitive);
     if (pattern == NULL)
         return;
     if (searchit(curwin, curbuf, &result, NULL, backward ? BACKWARD : FORWARD,
@@ -890,6 +911,108 @@ xim_engine_find(const char *text, int backward)
         curwin->w_set_curswant = TRUE;
     }
     vim_free(pattern);
+    redraw_curbuf_later(UPD_NOT_VALID);
+}
+
+    /*
+     * Count literal matches of text in the current buffer under the case rule,
+     * capped so a huge match set cannot run away.  Non-overlapping, matching
+     * the window highlight regexp.
+     */
+    static long
+xim_count_matches(const char *text, int case_sensitive, long cap)
+{
+    long count = 0;
+    size_t nlen = STRLEN(text);
+    char_u *needle = (char_u *)text;
+    linenr_T lnum;
+
+    if (nlen == 0)
+        return 0;
+    for (lnum = 1; lnum <= curbuf->b_ml.ml_line_count; ++lnum)
+    {
+        char_u *line = ml_get(lnum);
+        colnr_T len = ml_get_buf_len(curbuf, lnum);
+        colnr_T col = 0;
+        while (col < len)
+        {
+            if ((colnr_T)nlen <= len - col
+                    && (case_sensitive
+                        ? STRNCMP(line + col, needle, nlen) == 0
+                        : mb_strnicmp2(line + col, needle, nlen, nlen) == 0))
+            {
+                ++count;
+                if (count >= cap)
+                    return count;
+                col += (colnr_T)nlen;
+                continue;
+            }
+            col += (*mb_ptr2len)(line + col);
+        }
+    }
+    return count;
+}
+
+    static int xim_find_match_id = 0;
+
+    int
+xim_engine_peek_key(void)
+{
+    return vpeekc();
+}
+
+    void
+xim_engine_clear_highlight(void)
+{
+    if (xim_find_match_id <= 0)
+        return;
+    typval_T argv[3];
+    typval_T rettv;
+    CLEAR_FIELD(argv);
+    CLEAR_FIELD(rettv);
+    argv[0].v_type = VAR_NUMBER;
+    argv[0].vval.v_number = xim_find_match_id;
+    f_matchdelete(argv, &rettv);
+    xim_find_match_id = 0;
+    redraw_curbuf_later(UPD_NOT_VALID);
+}
+
+    void
+xim_engine_highlight(const char *text, int case_sensitive, int *count)
+{
+    char_u *pattern;
+    typval_T argv[5];
+    typval_T rettv;
+    long matches = 0;
+
+    xim_engine_clear_highlight();
+    if (text == NULL || *text == NUL)
+    {
+        if (count != NULL)
+            *count = 0;
+        return;
+    }
+    matches = xim_count_matches(text, case_sensitive, 1000000L);
+    if (count != NULL)
+        *count = (int)matches;
+    if (matches == 0)
+        return;
+    pattern = xim_literal_pattern(text, case_sensitive);
+    if (pattern == NULL)
+        return;
+    CLEAR_FIELD(argv);
+    CLEAR_FIELD(rettv);
+    rettv.v_type = VAR_NUMBER;
+    argv[0].v_type = VAR_STRING;
+    argv[0].vval.v_string = (char_u *)"XimFindMatch";
+    argv[1].v_type = VAR_STRING;
+    argv[1].vval.v_string = pattern;
+    argv[2].v_type = VAR_NUMBER;
+    argv[2].vval.v_number = 100;
+    f_matchadd(argv, &rettv);
+    vim_free(pattern);
+    if (rettv.vval.v_number > 0)
+        xim_find_match_id = (int)rettv.vval.v_number;
     redraw_curbuf_later(UPD_NOT_VALID);
 }
 
@@ -1082,7 +1205,8 @@ xim_clear_menu_popup(void)
 }
 
     void
-xim_engine_overlay(const char *prompt, const char *items, int error)
+xim_engine_overlay(const char *prompt, const char *items, const char *info,
+        int error)
 {
     int row = (int)Rows - 2;
     const char *end;
@@ -1149,17 +1273,27 @@ xim_engine_overlay(const char *prompt, const char *items, int error)
     screen_fill((int)Rows - 1, (int)Rows,
             MIN(vim_strsize((char_u *)prompt), (int)Columns), (int)Columns,
             ' ', ' ', attr);
+    if (info != NULL && *info != NUL)
+    {
+        // Right-aligned status (match count, case rule) on the prompt row.
+        int info_attr = syn_name2attr((char_u *)"XimPromptInfo");
+        if (info_attr == 0)
+            info_attr = attr;
+        int info_cells = vim_strsize((char_u *)info);
+        int info_col = (int)Columns - info_cells;
+        if (info_col < 0)
+            info_col = 0;
+        screen_puts_len((char_u *)info, (int)STRLEN(info), (int)Rows - 1,
+                info_col, info_attr);
+    }
     {
         int cursor_cells = 0;
         int length_cells = 0;
         extern void xim_prompt_get(int *, int *);
+        // The controller reports the caret cell inside the full prompt text.
         xim_prompt_get(&cursor_cells, &length_cells);
-        int label_cells = vim_strsize((char_u *)prompt) - length_cells;
-        if (label_cells < 0)
-            label_cells = (int)STRLEN(prompt) - length_cells;
-        if (label_cells < 0)
-            label_cells = 0;
-        int cursor_col = label_cells + cursor_cells;
+        (void)length_cells;
+        int cursor_col = cursor_cells;
         if (cursor_col >= Columns)
             cursor_col = Columns - 1;
         if (cursor_col < 0)
@@ -1255,6 +1389,8 @@ xim_initialize(void)
     do_highlight((char_u *)"default link XimPaletteSel PmenuSel", FALSE, FALSE);
     do_highlight((char_u *)"default link XimMenuBar StatusLine", FALSE, FALSE);
     do_highlight((char_u *)"default link XimMenuSel PmenuSel", FALSE, FALSE);
+    do_highlight((char_u *)"default link XimFindMatch Search", FALSE, FALSE);
+    do_highlight((char_u *)"default link XimPromptInfo Comment", FALSE, FALSE);
     do_cmdline_cmd((char_u *)"set statusline=%#XimStatus#\\ Xim\\ %f\\ %m%=%l:%c\\ ");
     do_cmdline_cmd((char_u *)"syntax enable");
     setmouse();

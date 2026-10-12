@@ -4,6 +4,7 @@ import argparse
 import fcntl
 import os
 import pty
+import re
 import select
 import shutil
 import signal
@@ -169,8 +170,9 @@ def run(binary, root, themes=()):
             assert session.snapshot() == "!second\nthird\n"
             session.send(b"\x1a")
             assert session.snapshot() == "α\t界\nsecond\nthird\n"
-            # Find and next/previous without modal commands.
-            session.send(b"\x06third\r")
+            # Find and next/previous without modal commands. Enter navigates
+            # and keeps the prompt open; Escape closes it.
+            session.send(b"\x06third\r\x1b")
             session.ex("call writefile([string(line('.'))], 'position')")
             assert (directory / "position").read_text() == "3\n"
             # Save-as handles spaces and command metacharacters as filename text.
@@ -228,7 +230,7 @@ def run(binary, root, themes=()):
             session.send(b"d")
             assert session.snapshot() == "other\n"
             # UTF-8 prompt backspace removes the entire codepoint.
-            session.send("\x06界\x7fother\r")
+            session.send("\x06界\x7fother\r\x1b")
             session.ex("call writefile([string(col('.'))], 'position')")
             assert (directory / "position").read_text() == "1\n"
             # Unicode navigation/deletion and joins at line boundaries.
@@ -1391,18 +1393,19 @@ def undo_redo_availability(binary, root):
         directory = Path(temporary)
         session = Session(binary, directory)
         try:
-            # Fresh buffer: neither Undo nor Redo can run.
+            # Fresh buffer: neither Undo nor Redo can run, and the Edit menu
+            # shows both disabled. The first enabled entry is Select all.
             session.send(b"\x1b[21~")
             session.wait(b"New")
             session.send(b"\x1b[C")
             session.drain(.2)
-            session.send(b"\x1b[B")
-            session.drain(.2)
+            assert b"Undo" in session.screen.text() and b"(disabled)" in session.screen.text()
             session.send(b"\r")
             session.drain(.3)
             assert b"Already at newest change" not in session.screen.text()
             assert b"Already at oldest change" not in session.screen.text()
-            # After a change Undo becomes reachable and works.
+            # After a change Undo becomes reachable and works. Opening the
+            # Edit menu now selects Undo as the first enabled entry.
             session.send(b"abc")
             session.drain(.2)
             session.send(b"\x1b[21~")
@@ -1415,6 +1418,53 @@ def undo_redo_availability(binary, root):
         finally:
             session.close()
     print("Undo/redo availability checks passed")
+
+
+def caret(session):
+    """Read the line:col from the status line above the prompt row."""
+    line = "".join(session.screen.lines[-2]).rstrip()
+    match = re.search(r"(\d+):(\d+)", line)
+    assert match, f"no caret on the status line: {line!r}"
+    return (int(match.group(1)), int(match.group(2)))
+
+
+def find_highlight(binary, root):
+    """Find highlights all matches, cycles case and navigates (Plan 5)."""
+    with tempfile.TemporaryDirectory(prefix="xim-find-", dir=root) as temporary:
+        directory = Path(temporary)
+        (directory / "alpha.txt").write_text("alpha Beta gamma\nALPHA beta\n")
+        session = Session(binary, directory, ("alpha.txt",))
+        try:
+            start = caret(session)
+            session.send(b"\x06")  # Ctrl-F
+            assert wait_screen(session, b"Find:"), "find prompt did not open"
+            assert wait_screen(session, b"0 matches  [Smart]"), session.screen.text()
+            session.send("a")
+            assert wait_screen(session, b"8 matches  [Smart]"), session.screen.text()
+            # Typing never moves the caret.
+            assert caret(session) == start, (start, caret(session))
+            # Alt-C cycles smart -> insensitive -> sensitive.
+            session.send(b"\x1bc")
+            assert wait_screen(session, b"[aa]"), session.screen.text()
+            session.send(b"\x1bc")
+            assert wait_screen(session, b"6 matches  [Aa]"), session.screen.text()
+            # Enter navigates to a match and keeps the prompt open.
+            session.send(b"\r")
+            assert wait_screen(session, b"matches  [Aa]"), session.screen.text()
+            assert caret(session) != start, "Enter did not move the caret"
+            # Escape closes the prompt and clears the native highlight.
+            session.send(b"\x1b")
+            assert wait_screen(session, b"Find:", present=False), "find survived Escape"
+            session.ex("call writefile([string(len(getmatches()))], 'matches')")
+            assert (directory / "matches").read_text().strip() == "0", "highlight leaked"
+            # F3 reuses the stored query and advances to the next match.
+            before = caret(session)
+            session.send(b"\x1bOR")  # F3
+            session.drain(.3)
+            assert caret(session) != before, "F3 did not advance"
+        finally:
+            session.close()
+    print("Find highlight, case and navigation checks passed")
 
 
 if __name__ == "__main__":
@@ -1450,3 +1500,4 @@ if __name__ == "__main__":
     menu_overlay_cleanup(args.binary.resolve(), args.work.resolve())
     horizontal_wheel_direction(args.binary.resolve(), args.work.resolve())
     undo_redo_availability(args.binary.resolve(), args.work.resolve())
+    find_highlight(args.binary.resolve(), args.work.resolve())

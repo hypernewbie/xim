@@ -12,7 +12,9 @@ int main()
         {XIM_LEFT, XIM_SHIFT, Action::move}, {XIM_F3, XIM_SHIFT, Action::previous},
         {XIM_BACKSPACE, 0, Action::backspace}, {XIM_IGNORE, 0, Action::ignore},
         {'a', XIM_ALT, Action::ignore}, {XIM_F10, 0, Action::menu},
-        {25, 0, Action::redo}, {14, 0, Action::new_buffer}
+        {25, 0, Action::redo}, {14, 0, Action::new_buffer},
+        {8, 0, Action::replace}, {6, XIM_SHIFT, Action::search_project},
+        {'c', XIM_ALT, Action::toggle_case}, {XIM_BACKSPACE, XIM_SHIFT, Action::backspace}
     };
     for (const auto &test : cases)
         if (xim::resolve(test.key, test.modifiers) != test.action)

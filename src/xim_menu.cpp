@@ -19,6 +19,8 @@ constexpr MenuItem kEditItems[] = {
     {"Copy", "Ctrl-C", Action::copy, kHasSelection, 0},
     {"Paste", "Ctrl-V", Action::paste, kHasClipboard, 0},
     {"Select all", "Ctrl-A", Action::select_all, 0, 0},
+    {"Find", "Ctrl-F", Action::find, 0, 0},
+    {"Replace", "Ctrl-H", Action::replace, 0, 0},
 };
 constexpr MenuItem kViewItems[] = {
     {"Command palette", "Ctrl-Shift-P", Action::palette, 0, 0},
@@ -30,7 +32,7 @@ constexpr MenuItem kViewItems[] = {
 };
 constexpr MenuItem kNavigateItems[] = {
     {"Files", "Ctrl-P", Action::files, 0, 0},
-    {"Find", "Ctrl-F", Action::find, 0, 0},
+    {"Search project", "Ctrl-Shift-F", Action::search_project, 0, 0},
     {"Next match", "F3", Action::next, kHasQuery, 0},
     {"Previous match", "Shift-F3", Action::previous, kHasQuery, 0},
     {"Next buffer", "", Action::next_buffer, 0, 0},

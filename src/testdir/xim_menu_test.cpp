@@ -43,7 +43,9 @@ int main()
     int first_enabled = xim::menu_next(MenuGroup::edit, -1, 1,
             xim::kCanUndo | xim::kCanRedo);
     if (first_enabled != 0) return 1;
-    int wrapped = xim::menu_next(MenuGroup::edit, 5, 1,
+    // The Edit group ends with Find/Replace; stepping past the last entry
+    // wraps to the first enabled one.
+    int wrapped = xim::menu_next(MenuGroup::edit, 7, 1,
             xim::kCanUndo | xim::kCanRedo | xim::kHasSelection | xim::kHasClipboard);
     if (wrapped != 0) return 1;
     // Geometry: bar headings share one row, narrow screens clip but keep IDs.

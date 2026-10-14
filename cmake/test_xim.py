@@ -107,9 +107,11 @@ class Session:
             ack.unlink()
         except FileNotFoundError:
             pass
-        self.send(b"\x1bOPEx command\r")
-        self.wait(b"Ex:")
-        self.send(command + f"|call writefile(['{self.serial}'], '{ack}')\r")
+        # One sequential stream: palette, entry, command, Enter. Waiting for
+        # the "Ex: " prompt row here raced a stale row restored from a find
+        # prompt snapshot, which fired the command into the buffer instead.
+        self.send(b"\x1bOPEx command\r"
+                  + (command + f"|call writefile(['{self.serial}'], '{ack}')\r").encode())
         if not self.wait_for_file(ack, str(self.serial), timeout=15):
             raise AssertionError(f"Ex command did not finish: {command!r}")
         return b""
@@ -279,6 +281,9 @@ def run(binary, root, themes=()):
         readonly.write_text("original\n")
         session = Session(binary, directory, ("-R", str(readonly)))
         try:
+            # The first paint can precede the argument-file read; typing
+            # before the buffer renders would interrupt the load.
+            session.wait(b"readonly.txt")
             session.send("changed\x13")
             session.wait(b"E45")
             assert readonly.read_text() == "original\n"
@@ -1452,6 +1457,29 @@ def find_highlight(binary, root):
             session.send(b"\r")
             assert wait_screen(session, b"matches  [Aa]"), session.screen.text()
             assert caret(session) != start, "Enter did not move the caret"
+            # F3 and Shift-F3 navigate while the prompt stays open. Use a
+            # fresh query with exactly two matches so the round trip is
+            # deterministic (wrapping cannot hide the direction).
+            session.send(b"\x1b")
+            session.ex("call cursor(1, 1)")
+            session.send(b"\x06")
+            session.send(b"beta")
+            assert wait_screen(session, b"2 matches  [Smart]"), session.screen.text()
+            session.send(b"\r")
+            session.drain(.3)
+            first = caret(session)
+            assert first == (1, 7), first
+            session.send(b"\x1bOR")  # F3
+            session.drain(.3)
+            assert caret(session) == (2, 7), (first, caret(session))
+            session.send(b"\x1b[13;2~")  # Shift-F3
+            session.drain(.3)
+            assert caret(session) == first, "Shift-F3 did not go back"
+            # A distinctly reported Alt-C cycles the case rule, not text.
+            session.send(b"\x1b[27;3;99~")  # Alt-C via modifyOtherKeys
+            assert wait_screen(session, b"[aa]"), session.screen.text()
+            assert b"Find: beta\xc3\xa3" not in session.screen.text(), \
+                session.screen.text()
             # Escape closes the prompt and clears the native highlight.
             session.send(b"\x1b")
             assert wait_screen(session, b"Find:", present=False), "find survived Escape"
@@ -1465,6 +1493,77 @@ def find_highlight(binary, root):
         finally:
             session.close()
     print("Find highlight, case and navigation checks passed")
+
+
+def find_unicode(binary, root):
+    """Count, replace and smart case agree under Unicode folding (Plan 5)."""
+    with tempfile.TemporaryDirectory(prefix="xim-unicode-", dir=root) as temporary:
+        directory = Path(temporary)
+        (directory / "u.txt").write_text("\u017f s\n\u2c6a \u2c6a\n\u00c9 \u00e9\n")
+        session = Session(binary, directory, ("u.txt",))
+        try:
+            # A long s folds to s: both characters on line one match.
+            session.send(b"\x06s")
+            assert wait_screen(session, b"2 matches  [Smart]"), session.screen.text()
+            session.send(b"\x1b")
+            # Insensitive replacement handles a folded pair whose byte length
+            # differs from the query: both codepoints are replaced.
+            session.send("\x08\u2c6a".encode())
+            assert wait_screen(session, b"2 matches  [Smart]"), session.screen.text()
+            session.send(b"\x1bc")  # smart -> insensitive is explicit here
+            assert wait_screen(session, b"2 matches  [aa]"), session.screen.text()
+            session.send(b"\tX\r")
+            session.drain(.3)
+            session.send(b"\x1b")
+            session.ex("call writefile(getline(1, '$'), 'u')")
+            assert (directory / "u").read_text() == "\u017f s\nX X\n\u00c9 \u00e9\n", \
+                repr((directory / "u").read_text())
+            # Smart case sees non-ASCII uppercase: the query turns sensitive.
+            session.send("\x06\u00c9".encode())
+            assert wait_screen(session, b"1 match  [Smart]"), session.screen.text()
+            session.send(b"\x1b")
+        finally:
+            session.close()
+    print("Unicode find checks passed")
+
+
+def find_highlight_window(binary, root):
+    """The highlight is deleted from its own window after a window switch."""
+    with tempfile.TemporaryDirectory(prefix="xim-findwin-", dir=root) as temporary:
+        directory = Path(temporary)
+        (directory / "alpha.txt").write_text("alpha alpha\n")
+        session = Session(binary, directory, ("alpha.txt",))
+        try:
+            session.ex("let v:errmsg = ''")
+            # The find prompt owns a highlight in this window.
+            session.send(b"\x06alpha")
+            assert wait_screen(session, b"2 matches  [Smart]"), session.screen.text()
+            # Help > Xim help opens a second window while the prompt stays.
+            session.send(b"\x1b[21~")  # F10 opens menus
+            session.wait(b"New")
+            for _ in range(4):
+                session.send(b"\x1b[C")  # right to Help; first item selected
+            session.drain(.2)
+            session.send(b"\r")
+            assert wait_screen(session, b"xim.txt"), session.screen.text()
+            # Escape in the help window must delete the highlight from the
+            # window that created it, not from the focused one.
+            session.send(b"\x1b")
+            assert wait_screen(session, b"Find:", present=False), "find survived Escape"
+            session.drain(.4)
+            # A second find highlights the help window; it must clean up too.
+            session.send(b"\x06the")
+            assert wait_screen(session, b"matches  [Smart]"), session.screen.text()
+            session.send(b"\x1b")
+            assert wait_screen(session, b"Find:", present=False), "second find survived"
+            session.drain(.4)
+            # Deleting a highlight that belongs to another window used to
+            # report E803 and orphan the match; the message row must stay
+            # clean after both Escapes.
+            assert b"E803" not in session.screen.text(), session.screen.text()
+        finally:
+            session.close()
+    print("Find highlight window checks passed")
 
 
 def find_replace(binary, root):
@@ -1524,6 +1623,73 @@ def find_replace(binary, root):
             session.ex("call writefile(getline(1, '$'), 'utf')")
             assert (directory / "utf").read_text().splitlines() == ["cafE cafE"], \
                 (directory / "utf").read_text()
+        finally:
+            session.close()
+        # An empty replacement deletes whole-line matches too.
+        (directory / "empty.txt").write_text("aa\naa\nkeep aa\n")
+        session = Session(binary, directory, ("empty.txt",))
+        try:
+            session.send(b"\x08aa\t\r")
+            assert wait_screen(session, b"0 matches"), session.screen.text()
+            session.send(b"\x1b")
+            session.ex("call writefile(getline(1, '$'), 'empty')")
+            assert (directory / "empty").read_text().splitlines() == \
+                ["", "", "keep "], repr((directory / "empty").read_text())
+            session.send(b"\x1a")
+            session.drain(.2)
+            session.ex("call writefile(getline(1, '$'), 'empty-undo')")
+            assert (directory / "empty-undo").read_text().splitlines() == \
+                ["aa", "aa", "keep aa"]
+        finally:
+            session.close()
+        # A replacement with newlines splits into real lines, and the saved
+        # file contains no NUL bytes.
+        (directory / "multi.txt").write_text("needle tail\n")
+        session = Session(binary, directory, ("multi.txt",))
+        try:
+            session.send(b"\x08needle\t")
+            session.send(b"\x1b[200~a\nb\x1b[201~")
+            session.drain(.3)
+            session.send(b"\r")
+            assert wait_screen(session, b"0 matches"), session.screen.text()
+            session.send(b"\x1b")
+            session.ex("call writefile(getline(1, '$'), 'multi')")
+            assert (directory / "multi").read_text().splitlines() == \
+                ["a", "b tail"], repr((directory / "multi").read_text())
+            session.ex("w! multi-saved.txt")
+            assert b"\x00" not in (directory / "multi-saved.txt").read_bytes(), \
+                (directory / "multi-saved.txt").read_bytes()
+            session.send(b"\x1a")
+            session.drain(.2)
+            session.ex("call writefile(getline(1, '$'), 'multi-undo')")
+            assert (directory / "multi-undo").read_text().splitlines() == ["needle tail"]
+        finally:
+            session.close()
+        # A click places the caret in the replace field, and a wide
+        # character in the find field keeps the terminal cursor on the
+        # insertion cell.
+        (directory / "click.txt").write_text("a\n")
+        session = Session(binary, directory, ("click.txt",))
+        try:
+            session.send(b"\x08a\tbcd")
+            session.drain(.3)
+            row, column = screen_rowcol(session.screen, "bcd")
+            session.send(f"\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m".encode())
+            session.drain(.2)
+            session.send(b"X")
+            session.drain(.2)
+            assert wait_screen(session, b"Replace: Xbcd"), session.screen.text()
+            session.send(b"\x1b")
+        finally:
+            session.close()
+        (directory / "wide.txt").write_text("界\n")
+        session = Session(binary, directory, ("wide.txt",))
+        try:
+            session.send("\x08界\tX")
+            session.drain(.4)
+            assert session.screen.row == 23 and session.screen.col == 21, \
+                (session.screen.row, session.screen.col)
+            session.send(b"\x1b")
         finally:
             session.close()
         # Read-only buffers refuse the replace and keep the error state.
@@ -1608,6 +1774,35 @@ def project_content_search(binary, root):
             session.ex("call writefile([string(getcurpos()) . ' ' . expand('%:t')], 'click')")
             assert (directory / "click").read_text().strip() == "[0, 1, 7, 0, 7] b.txt", \
                 (directory / "click").read_text()
+            # The wheel moves list selection and Enter opens that row.
+            session.send(b"\x1bOP")
+            session.drain(.2)
+            session.send("Search project")
+            session.drain(.2)
+            session.send(b"\r")
+            session.drain(1.2)
+            session.send("hello")
+            assert wait_screen(session, b"2: second hello"), session.screen.text()
+            session.send(b"\x1b[<65;10;21M")  # wheel down in the results
+            session.drain(.4)
+            session.send(b"\r")
+            session.drain(.5)
+            session.ex("call writefile([string(getcurpos()) . ' ' . expand('%:t')], 'wheel')")
+            assert (directory / "wheel").read_text().strip() == "[0, 2, 8, 0, 8] a.txt", \
+                (directory / "wheel").read_text()
+            # Enter straight after the query opens the first match without
+            # waiting for a paint, and later typing goes into the document.
+            session.send(b"\x1bOP")
+            session.drain(.2)
+            session.send("Search project")
+            session.drain(.2)
+            session.send(b"\r")
+            session.send("hello\rZ")
+            session.drain(2.5)
+            session.ex("call writefile([string(getcurpos()) . ' ' . expand('%:t')"
+                       " . ' ' . getline(1)], 'early')")
+            assert (directory / "early").read_text().strip() == \
+                "[0, 1, 2, 0, 2] a.txt Zhello world", (directory / "early").read_text()
         finally:
             session.close()
     print("Project content search checks passed")
@@ -1673,6 +1868,8 @@ if __name__ == "__main__":
     horizontal_wheel_direction(args.binary.resolve(), args.work.resolve())
     undo_redo_availability(args.binary.resolve(), args.work.resolve())
     find_highlight(args.binary.resolve(), args.work.resolve())
+    find_unicode(args.binary.resolve(), args.work.resolve())
+    find_highlight_window(args.binary.resolve(), args.work.resolve())
     find_replace(args.binary.resolve(), args.work.resolve())
     project_content_search(args.binary.resolve(), args.work.resolve())
     compatibility_unchanged(args.binary.resolve(), args.work.resolve())

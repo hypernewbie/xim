@@ -507,6 +507,11 @@ std::vector<std::string> match_paths(const Index &paths, std::string_view query,
 constexpr std::size_t kMaxContentMatches = 1000;
 constexpr std::size_t kMaxContentFiles = 200;
 constexpr std::uintmax_t kMaxContentFileSize = 1u << 20; // 1 MiB
+// Display excerpts are bounded so one huge line cannot dominate the result
+// packet, the editor-side cache, or redraw work.
+constexpr std::size_t kExcerptBefore = 32;
+constexpr std::size_t kExcerptAfter = 128;
+constexpr std::size_t kMaxContentBytes = 256u * 1024u;
 
 struct ContentMatch
 {
@@ -522,6 +527,8 @@ struct ContentResults
     unsigned files_skipped = 0;
     bool truncated = false;
     bool complete = false;
+    unsigned generation = 0;
+    std::size_t excerpt_bytes = 0;
 };
 
 const auto empty_content = std::make_shared<const ContentResults>();
@@ -534,6 +541,9 @@ std::string content_query_text;
 bool content_case = false;
 std::shared_ptr<const ContentResults> content_snapshot = empty_content;
 unsigned content_result_revision = 0;
+// Bumped on every published result so the editor-side cache can tell a new
+// completion from a repeated read of the same snapshot.
+unsigned long long content_publishes = 0;
 std::thread content_worker;
 
 // Decode one UTF-8 codepoint at `pos`; return its byte length (0 on a bad
@@ -627,8 +637,10 @@ search_content(const std::filesystem::path &base, const Index &paths,
     if (query.empty())
     {
         results->complete = true;
+        results->generation = generation;
         return results;
     }
+    results->generation = generation;
     std::size_t matched_files = 0;
     for (const auto &entry : paths)
     {
@@ -673,13 +685,31 @@ search_content(const std::filesystem::path &base, const Index &paths,
             int col = find_literal(line, query, case_sensitive);
             if (col >= 0)
             {
-                if (results->matches.size() >= kMaxContentMatches)
+                if (results->matches.size() >= kMaxContentMatches
+                        || results->excerpt_bytes >= kMaxContentBytes)
                 {
                     results->truncated = true;
                     break;
                 }
+                // Bounded, match-centered excerpt: the meta column keeps the
+                // true jump position, only the display text is shortened.
+                std::size_t lo = col > static_cast<int>(kExcerptBefore)
+                    ? static_cast<std::size_t>(col) - kExcerptBefore : 0;
+                std::size_t hi = std::min(line.size(),
+                        static_cast<std::size_t>(col) + kExcerptAfter);
+                while (lo > 0 && (static_cast<unsigned char>(line[lo]) & 0xC0)
+                        == 0x80)
+                    --lo;
+                while (hi < line.size()
+                        && (static_cast<unsigned char>(line[hi]) & 0xC0) == 0x80)
+                    ++hi;
+                std::string text;
+                if (lo > 0) text += "\xe2\x80\xa6";
+                text += std::string(line.substr(lo, hi - lo));
+                if (hi < line.size()) text += "\xe2\x80\xa6";
+                results->excerpt_bytes += text.size();
                 results->matches.push_back(
-                        {entry.path, lnum, col, std::string(line)});
+                        {entry.path, lnum, col, std::move(text)});
                 file_matched = true;
             }
             if (end == std::string::npos)
@@ -1140,6 +1170,7 @@ void content_loop()
         }
         content_snapshot = std::move(results);
         content_result_revision = revision;
+        ++content_publishes;
         completion = true;
         notify_editor();
         lock.unlock();
@@ -1169,43 +1200,63 @@ xim_project_files(const char *query)
 }
 
 // Project content search. Nonblocking: starts or restarts the content query
-// and returns rows only when the current query has completed. Rows are
-// DISPLAY \t PATH \t LNUM \t COL; a file header has an empty PATH.
+// and returns rows only when the current query has completed for the
+// current scan generation. Rows are DISPLAY \t PATH \t LNUM \t COL; a file
+// header has an empty PATH. Serialization runs outside the state mutex.
+static bool content_ready_locked()
+{
+    return content_active && content_snapshot->complete
+        && content_result_revision == current_content.load()
+        && content_snapshot->generation == current_generation.load();
+}
+
 extern "C" char *
 xim_project_content(const char *query, int case_sensitive)
 {
+    std::shared_ptr<const ContentResults> ready;
+
     if (!ensure_workers()) return nullptr;
     if (!ensure_content_worker()) return nullptr;
     std::string_view text = query == nullptr ? "" : query;
-    std::lock_guard lock(state_lock);
-    if (!active)
     {
-        ContentResults empty;
-        content_active = false;
-        return duplicate_content_rows(empty);
+        std::lock_guard lock(state_lock);
+        if (!active)
+        {
+            ContentResults empty;
+            content_active = false;
+            // No shared state is referenced; serialize without the mutex.
+            return duplicate_content_rows(empty);
+        }
+        if (!content_active || content_query_text != text
+                || content_case != (case_sensitive != 0))
+        {
+            content_query_text = text;
+            content_case = case_sensitive != 0;
+            current_content.fetch_add(1);
+            content_active = true;
+            content_requested = true;
+            content_snapshot = empty_content;
+            content_changed.notify_one();
+        }
+        if (!content_ready_locked())
+            return nullptr;
+        ready = content_snapshot;
     }
-    if (!content_active || content_query_text != text
-            || content_case != (case_sensitive != 0))
-    {
-        content_query_text = text;
-        content_case = case_sensitive != 0;
-        current_content.fetch_add(1);
-        content_active = true;
-        content_requested = true;
-        content_snapshot = empty_content;
-        content_changed.notify_one();
-    }
-    if (content_result_revision != current_content.load()
-            || !content_snapshot->complete)
-        return nullptr;
-    return duplicate_content_rows(*content_snapshot);
+    return duplicate_content_rows(*ready);
 }
 
 extern "C" int
 xim_project_content_pending(void)
 {
     std::lock_guard lock(state_lock);
-    return content_active && !content_snapshot->complete ? 1 : 0;
+    return content_active && !content_ready_locked() ? 1 : 0;
+}
+
+extern "C" unsigned long long
+xim_project_content_serial(void)
+{
+    std::lock_guard lock(state_lock);
+    return content_publishes;
 }
 
 extern "C" const char *
@@ -1215,7 +1266,8 @@ xim_project_content_status(void)
     std::lock_guard lock(state_lock);
     text = worker_error != nullptr ? worker_error
         : !active ? ""
-        : content_active && !content_snapshot->complete ? "Searching project..." : "";
+        : content_active && !content_ready_locked()
+            ? "Searching project..." : "";
     return text.c_str();
 }
 

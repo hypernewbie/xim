@@ -79,8 +79,8 @@ def measure_find(binary, directory, query, expected, runs):
             session.wait(b"Find:")
             start = time.monotonic()
             session.send(query)
-            wait_fast(session, lambda: marker in session.screen.text()
-                    and count in session.screen.text())
+            assert wait_fast(session, lambda: marker in session.screen.text()
+                    and count in session.screen.text()), session.screen.text()
             samples.append((time.monotonic() - start) * 1000)
             session.send(b"\x1b")
             session.drain(.2)
@@ -98,12 +98,18 @@ def measure_replace(binary, directory, query, replacement, runs):
             session.send(b"\x08")  # Ctrl-H
             session.wait(b"Replace:")
             session.send(query)
-            wait_fast(session, lambda: b"1000 matches" in session.screen.text())
+            assert wait_fast(session,
+                    lambda: b"1000 matches" in session.screen.text()), \
+                session.screen.text()
             session.send(b"\t")
             session.send(replacement)
             start = time.monotonic()
             session.send(b"\r")
-            wait_fast(session, lambda: b"0 matches" in session.screen.text())
+            # " 0 matches" cannot match inside "1000 matches": the space
+            # before the count must be a padding space, not a digit.
+            assert wait_fast(session,
+                    lambda: b" 0 matches  [" in session.screen.text()), \
+                session.screen.text()
             samples.append((time.monotonic() - start) * 1000)
             session.send(b"\x1b")
             session.send(b"\x1a")  # undo the replace-all
@@ -114,6 +120,8 @@ def measure_replace(binary, directory, query, replacement, runs):
 
 
 def measure_project(binary, directory, query, runs):
+    # The cold sample includes process start and argument-file load, so the
+    # timer begins before the session exists.
     session = Session(binary, directory)
     samples = []
     cold = None
@@ -124,7 +132,9 @@ def measure_project(binary, directory, query, runs):
         session.send(b"\r")
         session.wait(b"Search:")
         session.send(query)
-        wait_fast(session, lambda: b"needle here" in session.screen.text(), timeout=60)
+        assert wait_fast(session,
+                lambda: b"needle here" in session.screen.text(), timeout=60), \
+            session.screen.text()
         cold = (time.monotonic() - start) * 1000
         session.send(b"\x1b")
         session.drain(.3)
@@ -135,7 +145,9 @@ def measure_project(binary, directory, query, runs):
             session.wait(b"Search:")
             start = time.monotonic()
             session.send(query)
-            wait_fast(session, lambda: b"needle here" in session.screen.text(), timeout=30)
+            assert wait_fast(session,
+                    lambda: b"needle here" in session.screen.text(), timeout=30), \
+                session.screen.text()
             samples.append((time.monotonic() - start) * 1000)
             session.send(b"\x1b")
             session.drain(.3)
@@ -190,7 +202,9 @@ def main():
         results["find_keystroke_to_highlight"] = summary(
             measure_find(binary, directory, "needle", 1000, runs))
         results["replace_all_1000_matches"] = summary(
-            measure_replace(binary, directory, "needle", "NEEDLE", runs))
+            # The replacement must stop matching: under a smart-case
+            # insensitive query "NEEDLE" would leave all 1000 matches.
+            measure_replace(binary, directory, "needle", "X", runs))
         project_samples, project_cold = measure_project(
             binary, directory / "project", "needle", runs)
         results["project_search_warm"] = summary(project_samples)

@@ -44,6 +44,8 @@ void xim_engine_find(const char *text, int backward, int case_sensitive);
  * only; does not move the caret or selection. */
 void xim_engine_highlight(const char *text, int case_sensitive, int *count);
 void xim_engine_clear_highlight(void);
+/* True when the UTF-8 text contains an uppercase codepoint (smart case). */
+int xim_engine_has_upper(const char *text);
 /* Peek the next decoded key without consuming it (Alt-letter detection). */
 int xim_engine_peek_key(void);
 /* Replace adapters: main-thread only, one undo block, UTF-8 aware. */

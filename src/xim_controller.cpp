@@ -104,7 +104,9 @@ int confirm_choice_at(int col)
 std::vector<std::string> file_rows;
 std::string file_rows_query;
 // Project content results. Display rows feed the picker; the parallel meta
-// list resolves a row to a file, line and column on activation.
+// list resolves a row to a file, line and column on activation. Completed
+// rows are cached per publish so caret moves and mouse hits do not
+// reserialize the result set.
 struct ContentMeta
 {
     std::string path;
@@ -113,6 +115,9 @@ struct ContentMeta
 };
 std::vector<std::string> content_rows;
 std::vector<ContentMeta> content_meta;
+unsigned long long content_serial_seen = 0;
+std::string content_cache_query;
+int content_cache_case = -1;
 // Menu state: F10 or bar click opens a real drop-down. Right-click opens the
 // Edit group as a context menu at the pointer. Keyboard and mouse share the
 // same pure hit layout in xim_menu.
@@ -287,14 +292,13 @@ bool prompt_supports_case()
     return prompt_is_find_like() || prompt == Action::search_project;
 }
 
-// Smart case: an uppercase letter in the query makes the match case-sensitive.
+// Smart case: an uppercase codepoint in the query makes the match
+// case-sensitive. The check is Unicode-aware through the engine.
 bool prompt_case_sensitive()
 {
     if (prompt_case == CaseRule::sensitive) return true;
     if (prompt_case == CaseRule::insensitive) return false;
-    for (unsigned char c : input)
-        if (c >= 'A' && c <= 'Z') return true;
-    return false;
+    return xim_engine_has_upper(input.c_str()) != 0;
 }
 
 std::string case_label()
@@ -410,16 +414,77 @@ std::vector<const xim::Command *> filtered()
 
 std::vector<std::string> project_items(Action action, const std::string &text)
 {
+    if (action == Action::search_project)
+    {
+        // Cached rows: refetch only when the publish serial, query or case
+        // rule changed. Caret moves, list scrolling and mouse hit tests all
+        // reuse the cache, so a large result set costs no repeated work.
+        int rule = prompt_case_sensitive() ? 1 : 0;
+        unsigned long long serial = xim_project_content_serial();
+        if (content_cache_case != rule || content_cache_query != text)
+            serial = content_serial_seen + 1;  // force one refetch
+        if (serial != content_serial_seen)
+        {
+            char *sources = xim_project_content(text.c_str(), rule);
+            if (sources == nullptr)
+            {
+                // Pending or restarted: keep the rows empty so the status
+                // line reports the search.
+                content_rows.clear();
+                content_meta.clear();
+                content_cache_case = rule;
+                content_cache_query = text;
+                content_serial_seen = xim_project_content_serial();
+                return content_rows;
+            }
+            std::unique_ptr<char, decltype(&xim_project_free)> guard(
+                    sources, xim_project_free);
+            std::string text_all = guard.get() ? guard.get() : "";
+            content_rows.clear();
+            content_meta.clear();
+            std::size_t start = 0;
+            for (;;)
+            {
+                auto end = text_all.find('\n', start);
+                if (end == std::string::npos)
+                    break;
+                std::string row = text_all.substr(start, end - start);
+                start = end + 1;
+                // Split DISPLAY \t PATH \t LNUM \t COL. A header has an
+                // empty PATH.
+                auto first = row.find('\t');
+                if (first == std::string::npos)
+                {
+                    content_rows.push_back(std::move(row));
+                    content_meta.push_back(ContentMeta{});
+                    continue;
+                }
+                ContentMeta meta;
+                auto second = row.find('\t', first + 1);
+                auto third = second == std::string::npos
+                    ? std::string::npos : row.find('\t', second + 1);
+                if (second != std::string::npos && third != std::string::npos)
+                {
+                    meta.path = row.substr(first + 1, second - first - 1);
+                    meta.lnum = std::atoi(
+                            row.substr(second + 1, third - second - 1).c_str());
+                    meta.col = std::atoi(row.substr(third + 1).c_str());
+                }
+                content_rows.push_back(row.substr(0, first));
+                content_meta.push_back(std::move(meta));
+            }
+            content_cache_case = rule;
+            content_cache_query = text;
+            content_serial_seen = xim_project_content_serial();
+        }
+        return content_rows;
+    }
     char *sources = nullptr;
     switch (action)
     {
         case Action::files: sources = xim_project_files(text.c_str()); break;
         case Action::explorer: sources = xim_project_explorer(text.c_str()); break;
         case Action::buffers: sources = xim_engine_buffers(); break;
-        case Action::search_project:
-            sources = xim_project_content(text.c_str(),
-                    prompt_case_sensitive() ? 1 : 0);
-            break;
         default: break;
     }
     std::vector<std::string> items;
@@ -439,46 +504,14 @@ std::vector<std::string> project_items(Action action, const std::string &text)
         std::unique_ptr<char, decltype(&xim_project_free)> guard(sources, xim_project_free);
         text_all = guard.get();
     }
-    if (action == Action::search_project)
-        content_meta.clear();
     std::size_t start = 0;
     for (;;)
     {
         auto end = text_all.find('\n', start);
         if (end == std::string::npos)
             break;
-        std::string row = text_all.substr(start, end - start);
+        items.push_back(text_all.substr(start, end - start));
         start = end + 1;
-        if (action != Action::search_project)
-        {
-            items.push_back(std::move(row));
-            continue;
-        }
-        // Split DISPLAY \t PATH \t LNUM \t COL. A header has an empty PATH.
-        auto first = row.find('\t');
-        if (first == std::string::npos)
-        {
-            items.push_back(std::move(row));
-            content_meta.push_back(ContentMeta{});
-            continue;
-        }
-        ContentMeta meta;
-        auto second = row.find('\t', first + 1);
-        auto third = second == std::string::npos
-            ? std::string::npos : row.find('\t', second + 1);
-        if (second != std::string::npos && third != std::string::npos)
-        {
-            meta.path = row.substr(first + 1, second - first - 1);
-            meta.lnum = std::atoi(row.substr(second + 1, third - second - 1).c_str());
-            meta.col = std::atoi(row.substr(third + 1).c_str());
-        }
-        items.push_back(row.substr(0, first));
-        content_meta.push_back(std::move(meta));
-    }
-    if (action == Action::search_project)
-    {
-        content_rows = items;
-        return items;
     }
     if (action == Action::files)
     {
@@ -543,6 +576,11 @@ void begin(Action action)
     replace_error = false;
     file_rows.clear();
     file_rows_query.clear();
+    content_rows.clear();
+    content_meta.clear();
+    content_cache_query.clear();
+    content_cache_case = -1;
+    content_serial_seen = xim_project_content_serial();
     selected = 0;
     last_picker_items.clear();
     last_picker_action = Action::ignore;
@@ -624,7 +662,7 @@ void execute(Action action)
         case Action::toggle_mouse: xim_engine_toggle_option("mouse"); break;
         case Action::next_buffer: xim_engine_command("hide bnext", "", 0); break;
         case Action::prev_buffer: xim_engine_command("hide bprevious", "", 0); break;
-        case Action::help: xim_engine_command("help", "xim", 0); break;
+        case Action::help: xim_engine_command("help", "xim.txt", 0); break;
         case Action::about:
             // Pass the whole command line: the argument path filename-escapes
             // its text, which turns the quoted message into an Ex error.
@@ -843,12 +881,19 @@ bool activate_current_row(Action current)
     if (current == Action::search_project)
     {
         // The content list is indexed by absolute row; the last render kept
-        // the scroll origin so a click and Enter resolve the same row.
+        // the scroll origin so a click and Enter resolve the same row. When
+        // no paint has happened yet (an Enter accepted on completion), fall
+        // back to the selection and move it onto the first activatable row.
         std::vector<std::string> list = project_items(current, input);
         std::size_t row = last_picker_action == current
             ? static_cast<std::size_t>(last_picker_first + last_picker_selected)
             : selected;
-        if (row >= content_meta.size()) return false;
+        if (list.empty() || content_meta.empty())
+        {
+            prompt = current;
+            return false;
+        }
+        row = first_activatable(row % content_meta.size());
         return open_picker_item(current, list, row);
     }
     if (current == Action::files || current == Action::buffers
@@ -916,10 +961,17 @@ extern "C" int xim_menu_active() { return menu_open ? 1 : 0; }
 extern "C" void xim_dispatch(int key, int modifiers)
 {
     auto action = xim::resolve(key, modifiers);
-    if (swallow_key != 0 && key == swallow_key)
+    if (swallow_key != 0)
     {
+        // The Escape fallback claimed a pending letter as the case toggle.
+        // Any other key first proves the claim stale; a real Alt-C always
+        // delivers its letter immediately after the Escape.
+        if (key == swallow_key)
+        {
+            swallow_key = 0;
+            return;
+        }
         swallow_key = 0;
-        return;
     }
     if (handle_menu_key(key, modifiers)) return;
     if (menu_open && action == Action::cancel)
@@ -971,6 +1023,10 @@ extern "C" void xim_dispatch(int key, int modifiers)
             replace_sel_start = replace_sel_end = 0;
             active_field = 0;
             replace_error = false;
+            content_rows.clear();
+            content_meta.clear();
+            content_cache_query.clear();
+            content_cache_case = -1;
             save_then_continue = false;
             pending = Action::ignore;
             pending_path.clear();
@@ -1022,6 +1078,30 @@ extern "C" void xim_dispatch(int key, int modifiers)
                 perform_replace_one();
                 return;
             }
+        }
+        if (action == Action::toggle_case)
+        {
+            // A distinctly reported Alt-C (modifyOtherKeys or Kitty)
+            // reaches the seam with its modifier preserved.
+            execute(Action::toggle_case);
+            return;
+        }
+        if (action == Action::menu)
+        {
+            // F10 opens the menu bar even while a prompt is open; the menu
+            // popup restores the prompt rows when it closes.
+            execute(Action::menu);
+            return;
+        }
+        if (key == XIM_F3 && prompt_is_find_like())
+        {
+            // F3 and Shift-F3 navigate while the find prompt stays open.
+            query = input;
+            query_case_sensitive = prompt_case_sensitive();
+            if (!input.empty())
+                xim_engine_find(input.c_str(),
+                        (modifiers & XIM_SHIFT) != 0, query_case_sensitive);
+            return;
         }
         if (key == '\r' || key == '\n')
         {
@@ -1457,13 +1537,15 @@ void render_prompt_overlay(int menu_rows)
         const std::string find_label = "Find: ";
         const std::string replace_label = "   Replace: ";
         rendered_prompt_text = find_label + input + replace_label + replace_input;
+        // Caret cell inside the full prompt text, measured in display cells
+        // so wide characters place the terminal cursor correctly.
         if (active_field == 1)
-            rendered_prompt_cursor = static_cast<int>(
-                    (find_label + input + replace_label).size())
+            rendered_prompt_cursor = 6 + 12
+                + cells_before(input, input.size())
                 + cells_before(replace_input,
                         std::min(replace_cursor, replace_input.size()));
         else
-            rendered_prompt_cursor = static_cast<int>(find_label.size())
+            rendered_prompt_cursor = 6
                 + cells_before(input, std::min(input_cursor, input.size()));
         std::string info = prompt_info();
         xim_engine_overlay(rendered_prompt_text.c_str(), items.c_str(),
@@ -1703,7 +1785,7 @@ extern "C" void xim_mouse_press(int row, int col, int button, int modifiers, int
     {
         // Place the caret in whichever field was clicked.
         int find_cells = 6;    // "Find: "
-        int repl_cells = 11;   // "   Replace: "
+        int repl_cells = 12;   // "   Replace: "
         int find_end = find_cells + cells_before(input, input.size());
         if (col <= find_end)
         {
@@ -1820,7 +1902,8 @@ extern "C" void xim_mouse_wheel(int row, int col, int direction, int modifiers)
         return;
     }
     if (prompt == Action::files || prompt == Action::buffers
-            || prompt == Action::explorer || prompt == Action::palette)
+            || prompt == Action::explorer || prompt == Action::palette
+            || prompt == Action::search_project)
     {
         if (direction == 0) xim_dispatch(XIM_UP, 0);
         else if (direction == 1) xim_dispatch(XIM_DOWN, 0);

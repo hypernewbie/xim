@@ -1809,7 +1809,8 @@ merge_modifyOtherKeys(int c_arg, int *modifiers)
     }
 
     // Alt/Meta sets the 8th bit of the character.
-    if ((*modifiers & (MOD_MASK_META | MOD_MASK_ALT))
+    if (!xim_preserve_modifiers
+	    && (*modifiers & (MOD_MASK_META | MOD_MASK_ALT))
 	    && c >= 0 && c <= 127)
     {
 	// Some terminals (esp. Kitty) do not include Shift in the character.

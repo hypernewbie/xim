@@ -30,7 +30,7 @@ Local notes are in `temp/XIM_DESIGN.md`, `temp/XIM_PLAN0.md`,
 `temp/XIM_PLAN0_REVIEW.md`, `temp/XIM_PLAN1.md`, `temp/XIM_PLAN1_REVIEW.md`,
 `temp/XIM_PLAN1_FULL_INITIAL_FAILURE.md`, `temp/XIM_PLAN2.md`,
 `temp/XIM_PLAN2_REVIEW.md`, `temp/XIM_PLAN3.md`, `temp/XIM_PLAN4.md`,
-`temp/XIM_ROADMAP.md` and `temp/XIM_PLAN5.md`.
+`temp/XIM_ROADMAP.md`, `temp/XIM_PLAN5.md` and `temp/XIM_PLAN5_REVIEW.md`.
 Read them when present. `temp/` is gitignored, so these files can be absent
 in other checkouts. The requirements in this file do not depend on those notes.
 
@@ -82,6 +82,17 @@ Evidence is in `cmake/PLAN4_VALIDATION.md`; behavior is documented in
 F10 is menus (Ctrl-Y remains redo) and Ctrl-N creates a new buffer (F3 remains
 Next match). Mouse work reuses the inherited SGR decoder and owning-thread
 adapters; no second input stream or modal key injection is allowed.
+
+The operator authorized native find, replace and project content search on
+2026-10-09. Plan 5 ships highlight-all find with smart/insensitive/sensitive
+case, a two-field replace prompt (replace-all is one undo block; multiline
+replacements splice real lines), and a third content worker over the project
+index with bounded excerpts, caps and skip summaries. The 2026-10-11 review
+found twelve defects; the closeout fixes are verified in
+`cmake/PLAN5_VALIDATION.md` (2026-10-14) with resolutions recorded in
+`temp/XIM_PLAN5_REVIEW.md`. F3/Shift-F3 navigate while the find prompt is
+open, F10 opens the menu bar over any prompt, and Help > Xim help opens
+`runtime/doc/xim.txt`.
 Keep these gates in effect for subsequent changes:
 
 - Build from tracked sources without Make-generated source-tree headers.

@@ -22,6 +22,9 @@ char *xim_project_explorer(const char *query);
  * The result must be freed with xim_project_free. */
 char *xim_project_content(const char *query, int case_sensitive);
 int xim_project_content_pending(void);
+/* Monotonic count of published results; lets callers cache rows across
+ * caret moves without missing a new completion. */
+unsigned long long xim_project_content_serial(void);
 const char *xim_project_content_status(void);
 int xim_project_explorer_activate(const char *item, char **selected);
 const char *xim_project_status(void);

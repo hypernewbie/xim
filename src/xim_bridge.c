@@ -868,18 +868,25 @@ xim_engine_error(void)
 
     /*
      * Build the literal search pattern for native find/replace.  The text is
-     * taken verbatim (\V very nomagic) with backslashes escaped; the case rule
-     * is explicit (\c case-insensitive, \C case-sensitive) so it never depends
-     * on the 'ignorecase' option.  Caller frees the result.
+     * taken verbatim (\V very nomagic) with backslashes escaped and newlines
+     * written as "\n"; the case rule is explicit (\c case-insensitive,
+     * \C case-sensitive) so it never depends on the 'ignorecase' option.
+     * Caller frees the result.
      */
     static char_u *
 xim_literal_pattern(const char *text, int case_sensitive)
 {
     char_u *escaped = vim_strsave_escaped((char_u *)text, (char_u *)"\\");
     char_u *pattern;
+    size_t i;
+    size_t end;
+    size_t nls = 0;
     if (escaped == NULL)
         return NULL;
-    pattern = alloc(STRLEN(escaped) + 5);
+    for (i = 0; escaped[i] != NUL; ++i)
+        if (escaped[i] == NL)
+            ++nls;
+    pattern = alloc(STRLEN(escaped) + 5 + nls);
     if (pattern == NULL)
     {
         vim_free(escaped);
@@ -887,9 +894,74 @@ xim_literal_pattern(const char *text, int case_sensitive)
     }
     STRCPY(pattern, (char_u *)"\\V");
     STRCAT(pattern, (char_u *)(case_sensitive ? "\\C" : "\\c"));
-    STRCAT(pattern, escaped);
+    for (i = 0; escaped[i] != NUL; ++i)
+    {
+        if (escaped[i] == NL)
+        {
+            STRCAT(pattern, (char_u *)"\\n");
+        }
+        else
+        {
+            end = STRLEN(pattern);
+            pattern[end] = escaped[i];
+            pattern[end + 1] = NUL;
+        }
+    }
     vim_free(escaped);
     return pattern;
+}
+
+// One literal match: line, byte offset of the start, byte length.  The
+// length can differ from the needle length under Unicode case folding.
+typedef struct
+{
+    linenr_T lnum;
+    size_t   col;
+    size_t   len;
+} xim_span_T;
+
+// Cached compiled literal pattern so per-line scans do not recompile.
+static regprog_T *xim_literal_prog = NULL;
+static char_u *xim_literal_prog_text = NULL;
+static int xim_literal_prog_case = -1;
+
+/*
+ * Return the compiled literal pattern for text and case rule, reusing the
+ * cached program when they are unchanged.  Returns NULL when compilation
+ * fails, in which case only byte-exact matching remains.
+ */
+    static regprog_T *
+xim_pattern_prog(const char *text, int case_sensitive)
+{
+    char_u *pattern;
+    char_u *copy;
+
+    if (xim_literal_prog != NULL && xim_literal_prog_case == case_sensitive
+            && xim_literal_prog_text != NULL
+            && STRCMP(xim_literal_prog_text, (char_u *)text) == 0)
+        return xim_literal_prog;
+    pattern = xim_literal_pattern(text, case_sensitive);
+    if (pattern == NULL)
+        return NULL;
+    copy = vim_strsave((char_u *)text);
+    if (copy == NULL)
+    {
+        vim_free(pattern);
+        return NULL;
+    }
+    if (xim_literal_prog != NULL)
+        vim_regfree(xim_literal_prog);
+    xim_literal_prog = vim_regcomp(pattern, RE_MAGIC + RE_STRING);
+    vim_free(pattern);
+    if (xim_literal_prog == NULL)
+    {
+        vim_free(copy);
+        return NULL;
+    }
+    vim_free(xim_literal_prog_text);
+    xim_literal_prog_text = copy;
+    xim_literal_prog_case = case_sensitive;
+    return xim_literal_prog;
 }
 
     void
@@ -925,6 +997,16 @@ xim_ascii_needle(char_u *needle, size_t nlen)
 }
 
     static int
+xim_line_ascii(char_u *line, size_t len)
+{
+    size_t i;
+    for (i = 0; i < len; ++i)
+        if (line[i] >= 0x80)
+            return FALSE;
+    return TRUE;
+}
+
+    static int
 xim_match_at(char_u *line, char_u *needle, size_t nlen, int case_sensitive,
         int ascii)
 {
@@ -948,49 +1030,98 @@ xim_match_at(char_u *line, char_u *needle, size_t nlen, int case_sensitive,
     return mb_strnicmp2(line, needle, nlen, nlen) == 0;
 }
 
+/*
+ * Find the next literal match in "line" (length "len") at or after byte
+ * "col".  Return the byte length of the match, or 0 when there is none,
+ * and store the match start byte offset in "*start".  "fast" selects the
+ * byte path, which is valid when matching is case-sensitive or both the
+ * needle and the line are all ASCII; otherwise the compiled literal
+ * regexp is used so count, replace, highlight and navigation agree under
+ * Vim's full case folding (for example a long s matches "s").
+ */
+    static size_t
+xim_span_in_line(char_u *line, size_t len, size_t col, const char *needle,
+        size_t nlen, int case_sensitive, int fast, regprog_T *prog,
+        size_t *start)
+{
+    if (fast)
+    {
+        size_t i = col;
+        while (i + nlen <= len)
+        {
+            if (xim_match_at(line + i, (char_u *)needle, nlen,
+                        case_sensitive, TRUE))
+            {
+                *start = i;
+                return nlen;
+            }
+            ++i;
+        }
+        return 0;
+    }
+    if (prog == NULL)
+        return 0;
+    {
+        regmatch_T rm;
+        rm.regprog = prog;
+        if (vim_regexec_nl(&rm, line, (colnr_T)col))
+        {
+            size_t s = (size_t)(rm.startp[0] - line);
+            size_t e = (size_t)(rm.endp[0] - line);
+            if (e <= s || s < col)
+                return 0;
+            *start = s;
+            return e - s;
+        }
+    }
+    return 0;
+}
+
     /*
      * Count literal matches of text in the current buffer under the case rule,
-     * capped so a huge match set cannot run away.  Non-overlapping, matching
-     * the window highlight regexp.
+     * capped so a huge match set cannot run away.  Non-overlapping and in
+     * agreement with the window highlight regexp.
      */
     static long
 xim_count_matches(const char *text, int case_sensitive, long cap)
 {
     long count = 0;
     size_t nlen = STRLEN(text);
-    char_u *needle = (char_u *)text;
     linenr_T lnum;
     int ascii;
+    regprog_T *prog;
 
     if (nlen == 0)
         return 0;
-    ascii = xim_ascii_needle(needle, nlen);
-    for (lnum = 1; lnum <= curbuf->b_ml.ml_line_count; ++lnum)
+    ascii = xim_ascii_needle((char_u *)text, nlen);
+    prog = xim_pattern_prog(text, case_sensitive);
+    for (lnum = 1; lnum <= curbuf->b_ml.ml_line_count && count < cap; ++lnum)
     {
         char_u *line = ml_get(lnum);
         colnr_T len = ml_get_buf_len(curbuf, lnum);
-        colnr_T col = 0;
-        while (col < len)
+        int fast = case_sensitive || (ascii && xim_line_ascii(line, len));
+        size_t col = 0;
+        while (col < (size_t)len)
         {
-            if ((colnr_T)nlen <= len - col
-                    && xim_match_at(line + col, needle, nlen, case_sensitive,
-                        ascii))
-            {
-                ++count;
-                if (count >= cap)
-                    return count;
-                col += (colnr_T)nlen;
-                continue;
-            }
-            // An all-ASCII needle can only match ASCII bytes, so a byte step
-            // is safe and avoids the multibyte length lookup.
-            col += ascii ? 1 : (*mb_ptr2len)(line + col);
+            size_t start = 0;
+            size_t mlen = xim_span_in_line(line, len, col, text, nlen,
+                    case_sensitive, fast, prog, &start);
+            if (mlen == 0)
+                break;
+            ++count;
+            if (count >= cap)
+                return count;
+            col = start + mlen;
         }
     }
     return count;
 }
 
     static int xim_find_match_id = 0;
+// The window that owns the match list; match IDs are window-local, so the
+// highlight must be deleted from its own window even after a menu action
+// changed the current window.
+static win_T *xim_find_match_win = NULL;
 
     int
 xim_engine_peek_key(void)
@@ -1001,17 +1132,29 @@ xim_engine_peek_key(void)
     void
 xim_engine_clear_highlight(void)
 {
+    win_T *wp;
+    char command[64];
+
     if (xim_find_match_id <= 0)
         return;
-    typval_T argv[3];
-    typval_T rettv;
-    CLEAR_FIELD(argv);
-    CLEAR_FIELD(rettv);
-    argv[0].v_type = VAR_NUMBER;
-    argv[0].vval.v_number = xim_find_match_id;
-    f_matchdelete(argv, &rettv);
+    // Match IDs are window-local: delete from the window that owns the
+    // highlight, which can differ from the current window after a menu
+    // action opened another window (for example Help).
+    wp = win_valid(xim_find_match_win) ? xim_find_match_win : curwin;
+    if (wp == curwin)
+        vim_snprintf(command, sizeof(command),
+                "silent! call matchdelete(%d)", xim_find_match_id);
+    else
+        vim_snprintf(command, sizeof(command),
+                "silent! call matchdelete(%d, %d)", xim_find_match_id,
+                wp->w_id);
+    do_cmdline_cmd((char_u *)command);
     xim_find_match_id = 0;
-    redraw_curbuf_later(UPD_NOT_VALID);
+    xim_find_match_win = NULL;
+    if (wp == curwin)
+        redraw_curbuf_later(UPD_NOT_VALID);
+    else
+        redraw_win_later(wp, UPD_NOT_VALID);
 }
 
     void
@@ -1049,8 +1192,31 @@ xim_engine_highlight(const char *text, int case_sensitive, int *count)
     f_matchadd(argv, &rettv);
     vim_free(pattern);
     if (rettv.vval.v_number > 0)
+    {
         xim_find_match_id = (int)rettv.vval.v_number;
+        xim_find_match_win = curwin;
+    }
     redraw_curbuf_later(UPD_NOT_VALID);
+}
+
+/*
+ * Smart case must see uppercase in any script: report whether the UTF-8
+ * text contains a codepoint that changes under lowercasing.  Used by the
+ * controller for the default case rule.
+ */
+    int
+xim_engine_has_upper(const char *text)
+{
+    char_u *p = (char_u *)text;
+    int c;
+
+    while (*p != NUL)
+    {
+        c = mb_ptr2char_adv(&p);
+        if (utf_tolower(c) != c)
+            return 1;
+    }
+    return 0;
 }
 
     int
@@ -1059,10 +1225,149 @@ xim_engine_modifiable(void)
     return curbuf->b_p_ma && !curbuf->b_p_ro ? 1 : 0;
 }
 
+/*
+ * Build the produced lines for one original line: every span is replaced
+ * by "replace" (which may contain newlines, splitting the line).  "*out"
+ * receives one allocated char_u * per produced line; the caller frees
+ * each line and the array.  Returns FAIL only on allocation failure.
+ */
+    static int
+xim_build_spliced(char_u *line, size_t len, const xim_span_T *spans, int nspans,
+        const char *replace, garray_T *out)
+{
+    garray_T text;
+    size_t pos = 0;
+    int i;
+
+    ga_init2(&text, 1, (int)len + 64);
+    ga_init2(out, sizeof(char_u *), 4);
+    for (i = 0; i < nspans; ++i)
+    {
+        if (spans[i].col > pos)
+            ga_concat_len(&text, line + pos, spans[i].col - pos);
+        ga_concat_len(&text, (char_u *)replace, STRLEN(replace));
+        pos = spans[i].col + spans[i].len;
+    }
+    if (pos < len)
+        ga_concat_len(&text, line + pos, len - pos);
+    ga_append(&text, NUL);
+    if (text.ga_data != NULL)
+    {
+        char_u *content = (char_u *)text.ga_data;
+        char_u *endp = content + STRLEN((char *)content);
+        char_u *p = content;
+        char_u *seg = content;
+
+        for (;;)
+        {
+            if (p == endp || *p == NL)
+            {
+                char_u *copy = vim_strnsave(seg, p - seg);
+
+                if (copy == NULL)
+                    return FAIL;
+                if (ga_grow(out, 1) == FAIL)
+                {
+                    vim_free(copy);
+                    return FAIL;
+                }
+                ((char_u **)out->ga_data)[out->ga_len++] = copy;
+                if (p == endp)
+                    break;
+                seg = p + 1;
+            }
+            ++p;
+        }
+    }
+    ga_clear(&text);
+    return OK;
+}
+
+    static void
+xim_free_lines(garray_T *out)
+{
+    int i;
+
+    for (i = 0; i < out->ga_len; ++i)
+        vim_free(((char_u **)out->ga_data)[i]);
+    ga_clear(out);
+}
+
+/*
+ * Commit the produced lines for one original line.  The u_save range covers
+ * the line replacement and the adjacent insertions, like ":s" with "\r":
+ * one undo restores the saved block and removes the appended lines.
+ */
+    static int
+xim_splice_line(linenr_T lnum, garray_T *out)
+{
+    int i;
+
+    if (out->ga_len < 1 || u_save(lnum - 1, lnum + 1) != OK)
+        return FAIL;
+    if (ml_replace(lnum, ((char_u **)out->ga_data)[0], TRUE) == FAIL)
+        return FAIL;
+    for (i = 1; i < out->ga_len; ++i)
+        if (ml_append(lnum + i - 1, ((char_u **)out->ga_data)[i],
+                    (colnr_T)0, FALSE) == FAIL)
+            return FAIL;
+    return OK;
+}
+
+/*
+ * Collect the literal match spans of the whole buffer, capped like the
+ * prompt count so memory stays bounded.  Returns the span count.
+ */
+    static long
+xim_collect_spans(const char *text, int case_sensitive, garray_T *spans,
+        long cap)
+{
+    size_t nlen = STRLEN(text);
+    linenr_T lnum;
+    int ascii;
+    regprog_T *prog;
+
+    ga_init2(spans, sizeof(xim_span_T), 256);
+    if (nlen == 0)
+        return 0;
+    ascii = xim_ascii_needle((char_u *)text, nlen);
+    prog = xim_pattern_prog(text, case_sensitive);
+    for (lnum = 1; lnum <= curbuf->b_ml.ml_line_count; ++lnum)
+    {
+        char_u *line = ml_get(lnum);
+        colnr_T len = ml_get_buf_len(curbuf, lnum);
+        int fast = case_sensitive || (ascii && xim_line_ascii(line, len));
+        size_t col = 0;
+
+        while (col < (size_t)len)
+        {
+            xim_span_T span;
+            size_t start = 0;
+            size_t mlen = xim_span_in_line(line, len, col, text, nlen,
+                    case_sensitive, fast, prog, &start);
+
+            if (mlen == 0)
+                break;
+            span.lnum = lnum;
+            span.col = start;
+            span.len = mlen;
+            if (spans->ga_len >= cap)
+                return spans->ga_len;
+            if (ga_grow(spans, 1) == FAIL)
+                return spans->ga_len;
+            ((xim_span_T *)spans->ga_data)[spans->ga_len++] = span;
+            col = start + mlen;
+        }
+    }
+    return spans->ga_len;
+}
+
     /*
      * Replace every literal match of find with replace in the current buffer.
      * All replacements form one undo block; matching is UTF-8 aware and uses
-     * the explicit case rule.  Returns the replacement count.
+     * the explicit case rule, so it agrees with the highlight.  A
+     * replacement containing newlines splits into real lines.  Returns the
+     * replacement count.
      */
     int
 xim_engine_replace_all(const char *find, const char *replace, int case_sensitive,
@@ -1071,53 +1376,112 @@ xim_engine_replace_all(const char *find, const char *replace, int case_sensitive
     long replaced = 0;
     size_t flen = STRLEN(find);
     size_t rlen = STRLEN(replace);
-    linenr_T lnum;
-    garray_T newline;
-    int ascii;
+    int multiline = vim_strchr((char_u *)replace, NL) != NULL;
 
     if (count != NULL)
         *count = 0;
     if (flen == 0 || !xim_engine_modifiable())
         return 0;
-    ascii = xim_ascii_needle((char_u *)find, flen);
-    ++no_u_sync;
-    for (lnum = 1; lnum <= curbuf->b_ml.ml_line_count; ++lnum)
-    {
-        char_u *line = ml_get(lnum);
-        colnr_T len = ml_get_buf_len(curbuf, lnum);
-        colnr_T col = 0;
-        int changed = FALSE;
 
-        ga_init2(&newline, 1, (int)len + (int)rlen + 16);
-        while (col < len)
+    if (!multiline)
+    {
+        garray_T newline;
+        int ascii = xim_ascii_needle((char_u *)find, flen);
+        regprog_T *prog = xim_pattern_prog(find, case_sensitive);
+        linenr_T lnum;
+
+        ++no_u_sync;
+        for (lnum = 1; lnum <= curbuf->b_ml.ml_line_count; ++lnum)
         {
-            if ((colnr_T)flen <= len - col
-                    && xim_match_at(line + col, (char_u *)find, flen,
-                        case_sensitive, ascii))
+            char_u *line = ml_get(lnum);
+            colnr_T len = ml_get_buf_len(curbuf, lnum);
+            int fast = case_sensitive || (ascii && xim_line_ascii(line, len));
+            size_t col = 0;
+            size_t out_col = 0;
+            int changed = FALSE;
+            long hits = 0;
+
+            ga_init2(&newline, 1, (int)len + 16);
+            while (col < (size_t)len)
             {
+                size_t start = 0;
+                size_t mlen = xim_span_in_line(line, len, col, find, flen,
+                        case_sensitive, fast, prog, &start);
+
+                if (mlen == 0)
+                {
+                    if (out_col < len)
+                        ga_concat_len(&newline, line + out_col,
+                                len - out_col);
+                    break;
+                }
+                if (start > out_col)
+                    ga_concat_len(&newline, line + out_col, start - out_col);
                 if (rlen > 0)
                     ga_concat_len(&newline, (char_u *)replace, rlen);
-                col += (colnr_T)flen;
-                ++replaced;
+                col = start + mlen;
+                out_col = col;
+                ++hits;
                 changed = TRUE;
-                continue;
             }
-            ga_concat_len(&newline, line + col, (size_t)(ascii ? 1 : (*mb_ptr2len)(line + col)));
-            col += ascii ? 1 : (*mb_ptr2len)(line + col);
+            if (changed)
+            {
+                ga_append(&newline, NUL);
+                if (u_savesub(lnum) == OK)
+                {
+                    ml_replace(lnum, newline.ga_data, TRUE);
+                    replaced += hits;
+                }
+                // A failed undo save leaves the line and the count alone.
+            }
+            ga_clear(&newline);
         }
-        if (changed && newline.ga_data != NULL)
-        {
-            ga_append(&newline, NUL);
-            if (u_savesub(lnum) == OK)
-                ml_replace(lnum, newline.ga_data, TRUE);
-        }
-        ga_clear(&newline);
+        --no_u_sync;
     }
-    --no_u_sync;
+    else
+    {
+        garray_T spans;
+        long total = xim_collect_spans(find, case_sensitive, &spans,
+                1000000L);
+
+        if (total > 0)
+        {
+            int i = (int)total - 1;
+
+            ++no_u_sync;
+            // Splices change the line count, so commit bottom-up and the
+            // line numbers of earlier spans stay valid.
+            while (i >= 0)
+            {
+                linenr_T span_lnum = ((xim_span_T *)spans.ga_data)[i].lnum;
+                int first = i;
+                garray_T out;
+
+                while (first > 0
+                        && ((xim_span_T *)spans.ga_data)[first - 1].lnum
+                            == span_lnum)
+                    --first;
+                if (xim_build_spliced(ml_get(span_lnum),
+                            ml_get_buf_len(curbuf, span_lnum),
+                            (xim_span_T *)spans.ga_data + first,
+                            i - first + 1, replace, &out) == OK)
+                {
+                    if (xim_splice_line(span_lnum, &out) == OK)
+                        replaced += i - first + 1;
+                }
+                xim_free_lines(&out);
+                i = first - 1;
+            }
+            --no_u_sync;
+        }
+        ga_clear(&spans);
+    }
     u_sync(TRUE);
     if (replaced > 0)
     {
         changed_lines(1, 0, curbuf->b_ml.ml_line_count + 1, 0);
+        check_cursor();
+        curwin->w_set_curswant = TRUE;
         redraw_curbuf_later(UPD_NOT_VALID);
     }
     if (count != NULL)
@@ -1127,7 +1491,8 @@ xim_engine_replace_all(const char *find, const char *replace, int case_sensitive
 
     /*
      * Replace the first literal match at or after the cursor and leave the
-     * cursor after the replacement.  One undo block; UTF-8 aware.
+     * cursor after the replacement.  One undo block; UTF-8 aware; a
+     * replacement with newlines splits into real lines.
      */
     int
 xim_engine_replace_one(const char *find, const char *replace, int case_sensitive)
@@ -1135,52 +1500,65 @@ xim_engine_replace_one(const char *find, const char *replace, int case_sensitive
     size_t flen = STRLEN(find);
     size_t rlen = STRLEN(replace);
     linenr_T lnum;
-    colnr_T start_col;
+    size_t start_col;
     int ascii;
+    regprog_T *prog;
 
     if (flen == 0 || !xim_engine_modifiable())
         return 0;
     ascii = xim_ascii_needle((char_u *)find, flen);
+    prog = xim_pattern_prog(find, case_sensitive);
     lnum = curwin->w_cursor.lnum;
     start_col = curwin->w_cursor.col;
     for (; lnum <= curbuf->b_ml.ml_line_count; ++lnum, start_col = 0)
     {
         char_u *line = ml_get(lnum);
         colnr_T len = ml_get_buf_len(curbuf, lnum);
-        colnr_T col = start_col;
+        int fast = case_sensitive || (ascii && xim_line_ascii(line, len));
+        size_t col = start_col;
 
-        while (col < len)
+        while (col < (size_t)len)
         {
-            if ((colnr_T)flen <= len - col
-                    && xim_match_at(line + col, (char_u *)find, flen,
-                        case_sensitive, ascii))
-            {
-                garray_T newline;
+            size_t start = 0;
+            size_t mlen = xim_span_in_line(line, len, col, find, flen,
+                    case_sensitive, fast, prog, &start);
 
-                ga_init2(&newline, 1, (int)len + (int)rlen + 16);
-                ga_concat_len(&newline, line, (size_t)col);
-                if (rlen > 0)
-                    ga_concat_len(&newline, (char_u *)replace, rlen);
-                ga_concat_len(&newline, line + col + flen,
-                        (size_t)(len - col - flen));
-                ga_append(&newline, NUL);
-                if (u_savesub(lnum) != OK)
+            if (mlen > 0)
+            {
+                xim_span_T span;
+                garray_T out;
+                char_u *tail;
+
+                span.lnum = lnum;
+                span.col = start;
+                span.len = mlen;
+                if (xim_build_spliced(line, len, &span, 1, replace, &out)
+                        != OK)
                 {
-                    ga_clear(&newline);
+                    xim_free_lines(&out);
                     return 0;
                 }
-                ml_replace(lnum, newline.ga_data, TRUE);
-                ga_clear(&newline);
-                curwin->w_cursor.lnum = lnum;
-                curwin->w_cursor.col = col + (colnr_T)rlen;
-                check_cursor_col();
+                if (xim_splice_line(lnum, &out) != OK)
+                {
+                    xim_free_lines(&out);
+                    return 0;
+                }
+                // Cursor after the replacement: on the last produced line,
+                // at the byte length of the replacement tail.
+                tail = (char_u *)replace + rlen;
+                while (tail > (char_u *)replace && tail[-1] != NL)
+                    --tail;
+                curwin->w_cursor.lnum = lnum + out.ga_len - 1;
+                curwin->w_cursor.col = (colnr_T)((char_u *)replace + rlen - tail);
+                xim_free_lines(&out);
+                check_cursor();
                 curwin->w_set_curswant = TRUE;
                 u_sync(TRUE);
-                changed_lines(lnum, 0, lnum + 1, 0);
+                changed_lines(lnum, 0, curwin->w_cursor.lnum + 1, 0);
                 redraw_curbuf_later(UPD_NOT_VALID);
                 return 1;
             }
-            col += ascii ? 1 : (*mb_ptr2len)(line + col);
+            col += fast ? 1 : (size_t)(*mb_ptr2len)(line + col);
         }
     }
     return 0;
@@ -1587,6 +1965,10 @@ xim_step(void)
         goto received;
     }
     xim_render();
+    // Preserve Alt through decoding for this read: merge_modifyOtherKeys
+    // would otherwise fold Alt into the character's high bit before the
+    // native seam can see the modifier.
+    xim_preserve_modifiers = TRUE;
     // Wait at the top-level seam: completions are not decoder input and
     // engine operations never run inside safe_vgetc(). The existing Unix
     // wait still services timers, channels and resize notifications.
@@ -1600,12 +1982,14 @@ xim_step(void)
         xim_waiting = FALSE;
         if (xim_background())
         {
+            xim_preserve_modifiers = FALSE;
             c = K_IGNORE;
             goto received;
         }
         xim_render();
     }
     c = safe_vgetc();
+    xim_preserve_modifiers = FALSE;
 received:
     --allow_keys;
     --no_mapping;
@@ -1719,6 +2103,7 @@ received:
         case K_TAB: key = '\t'; break;
         case K_F1: key = XIM_F1; break;
         case K_F2: key = XIM_F2; break;
+        case K_S_F3: modifiers |= XIM_SHIFT; /* FALLTHROUGH */
         case K_F3: key = XIM_F3; break;
         case K_F4: key = XIM_F4; break;
         case K_F5: key = XIM_F5; break;

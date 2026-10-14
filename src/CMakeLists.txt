@@ -418,7 +418,7 @@ if(NOT XIM_FEATURE_LEVEL STREQUAL "tiny")
     add_test(NAME xim_native_pty
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/test_xim.py
             --binary $<TARGET_FILE:xim> --work ${CMAKE_BINARY_DIR}/Testing/native)
-    set_tests_properties(xim_native_pty PROPERTIES LABELS "xim_native" TIMEOUT 120)
+    set_tests_properties(xim_native_pty PROPERTIES LABELS "xim_native" TIMEOUT 240)
 else()
     message(STATUS "Tiny omits Vimscript/Visual support; building compatibility Vim only.")
 endif()

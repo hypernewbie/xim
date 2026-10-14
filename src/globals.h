@@ -1536,6 +1536,7 @@ EXTERN int      xim_native_mode INIT(= FALSE); // native entry point only
 EXTERN int      xim_wake_fd INIT(= -1); // owned by the native project module
 EXTERN int      xim_waiting INIT(= FALSE); // top-level native event wait only
 EXTERN int      xim_drawing_overlay INIT(= FALSE);
+EXTERN int      xim_preserve_modifiers INIT(= FALSE); // keep Alt distinct at the native read seam
 EXTERN void     (*xim_redraw_ui)(void) INIT(= NULL); // owning-thread callback
 EXTERN void     (*xim_draw_menu_bar_ptr)(void) INIT(= NULL); // native menu bar
 

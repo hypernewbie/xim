@@ -187,6 +187,56 @@ int main(int argc, char **argv)
             require(capped.find("results truncated") != std::string::npos,
                 "truncation summary missing");
         }
+        // A refresh invalidates completed content results until the new
+        // generation publishes (stale-read regression).
+        {
+            auto content = fixture / "stale";
+            std::filesystem::create_directories(content);
+            std::ofstream(content / "a.txt") << "needle OLD\n";
+            xim_project_init(content.c_str());
+            wait_scan();
+            auto stale = completed_content("needle", false);
+            require(stale.find("needle OLD") != std::string::npos,
+                "initial content match missing");
+            std::ofstream(content / "a.txt") << "NO LONGER MATCHES\n";
+            xim_project_refresh();
+            require(xim_project_content_pending() == 1,
+                "refresh did not invalidate content readiness");
+            char *stale_rows = xim_project_content("needle", 0);
+            require(stale_rows == nullptr,
+                "completed rows served across a generation change");
+            xim_project_free(stale_rows);
+            wait_scan();
+            auto fresh = completed_content("needle", false);
+            require(fresh.find("needle OLD") == std::string::npos,
+                "stale content survived the rescanned generation");
+        }
+        // Display excerpts are bounded even when a matched line is huge;
+        // the meta column still carries the true jump position.
+        {
+            auto content = fixture / "excerpts";
+            std::filesystem::create_directories(content);
+            {
+                std::ofstream stream(content / "long.txt");
+                stream << std::string(9000, 'x') << "needle" << " tail";
+            }
+            xim_project_init(content.c_str());
+            wait_scan();
+            auto rows = completed_content("needle", false);
+            std::size_t line_start = rows.find("1: ");
+            require(line_start != std::string::npos, "excerpt row missing");
+            std::size_t display_end = rows.find('\t', line_start);
+            std::size_t line_end = rows.find('\n', line_start);
+            require(display_end != std::string::npos && display_end < line_end,
+                "excerpt row not field separated");
+            require(display_end - line_start < 300, "excerpt display unbounded");
+            require(rows.find("\xe2\x80\xa6") != std::string::npos,
+                "excerpt truncation marker missing");
+            std::size_t meta = rows.rfind('\t', line_end);
+            std::string col_text = rows.substr(meta + 1,
+                rows.find('\n', meta) - meta - 1);
+            require(col_text == "9000", col_text.c_str());
+        }
         xim_project_disable();
         require(std::string(xim_project_status()).empty(), "disabled project reports indexing");
         require(completed("alpha").empty(), "disabled project retained index");

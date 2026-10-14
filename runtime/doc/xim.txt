@@ -1,5 +1,5 @@
 *xim.txt*	Native non-modal terminal editing
-					Last change: 2026 Oct 11
+					Last change: 2026 Oct 14
 
 Xim's native input layer uses the existing Vim text engine.  This document
 describes the first native editing milestone.
@@ -68,18 +68,26 @@ Enter accepts; Escape cancels.  Find and Replace use literal text, so a query
 never acts as a regular expression.
 
 Find highlights every literal match as the query is typed and does not move
-the caret until you navigate.  Enter and F3 go to the next match, Shift-Enter
-and Shift-F3 to the previous.  Escape closes the prompt and clears the
-highlight.  Case is smart by default: the query is case-insensitive until it
-contains an uppercase letter.  Alt-C cycles smart, insensitive and sensitive,
-and the active rule and the match count show at the right of the prompt line.
+the caret until you navigate.  Enter goes to the next match, Shift-Enter to
+the previous; F3 and Shift-F3 do the same while the prompt stays open, and
+they keep working after the prompt closes.  F10 opens the menu bar even while
+a prompt is open.  Escape closes the prompt and clears the highlight in the
+window that owns it.  Case is smart by default: the query is case-insensitive
+until it contains an uppercase letter.  Buffer matching folds case through
+the editor's Unicode rules, so a long s matches s and folded pairs of
+different byte length replace correctly.  Alt-C cycles smart, insensitive and
+sensitive, and the active rule and the match count show at the right of the
+prompt line.  A terminal that reports modifiers, such as modifyOtherKeys,
+delivers Alt-C distinctly; a bare Escape followed by c is also accepted.
 The native highlight is window-local match state; it never changes 'hlsearch',
 so the compatibility path is unaffected.
 
 Replace opens two fields on one line.  Tab and Shift-Tab move between the find
 and replace fields.  Enter replaces every match in one undo block; Ctrl-R
-replaces the current match and advances to the next.  A read-only or
-non-modifiable buffer refuses the change and the prompt shows "read-only".
+replaces the current match and advances to the next.  A replacement pasted
+with newlines splits into real lines, like ":s" with a line break, and one
+undo restores the whole change.  A read-only or non-modifiable buffer refuses
+the change and the prompt shows "read-only".
 
 Files
 								*xim-files*
@@ -124,15 +132,22 @@ Project search
 								*xim-search*
 Search project finds literal text in the indexed files.  It reuses the smart
 case rule and the Alt-C toggle.  Results list each file as a header with its
-matched lines beneath; Enter or a click opens the file at that match.  The
-search runs on a third background worker over the file index.  Files larger
-than 1 MiB and binary files (a NUL byte in the first block) are skipped; the
-count of skipped files is reported once as a summary line, not per file.
-Results start capped at 1000 matches or 200 files, whichever comes first, and
-report truncation.  Only the latest query is searched; obsolete work is
-cancelled through a generation check.  A file argument opens a single buffer
-and disables the project, so project search is available only for a directory
-or a bare start.
+matched lines beneath; Enter or a click opens the file at that match, and the
+wheel moves the row selection while the results are open.  Enter pressed
+while the search is still running opens the first result as soon as it
+arrives, and keys typed meanwhile land in the opened buffer.  Each result
+shows a bounded excerpt around the match, so a very long line cannot stall
+the editor; the true match column is kept for the jump.  The search runs on a
+third background worker over the file index.  Its case folding covers ASCII
+and Latin-1; other scripts compare case-sensitively there, while buffer find
+uses the full Unicode rules.  Files larger than 1 MiB and binary files (a NUL
+byte in the first block) are skipped; the count of skipped files is reported
+once as a summary line, not per file.  Results start capped at 1000 matches
+or 200 files, whichever comes first, and report truncation.  Only the latest
+query is searched; obsolete work is cancelled through a generation check, and
+a project refresh invalidates completed results until the new scan publishes.
+A file argument opens a single buffer and disables the project, so project
+search is available only for a directory or a bare start.
 
 Content search reads the on-disk text of indexed files.  Unsaved buffer
 changes are not searched; save the buffer first to search the edited text.
@@ -170,12 +185,14 @@ gestures are outside the editor's reporting boundary.
 
 The top row shows File, Edit, View, Navigate and Help.  F10 opens the
 menu; Left/Right switch headings, Up/Down move, Enter runs, Escape
-dismisses.  Click a heading to open it, hover to switch while open, and
-click or press-drag-release an entry to run it.  Clicking outside
+dismisses.  Opening a heading selects its first entry, so Enter runs it
+without a Down first.  Click a heading to open it, hover to switch while
+open, and click or press-drag-release an entry to run it.  Clicking outside
 dismisses.  Narrow terminals clip trailing headings; keyboard access still
 reaches every group.  Right-click opens Edit choices at the pointer
-without clearing the selection.  F10 was the Redo fallback; use Ctrl-Y
-for Redo.  Ctrl-N creates a new buffer; use F3 for Next match.
+without clearing the selection.  Help > Xim help opens this doc.  F10 was
+the Redo fallback; use Ctrl-Y for Redo.  Ctrl-N creates a new buffer; use
+F3 for Next match.
 
 Mouse reporting uses inherited SGR sequences and is enabled by default in
 native mode.  Click places the insertion point; Shift-click extends the

@@ -44,13 +44,21 @@ and Enter agree.
 Find highlights every literal match through a window-local match list, not
 'hlsearch', so `xim --vim` and the compatibility dispatch are untouched. It
 reports a match count and a smart/insensitive/sensitive case rule at the
-right of the prompt row and never moves the caret while typing. Alt-C cycles
-the rule; a terminal without modifyOtherKeys delivers it as Escape followed
-by 'c', which the seam claims as the case toggle before treating Escape as a
-cancel. Replace edits a find field and a replace field on one line; Tab and
-Shift-Tab move between them. Replace-all and replace-one run through
-`u_savesub` as one undo block. A read-only or non-modifiable buffer refuses
-the change and the prompt enters its error state.
+right of the prompt row and never moves the caret while typing. Buffer
+matching folds case through the editor's Unicode rules; a compiled pattern is
+reused per query and rule. The highlight is deleted from the window that
+created it, which can differ from the focused window after a menu opened
+another window. Alt-C cycles the rule; a terminal that reports modifiers
+delivers Alt-C with its modifier preserved at the seam (the inherited
+modifyOtherKeys fold is bypassed for native dispatch), and a terminal without
+it delivers Escape followed by 'c', which the seam claims as the case toggle
+before treating Escape as a cancel. F3 and Shift-F3 navigate while a find
+prompt is open, and F10 opens the menu bar over any prompt. Replace edits a
+find field and a replace field on one line; Tab and Shift-Tab move between
+them. Replace-all and replace-one run as one undo block; a replacement with
+newlines splices real lines through an `u_save` range so one undo restores
+the whole change. A read-only or non-modifiable buffer refuses the change and
+the prompt enters its error state.
 
 Mouse input reuses the inherited SGR decoder; no second parser and no modal
 key injection exist. Click, Shift-click, drag, double/triple-click, wheel
@@ -76,14 +84,21 @@ path snapshot; a third content matcher reads the indexed files and starts on
 the first project search. Requests coalesce and completion uses one latest-result slot
 plus a scan-change flag. Generations and query revisions reject obsolete
 results, with cancellation checks during walking, path matching and file
-reads. The content worker waits for a completed scan, skips files larger than
+reads. A content request carries its generation; a completed result is served
+only while that generation is still current, so a refresh invalidates it and
+the prompt shows the pending state until the new scan publishes. Content rows
+serialize outside the state mutex, and each row carries a bounded display
+excerpt (clamped on UTF-8 boundaries with ellipsis markers) next to the true
+line and column used for the jump. The content worker waits for a completed
+scan, skips files larger than
 1 MiB and files with a NUL byte in the first block, and caps results at 1000
 matches or 200 files. It reports skipped and truncated counts as one summary
 row rather than per file.
 Refresh never joins the old scan on the editor thread. Retired large indexes
 are freed by workers outside the state mutex, not during a main-thread refresh
 or a completion-slot update. Shutdown cancels first,
-then joins both workers; a blocking filesystem call can still delay shutdown.
+then joins all three workers; a blocking filesystem call can still delay
+shutdown.
 
 A nonblocking close-on-exec pipe wakes the existing Unix select/poll wait.
 The native top-level seam processes completions before entering safe_vgetc();

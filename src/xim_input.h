@@ -64,7 +64,7 @@ char *xim_engine_buffer_name(int fnum);
 int xim_engine_current_buffer(void);
 int xim_engine_buffer_utf8(int fnum);
 int xim_engine_reload_staged(int fnum, const char *data, size_t length,
-        unsigned long long expected_tick);
+        unsigned long long expected_tick, unsigned long long expected_version);
 int xim_engine_reload(int fnum);
 int xim_engine_rename_buffer(int fnum, const char *name);
 void xim_engine_notice(const char *text);

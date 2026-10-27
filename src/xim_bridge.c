@@ -113,7 +113,8 @@ xim_engine_current_buffer(void)
 xim_engine_buffer_utf8(int fnum)
 {
     buf_T *buf = buflist_findnr(fnum);
-    if (buf == NULL)
+    if (buf == NULL || !enc_utf8 || buf->b_p_bin || !bt_normal(buf)
+	    || !buf->b_p_ma)
 	return 0;
     if (buf->b_p_fenc == NULL || *buf->b_p_fenc == NUL)
 	return 1;
@@ -127,25 +128,66 @@ xim_engine_buffer_utf8(int fnum)
  * and changedtick. Only UTF-8 text is staged; other encodings use the
  * explicit engine reload so the full conversion rules apply.
  */
+    static int
+xim_reload_valid(bufref_T *ref, const char_u *name,
+	unsigned long long tick, unsigned long long version)
+{
+    if (!bufref_valid(ref) || curbuf != ref->br_buf
+	    || curbuf->b_ffname == NULL || STRCMP(curbuf->b_ffname, name) != 0
+	    || bufIsChanged(curbuf)
+	    || (unsigned long long)CHANGEDTICK(curbuf) != tick
+	    || !xim_engine_buffer_utf8(curbuf->b_fnum))
+	return FALSE;
+    return xim_project_file_version((const char *)name) == version;
+}
+
     int
 xim_engine_reload_staged(int fnum, const char *data, size_t length,
-	unsigned long long expected_tick)
+	unsigned long long expected_tick, unsigned long long expected_version)
 {
     buf_T *buf = buflist_findnr(fnum);
-    if (buf == NULL || buf != curbuf || bufIsChanged(buf))
+    bufref_T ref;
+    stat_T info;
+    if (buf == NULL || buf != curbuf || buf->b_ffname == NULL
+	    || memchr(data, NUL, length) != NULL
+	    || !utf_valid_string((char_u *)data, (char_u *)data + length))
 	return 0;
-    if ((unsigned long long)CHANGEDTICK(buf) != expected_tick)
+    set_bufref(&ref, buf);
+    char_u *name = vim_strsave(buf->b_ffname);
+    if (name == NULL)
 	return 0;
-    if (!xim_engine_buffer_utf8(fnum))
+    // The bytes belong to a specific disk version, not whatever file now
+    // occupies that path. Preserve this stamp for the next ordinary write.
+    if (mch_stat((const char *)name, &info) != 0
+	    || !xim_reload_valid(&ref, name, expected_tick, expected_version))
+    {
+	vim_free(name);
 	return 0;
+    }
+    apply_autocmds(EVENT_BUFREADPRE, name, NULL, FALSE, buf);
+    if (!xim_reload_valid(&ref, name, expected_tick, expected_version))
+    {
+	vim_free(name);
+	return 0;
+    }
+    vim_free(name);
 
-    // Split into lines using the separator present in the staged bytes.
-    int crlf = 0;
-    int mac = 0;
-    if (memchr(data, '\n', length) == NULL && memchr(data, '\r', length) != NULL)
-	mac = 1;
-    else if (memchr(data, '\r', length) != NULL)
-	crlf = 1;
+    int bomb = length >= 3 && (unsigned char)data[0] == 0xef
+	&& (unsigned char)data[1] == 0xbb && (unsigned char)data[2] == 0xbf;
+    if (bomb)
+    {
+	data += 3;
+	length -= 3;
+    }
+    // Only consistent CRLF pairs select DOS. A lone CR in an LF file is
+    // text, not evidence that every line must lose its last byte.
+    int mac = memchr(data, '\n', length) == NULL
+	&& memchr(data, '\r', length) != NULL;
+    int crlf = !mac && memchr(data, '\n', length) != NULL;
+    for (size_t i = 0; crlf && i < length; ++i)
+	if (data[i] == '\n' && (i == 0 || data[i - 1] != '\r'))
+	    crlf = FALSE;
+    int eol = length == 0 || data[length - 1] == (mac ? '\r' : '\n');
 
     garray_T lines;
     ga_init2(&lines, sizeof(char_u *), 128);
@@ -199,32 +241,54 @@ xim_engine_reload_staged(int fnum, const char *data, size_t length,
     }
 
     linenr_T old_count = buf->b_ml.ml_line_count;
-    if (u_save((linenr_T)0, old_count + 1) == FAIL)
+    xim_engine_boundary();
+    xim_engine_cancel();
+    if (u_savecommon((linenr_T)0, old_count + 1, 0, TRUE) == FAIL)
     {
 	for (int n = 0; n < added; ++n)
 	    vim_free(((char_u **)lines.ga_data)[n]);
 	ga_clear(&lines);
 	return 0;
     }
+    int ok = TRUE;
     for (int i = 0; i < added; ++i)
     {
 	char_u *line = ((char_u **)lines.ga_data)[i];
-	if (i < old_count)
-	    ml_replace((linenr_T)(i + 1), line, TRUE);
-	else
-	    ml_append((linenr_T)i, line, 0, FALSE);
-	if (i < old_count)
-	    line = NULL;  // ml_replace with copy owns a copy
+	if (ok)
+	    ok = i < old_count
+		? ml_replace((linenr_T)(i + 1), line, TRUE) == OK
+		: ml_append((linenr_T)i, line, 0, FALSE) == OK;
+	// Both APIs above copy the text. The staged allocation stays ours.
 	vim_free(line);
     }
-    for (linenr_T lnum = old_count; lnum > added; --lnum)
-	ml_delete(lnum);
+    for (linenr_T lnum = old_count; ok && lnum > added; --lnum)
+	ok = ml_delete(lnum) == OK;
     ga_clear(&lines);
-    unchanged(buf, FALSE, TRUE);
+    // This is a reload, not an edit of a readonly file. Avoid running the
+    // FileChangedRO callback from changed() after the import has started.
+    changed_internal();
+    changed_lines(1, 0, old_count + 1,
+	    buf->b_ml.ml_line_count - old_count);
+    xim_engine_boundary();
+    if (!ok)
+    {
+	u_undo(1);
+	return 0;
+    }
+    set_fileformat(mac ? EOL_MAC : crlf ? EOL_DOS : EOL_UNIX, OPT_LOCAL);
+    buf->b_p_eol = eol;
+    buf->b_p_bomb = bomb;
+    buf->b_no_eol_lnum = eol ? 0 : buf->b_ml.ml_line_count;
+    buf_store_time(buf, &info, buf->b_ffname);
+    buf->b_mtime_read = buf->b_mtime;
+    buf->b_mtime_read_ns = buf->b_mtime_ns;
+    unchanged(buf, TRUE, TRUE);
+    u_unchanged(buf);
     check_cursor();
     curwin->w_set_curswant = TRUE;
     redraw_curbuf_later(UPD_NOT_VALID);
-    return 1;
+    apply_autocmds(EVENT_BUFREADPOST, buf->b_fname, NULL, FALSE, buf);
+    return bufref_valid(&ref) ? 1 : 0;
 }
 
 /*

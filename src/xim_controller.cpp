@@ -274,6 +274,7 @@ struct TrackedBuffer
     unsigned long long tick = 0;
     unsigned long long version = 0;
     unsigned long long read_id = 0;
+    unsigned long long read_tick = 0;
     bool read_pending = false;
     bool modified = false;
 };
@@ -459,6 +460,7 @@ void sync_tracked_buffers()
             {
                 buffer.version = old.version;
                 buffer.read_id = old.read_id;
+                buffer.read_tick = old.read_tick;
                 buffer.read_pending = old.read_pending;
             }
             else
@@ -491,8 +493,16 @@ void sync_tracked_buffers()
         for (const auto &buffer : next)
             if (buffer.fnum == old.fnum)
                 present = true;
-        if (!present)
+        bool renamed = false;
+        for (const auto &buffer : next)
+            if (buffer.fnum == old.fnum && buffer.name != old.name)
+                renamed = true;
+        if (!present || renamed)
+        {
             xim_project_unwatch_file(old.name.c_str());
+            if (old.read_pending)
+                xim_project_read_discard(old.read_id);
+        }
     }
     tracked_buffers = std::move(next);
     update_status_note();
@@ -544,6 +554,7 @@ void consider_reload(TrackedBuffer &buffer, unsigned long long version)
         return;
     }
     buffer.read_id = id;
+    buffer.read_tick = tick;
     buffer.read_pending = true;
 }
 
@@ -579,8 +590,9 @@ bool process_pending_reads()
         unsigned long long tick = 0;
         int modified = 0;
         if (binary || !buffer_info(buffer.fnum, tick, modified)
-                || tick != buffer.tick || modified
-                || xim_engine_current_buffer() != buffer.fnum)
+                || tick != buffer.read_tick || modified
+                || xim_engine_current_buffer() != buffer.fnum
+                || xim_project_file_version(buffer.name.c_str()) != version)
         {
             // Typing during the read, a rename or an encoding boundary turns
             // the completion into a conflict instead of overwriting text.
@@ -588,7 +600,7 @@ bool process_pending_reads()
             continue;
         }
         if (!xim_engine_reload_staged(buffer.fnum, data.get(), length,
-                    buffer.tick))
+                    buffer.read_tick, version))
         {
             add_notice(buffer.fnum, buffer.name, 0);
             continue;

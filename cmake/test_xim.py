@@ -2,6 +2,7 @@
 """PTY assertions for the native Xim executable, using real shortcuts."""
 import argparse
 import fcntl
+import json
 import os
 import pty
 import re
@@ -1939,6 +1940,77 @@ def external_changes(binary, root):
     print("Watcher reload, dirty protection and rename checks passed")
 
 
+def external_reload_formats(binary, root):
+    """Staged reload preserves disk format, write stamps and undo boundaries."""
+    cases = (
+        ("noeol", b"new", "unix", 0, 0, b"Xnew"),
+        ("dos", b"new\r\nnext\r\n", "dos", 1, 0, b"Xnew\r\nnext\r\n"),
+        ("mac", b"new\rnext\r", "mac", 1, 0, b"Xnew\rnext\r"),
+        ("mixed", b"new\r\nnext\n", "unix", 1, 0, b"Xnew\r\nnext\n"),
+        ("bom", b"\xef\xbb\xbfnew\n", "unix", 1, 1, b"\xef\xbb\xbfXnew\n"),
+    )
+    for label, payload, ff, eol, bomb, saved in cases:
+        with tempfile.TemporaryDirectory(prefix="xim-reload-" + label + "-",
+                                         dir=root) as temporary:
+            project = Path(temporary)
+            path = project / "alpha.txt"
+            path.write_bytes(b"old\n")
+            session = Session(binary, project,
+                              ("alpha.txt", "-c", "setlocal nofixeol"),
+                              ready=b"alpha.txt")
+            try:
+                session.drain(.2)
+                path.write_bytes(payload)
+                assert wait_screen(session, b"Reloaded from disk:", timeout=5), \
+                    session.screen.text()[-800:]
+                session.ex("call writefile([json_encode([&ff, &eol, &bomb, "
+                           "getline(1)])], 'format')")
+                state = json.loads((project / "format").read_text())
+                assert state == [ff, eol, bomb, "new" + ("\r" if label == "mixed" else "")], state
+                # No inherited overwrite question after an accepted reload.
+                session.send(b"X\x13")
+                assert wait_drain(session, lambda: path.read_bytes() == saved), \
+                    (path.read_bytes(), saved, session.screen.text()[-800:])
+                session.send(b"\x1a\x1a")
+                session.drain(.2)
+                assert session.snapshot() == "old\n", session.snapshot()
+            finally:
+                session.close()
+
+    with tempfile.TemporaryDirectory(prefix="xim-reload-invalid-", dir=root) as temporary:
+        project = Path(temporary)
+        path = project / "alpha.txt"
+        path.write_bytes(b"old\n")
+        session = Session(binary, project, ("alpha.txt",), ready=b"alpha.txt")
+        try:
+            session.drain(.2)
+            path.write_bytes(b"invalid\xff\n")
+            assert wait_screen(session, b"changed on disk", timeout=5)
+            assert session.snapshot() == "old\n"
+            assert b"Reloaded from disk:" not in session.screen.text()
+        finally:
+            session.close()
+    for event, command, expected in (
+            ("BufReadPre", "call setline(1, 'hook edit')", "hook edit\n"),
+            ("BufReadPost", "bwipeout!", "\n")):
+        with tempfile.TemporaryDirectory(prefix="xim-reload-hook-", dir=root) as temporary:
+            project = Path(temporary)
+            path = project / "alpha.txt"
+            path.write_text("old\n")
+            (project / "hook.vim").write_text(
+                f"autocmd {event} alpha.txt {command}\n")
+            session = Session(binary, project, ("alpha.txt",), ready=b"alpha.txt")
+            try:
+                session.ex("source hook.vim")
+                path.write_text("disk\n")
+                session.drain(.7)
+                assert session.snapshot() == expected, session.snapshot()
+                assert path.read_text() == "disk\n"
+            finally:
+                session.close()
+    print("Staged reload format, write-stamp, UTF-8, hooks and undo checks passed")
+
+
 def file_operations(binary, root):
     """Plan 6: create, rename, move and permanent delete with safe targets."""
     with tempfile.TemporaryDirectory(prefix="xim-fsops-", dir=root) as temporary:
@@ -2218,4 +2290,5 @@ if __name__ == "__main__":
     file_operations(args.binary.resolve(), args.work.resolve())
     project_switch_recents(args.binary.resolve(), args.work.resolve())
     external_changes(args.binary.resolve(), args.work.resolve())
+    external_reload_formats(args.binary.resolve(), args.work.resolve())
     compatibility_unchanged(args.binary.resolve(), args.work.resolve())

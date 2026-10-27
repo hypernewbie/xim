@@ -173,7 +173,9 @@ automatically.  The staged bytes are applied only while the buffer, its edit
 revision and the disk identity still match the observation that started the
 read; typing during the read turns the completion into a conflict.  The reload
 keeps the caret position and leaves one undo step back to the previous text.
-Larger files, non-UTF-8 files and hidden buffers are not reloaded
+It also updates the disk timestamp and the 'fileformat', 'endofline' and
+'bomb' values.  The 'fixeol' option still controls final newlines on write.
+Invalid UTF-8, larger files, binary files and hidden buffers are not reloaded
 automatically.  A dirty buffer keeps its edits.
 
 The status line shows "[!] changed on disk" or "[!] missing on disk" for the

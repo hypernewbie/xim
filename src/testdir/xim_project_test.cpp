@@ -385,8 +385,36 @@ int main(int argc, char **argv)
             require(read_data && read_length == std::string("hello edited\n").size()
                     && std::string(read_data.get(), read_length) == "hello edited\n",
                 "staged read bytes differ");
-            require(read_version != 0 && !read_binary,
+            require(read_version == xim_project_file_version(
+                        (watched / "a.txt").c_str()) && !read_binary,
                 "staged read identity/binary flag differs");
+            // Discarded reads must not republish a result after the buffer
+            // closes or changes name. The last read is a worker-order barrier.
+            std::vector<unsigned long long> discarded;
+            for (int i = 0; i < 16; ++i)
+            {
+                auto id = xim_project_stage_read((watched / "a.txt").c_str(), 4096);
+                require(id != 0, "discarded read was refused");
+                xim_project_read_discard(id);
+                discarded.push_back(id);
+            }
+            require(mkfifo((watched / "pipe").c_str(), 0600) == 0,
+                "staged-read FIFO fixture failed");
+            auto fifo_id = xim_project_stage_read((watched / "pipe").c_str(), 4096);
+            require(fifo_id != 0, "FIFO read was not submitted");
+            until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (xim_project_read_state(fifo_id) == 0)
+            {
+                require(std::chrono::steady_clock::now() < until,
+                    "staged read blocked on a special file");
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            require(xim_project_read_state(fifo_id) == -1,
+                "staged read accepted a special file");
+            xim_project_read_discard(fifo_id);
+            for (auto id : discarded)
+                require(xim_project_read_state(id) == -1,
+                    "discarded read republished its result");
             std::filesystem::remove(watched / "a.txt");
             auto deleted = take_changes();
             require(deleted.find("a.txt") != std::string::npos

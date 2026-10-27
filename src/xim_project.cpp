@@ -1018,17 +1018,8 @@ std::string explorer_status_locked()
     return {};
 }
 
-unsigned long long path_version(const std::string &path)
+unsigned long long stat_file_version(const struct stat &info)
 {
-    struct stat info;
-    if (lstat(path.c_str(), &info) != 0)
-        return 0;
-    if (S_ISLNK(info.st_mode))
-    {
-        struct stat target;
-        if (stat(path.c_str(), &target) == 0)
-            info = target;
-    }
     unsigned long long value = static_cast<unsigned long long>(info.st_dev);
     value = value * 1099511628211ull
         ^ static_cast<unsigned long long>(info.st_ino);
@@ -1039,6 +1030,14 @@ unsigned long long path_version(const std::string &path)
     value = value * 1099511628211ull
         ^ static_cast<unsigned long long>(info.st_mtim.tv_nsec);
     return value;
+}
+
+unsigned long long path_version(const std::string &path)
+{
+    struct stat info;
+    if (stat(path.c_str(), &info) != 0)
+        return 0;
+    return stat_file_version(info);
 }
 
 std::string base_name_of(std::string_view path);
@@ -2405,7 +2404,7 @@ void read_loop()
         lock.unlock();
 
         ReadResult result;
-        int fd = open(request.path.c_str(), O_RDONLY | O_CLOEXEC);
+        int fd = open(request.path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0)
             result.state = -1;
         else
@@ -2441,12 +2440,13 @@ void read_loop()
                         || after.st_mtim.tv_sec != before.st_mtim.tv_sec
                         || after.st_mtim.tv_nsec != before.st_mtim.tv_nsec
                         || after.st_ino != before.st_ino
-                        || after.st_dev != before.st_dev)
+                        || after.st_dev != before.st_dev
+                        || path_version(request.path) != stat_file_version(after))
                     result.state = -1;
                 else
                 {
                     result.state = 1;
-                    result.version = path_version(request.path);
+                    result.version = stat_file_version(after);
                     result.binary = data.find('\0') != std::string::npos;
                     result.data = std::move(data);
                 }
@@ -2454,7 +2454,7 @@ void read_loop()
             close(fd);
         }
         lock.lock();
-        if (!stopping.load())
+        if (!stopping.load() && read_results.contains(request.id))
         {
             read_results[request.id] = std::move(result);
             while (read_results.size() > 64)

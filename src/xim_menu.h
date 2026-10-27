@@ -16,6 +16,7 @@ inline constexpr unsigned kCanRedo = 1u << 4;
 inline constexpr unsigned kWrapOn = 1u << 5;
 inline constexpr unsigned kNumberOn = 1u << 6;
 inline constexpr unsigned kMouseOn = 1u << 7;
+inline constexpr unsigned kProject = 1u << 8;
 
 enum class MenuGroup { file, edit, view, navigate, help, count };
 struct MenuItem

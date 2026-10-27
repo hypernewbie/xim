@@ -311,6 +311,10 @@ int main(int argc, char **argv)
             // A directory change between requests must reload the page data
             // rather than mixing two listings.
             std::ofstream(exp / "zz_new.txt") << "new\n";
+            // Make the directory change deterministic instead of racing the
+            // watcher rebuild that the same create also requests.
+            xim_project_refresh();
+            wait_scan();
             xim_project_explorer_more(".");
             rows = explorer_rows();
             require(rows.find("zz_new.txt\tzz_new.txt\tf\t0") != std::string::npos,

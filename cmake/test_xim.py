@@ -1927,6 +1927,120 @@ def external_changes(binary, root):
     print("Watcher reload, dirty protection and rename checks passed")
 
 
+def file_operations(binary, root):
+    """Plan 6: create, rename, move and permanent delete with safe targets."""
+    with tempfile.TemporaryDirectory(prefix="xim-fsops-", dir=root) as temporary:
+        project = Path(temporary)
+        (project / "alpha.txt").write_text("alpha\n")
+        (project / "sub").mkdir()
+        (project / "sub" / "inner.txt").write_text("inner\n")
+        (project / "ctx.txt").write_text("context\n")
+        session = Session(binary, project, (".",))
+        try:
+            # New file creates an empty disk file and opens it.
+            session.send(b"\x1bOPNew file\r")
+            session.wait(b"New file:")
+            session.send(b"created.txt\r")
+            assert session.wait_for_file(project / "created.txt", ""), \
+                "new file was not created"
+            session.wait(b"created.txt")
+            session.send(b"hello")
+            session.send(b"\x13")
+            assert session.wait_for_file(project / "created.txt", "hello"), \
+                (project / "created.txt").read_text()
+            # New folder.
+            session.send(b"\x1bOPNew folder\r")
+            session.wait(b"New folder:")
+            session.send(b"folder\r")
+            assert wait_until(lambda: (project / "folder").is_dir()), \
+                "new folder was not created"
+            # Right-clicking an explorer row targets that painted row.
+            session.send(b"\x05")
+            session.wait(b"Explorer:")
+            assert wait_screen(session, b"ctx.txt", timeout=5)
+            row, column = screen_rowcol(session.screen, "ctx.txt")
+            session.send(f"\x1b[<2;{column};{row}M\x1b[<2;{column};{row}m".encode())
+            session.wait(b"Delete permanently")
+            for _ in range(6):
+                session.send(b"\x1b[B")
+            session.send(b"\r")
+            session.wait(b"Rename: ")
+            session.send(b"\x01")
+            session.send(b"ctx2.txt\r")
+            assert wait_until(lambda: (project / "ctx2.txt").exists()), \
+                "context-menu rename did not reach disk"
+            assert not (project / "ctx.txt").exists()
+            session.send(b"\x1b")
+            session.drain(.2)
+            # Rename keeps the buffer text and updates its disk name.
+            session.send(b"\x1bOPRename\r")
+            session.wait(b"Rename: ")
+            session.send(b"\x01")
+            session.send(b"renamed.txt\r")
+            assert wait_until(lambda: (project / "renamed.txt").exists()), \
+                "rename did not reach disk"
+            assert not (project / "created.txt").exists()
+            assert session.snapshot() == "hello\n"
+            session.send(b"!")
+            session.send(b"\x13")
+            assert session.wait_for_file(project / "renamed.txt", "hello!"), \
+                (project / "renamed.txt").read_text()
+            assert not (project / "created.txt").exists()
+            # Open a descendant, then move its directory: the buffer keeps
+            # its text and follows the new path.
+            session.send(b"\x05")
+            session.wait(b"Explorer:")
+            session.send(b"sub")
+            assert wait_screen(session, b"sub/", timeout=5)
+            session.send(b"\r")
+            session.drain(.2)
+            session.send(b"\x01\x7f")
+            session.send(b"inner")
+            assert wait_screen(session, b"inner.txt", timeout=5)
+            session.send(b"\r")
+            session.wait(b"inner")
+            session.send(b"\x05")
+            session.wait(b"Explorer:")
+            session.send(b"sub")
+            assert wait_screen(session, b"sub/", timeout=5)
+            session.send(b"\x1b[21~")
+            session.wait(b"Delete permanently")
+            for _ in range(7):
+                session.send(b"\x1b[B")
+            session.send(b"\r")
+            session.wait(b"Move to: ")
+            session.send(b"moved\r")
+            assert wait_until(lambda: (project / "moved" / "inner.txt").exists()), \
+                "directory move did not reach disk"
+            assert not (project / "sub").exists()
+            session.wait(b"moved/inner.txt")
+            assert session.snapshot() == "inner\n"
+            # Deleting a dirty open file needs consent and keeps its text.
+            session.send(b"local")
+            session.drain(.2)
+            session.send(b"\x1bOPDelete permanently\r")
+            assert wait_screen(session, b"[d] Delete permanently", timeout=5), \
+                session.screen.text()[-800:]
+            assert b"dirty buffer" in session.screen.text(), \
+                session.screen.text()[-800:]
+            session.send(b"d")
+            assert wait_until(lambda: not (project / "moved" / "inner.txt").exists()), \
+                "permanent delete did not remove the file"
+            assert wait_screen(session, b"Missing on disk", timeout=5), \
+                session.screen.text()[-800:]
+            assert session.snapshot() == "localinner\n"
+            # Traversal in a new name is refused.
+            session.send(b"\x1bOPNew file\r")
+            session.wait(b"New file:")
+            session.send(b"../escaped.txt\r")
+            assert wait_screen(session, b"Invalid", timeout=5), \
+                session.screen.text()[-800:]
+            assert not (project.parent / "escaped.txt").exists()
+        finally:
+            session.close()
+    print("Native create, rename, move and permanent-delete checks passed")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -1965,5 +2079,6 @@ if __name__ == "__main__":
     find_highlight_window(args.binary.resolve(), args.work.resolve())
     find_replace(args.binary.resolve(), args.work.resolve())
     project_content_search(args.binary.resolve(), args.work.resolve())
+    file_operations(args.binary.resolve(), args.work.resolve())
     external_changes(args.binary.resolve(), args.work.resolve())
     compatibility_unchanged(args.binary.resolve(), args.work.resolve())

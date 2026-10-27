@@ -381,7 +381,7 @@ target_link_libraries(vim PRIVATE vim_core)
 if(NOT XIM_FEATURE_LEVEL STREQUAL "tiny")
     add_executable(xim main.c ${VIM_OBJ_MAIN_SRC}
         xim_bridge.c xim_controller.cpp xim_commands.cpp xim_menu.cpp xim_project.cpp
-        xim_watch.cpp xim_fsops.cpp)
+        xim_watch.cpp xim_fsops.cpp xim_recent.cpp)
     target_compile_definitions(xim PRIVATE XIM_NATIVE_ENTRY)
     target_link_libraries(xim PRIVATE vim_core)
     xim_apply_cxx_settings(xim)
@@ -408,6 +408,14 @@ if(NOT XIM_FEATURE_LEVEL STREQUAL "tiny")
 
     find_package(Threads REQUIRED)
     target_link_libraries(xim PRIVATE Threads::Threads)
+    add_executable(xim_recent_test testdir/xim_recent_test.cpp xim_recent.cpp)
+    xim_apply_default_flags(xim_recent_test)
+    xim_apply_cxx_settings(xim_recent_test)
+    target_link_libraries(xim_recent_test PRIVATE Threads::Threads)
+    add_test(NAME xim_recent COMMAND xim_recent_test
+        ${CMAKE_BINARY_DIR}/Testing/recent-fixture)
+    set_tests_properties(xim_recent PROPERTIES LABELS "xim_native" TIMEOUT 60)
+
     add_executable(xim_fsops_test testdir/xim_fsops_test.cpp xim_fsops.cpp)
     xim_apply_default_flags(xim_fsops_test)
     xim_apply_cxx_settings(xim_fsops_test)

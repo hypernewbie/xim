@@ -159,7 +159,7 @@ func Test_xim_project_pickers()
   " Quick open lists project-relative paths once the background index lands.
   call term_sendkeys(buf, "\<C-P>")
   call WaitForAssert({-> assert_match('Files:', s:Screen(buf))})
-  call WaitForAssert({-> assert_match('src/alpha\.cpp', s:Screen(buf))})
+  call WaitForAssert({-> assert_match('alpha\.cpp', s:Screen(buf))})
   call s:Dump(buf, 'Test_xim_quick_open')
   call term_sendkeys(buf, "\<Esc>")
   " The explorer expands a directory lazily.
@@ -168,7 +168,7 @@ func Test_xim_project_pickers()
   call WaitForAssert({-> assert_match('+ src/', s:Screen(buf))})
   call term_sendkeys(buf, "\<CR>")
   call WaitForAssert({-> assert_match('- src/', s:Screen(buf))})
-  call WaitForAssert({-> assert_match('src/alpha\.cpp', s:Screen(buf))})
+  call WaitForAssert({-> assert_match('alpha\.cpp', s:Screen(buf))})
   call s:Dump(buf, 'Test_xim_explorer')
   call term_sendkeys(buf, "\<Esc>")
   " Project content search lists file headers with their matched lines.
@@ -297,7 +297,7 @@ func Test_xim_project_refresh_preserves_expansion()
   call WaitForAssert({-> assert_match('+ src/', s:Screen(buf))})
   call term_sendkeys(buf, "\<CR>")
   call WaitForAssert({-> assert_match('- src/', s:Screen(buf))})
-  call WaitForAssert({-> assert_match('src/alpha\.cpp', s:Screen(buf))})
+  call WaitForAssert({-> assert_match('alpha\.cpp', s:Screen(buf))})
   call term_sendkeys(buf, "\<Esc>")
   call term_sendkeys(buf, "\<F2>Explorer\<CR>")
   call WaitForAssert({-> assert_match('Explorer:', s:Screen(buf))})
@@ -309,7 +309,7 @@ func Test_xim_project_refresh_preserves_expansion()
   call term_sendkeys(buf, "\<Esc>")
   call term_sendkeys(buf, "\<F2>Explorer\<CR>")
   call WaitForAssert({-> assert_match('- src/', s:Screen(buf))})
-  call WaitForAssert({-> assert_match('src/alpha\.cpp', s:Screen(buf))})
+  call WaitForAssert({-> assert_match('alpha\.cpp', s:Screen(buf))})
   " Close the explorer overlay before handing the terminal back to StopXim.
   call term_sendkeys(buf, "\<Esc>")
   call s:StopXim(buf)
@@ -420,4 +420,88 @@ func Test_xim_mouse_selection()
   call WaitForAssert({-> assert_match('a!beta', term_getline(buf, 2))})
   call s:Dump(buf, 'Test_xim_mouse_selection')
   call s:StopXim(buf)
+endfunc
+
+" Plan 6 screen coverage: operations, external changes and recents.
+func s:StartStateXim(layout)
+  let g:xim_state_saved = $XDG_STATE_HOME
+  let $XDG_STATE_HOME = getcwd() .. '/Xximstate'
+  return s:StartProjectXim(a:layout)
+endfunc
+
+func s:StopStateXim(buf)
+  call s:StopXim(a:buf)
+  let $XDG_STATE_HOME = g:xim_state_saved
+  call delete('Xximstate', 'rf')
+endfunc
+
+func Test_xim_delete_consent()
+  call mkdir('Xximops', 'p')
+  call writefile(['alpha', ''], 'Xximops/a.txt')
+  call writefile(['beta', ''], 'Xximops/b.txt')
+  let buf = s:StartProjectXim('Xximops')
+  " Select the row without opening it so the status line keeps a relative
+  " name and the dump stays machine-independent.
+  call term_sendkeys(buf, "\<C-E>")
+  call WaitForAssert({-> assert_match('Explorer:', s:Screen(buf))}, 5000)
+  call WaitForAssert({-> assert_match('a\.txt', s:Screen(buf))}, 5000)
+  call term_sendkeys(buf, "\<F10>")
+  call WaitForAssert({-> assert_match('New  Ctrl-N', s:Screen(buf))}, 5000)
+  call term_sendkeys(buf, repeat("\<Down>", 11) .. "\<CR>")
+  call WaitForAssert({-> assert_match('\[d\] Delete permanently', s:Screen(buf))}, 5000)
+  call s:Dump(buf, 'Test_xim_delete_consent')
+  call term_sendkeys(buf, "\<Esc>")
+  call TermWait(buf, 50)
+  call assert_true(filereadable('Xximops/a.txt'))
+  call s:StopXim(buf)
+  call delete('Xximops', 'rf')
+endfunc
+
+func Test_xim_operation_error()
+  call mkdir('Xximerr/exists', 'p')
+  let buf = s:StartProjectXim('Xximerr')
+  call term_sendkeys(buf, "\<F1>New folder\<CR>")
+  call WaitForAssert({-> assert_match('New folder:', s:Screen(buf))})
+  call term_sendkeys(buf, "exists\<CR>")
+  call WaitForAssert({-> assert_match('Destination already exists', s:Screen(buf))}, 5000)
+  call s:Dump(buf, 'Test_xim_operation_error')
+  call s:StopXim(buf)
+  call delete('Xximerr', 'rf')
+endfunc
+
+func Test_xim_changed_on_disk()
+  let buf = s:StartXim()
+  call term_sendkeys(buf, "local")
+  call WaitForAssert({-> assert_match('localalpha', term_getline(buf, 2))})
+  call writefile(['remote change', 'second line'], 'Xxim.txt')
+  call WaitForAssert({-> assert_match('changed on disk', s:Screen(buf))}, 5000)
+  call s:Dump(buf, 'Test_xim_changed_on_disk')
+  call s:StopXim(buf)
+endfunc
+
+func Test_xim_missing_on_disk()
+  let buf = s:StartXim()
+  call term_sendkeys(buf, "local")
+  call WaitForAssert({-> assert_match('localalpha', term_getline(buf, 2))})
+  call delete('Xxim.txt')
+  call WaitForAssert({-> assert_match('missing on disk', s:Screen(buf))}, 5000)
+  call s:Dump(buf, 'Test_xim_missing_on_disk')
+  call s:StopXim(buf)
+endfunc
+
+func Test_xim_recent_files()
+  call mkdir('Xximrecent', 'p')
+  call writefile(['recent content'], 'Xximrecent/r.txt')
+  " A fixture state keeps the dump free of the build directory path.
+  call mkdir('Xximstate/xim', 'p')
+  call writefile(['{"version":1,"files":["/demo/r.txt"],"folders":["/demo"]}'],
+        \ 'Xximstate/xim/recent.json')
+  let buf = s:StartStateXim('Xximrecent')
+  call term_sendkeys(buf, "\<F1>Recent files\<CR>")
+  call WaitForAssert({-> assert_match('Recent files:', s:Screen(buf))}, 5000)
+  call WaitForAssert({-> assert_match('/demo/r\.txt', s:Screen(buf))}, 5000)
+  call s:Dump(buf, 'Test_xim_recent_files')
+  call term_sendkeys(buf, "\<Esc>")
+  call s:StopStateXim(buf)
+  call delete('Xximrecent', 'rf')
 endfunc

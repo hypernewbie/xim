@@ -7,6 +7,9 @@ namespace
 constexpr MenuItem kFileItems[] = {
     {"New", "Ctrl-N", Action::new_buffer, 0, 0},
     {"Open", "Ctrl-O", Action::open, 0, 0},
+    {"Open folder", "", Action::open_folder, 0, 0},
+    {"Recent files", "", Action::recent_files, 0, 0},
+    {"Recent folders", "", Action::recent_folders, 0, 0},
     {"Save", "Ctrl-S", Action::save, 0, 0},
     {"Save as", "Ctrl-Shift-S", Action::save_as, 0, 0},
     {"New file", "", Action::new_file, kProject, 0},
@@ -18,7 +21,9 @@ constexpr MenuItem kFileItems[] = {
     {"Reload from disk", "", Action::reload_disk, 0, 0},
     {"Keep edits", "", Action::keep_edits, 0, 0},
     {"Check external changes", "", Action::check_external, 0, 0},
+    {"Clear recent history", "", Action::clear_recent, 0, 0},
     {"Close", "Ctrl-W", Action::close, 0, 0},
+    {"Close project", "", Action::close_project, kProject, 0},
     {"Quit", "Ctrl-Q", Action::quit, 0, 0},
 };
 constexpr MenuItem kEditItems[] = {

@@ -61,7 +61,7 @@ int main()
     if (help_items.empty() || help_heading != 4) return 1;
     // Layout and hit testing use the same coordinates.
     auto layout = xim::menu_layout(MenuGroup::file, 0, 24, 100, 0);
-    if (layout.row != 1 || layout.rows != 15 || layout.width <= 0) return 1;
+    if (layout.row != 1 || layout.rows != 20 || layout.width <= 0) return 1;
     if (xim::menu_item_at(layout, MenuGroup::file, 1, layout.col + 1, 0) != 0) return 1;
     if (xim::menu_item_at(layout, MenuGroup::file, 0, layout.col + 1, 0) != -1) return 1;
     auto lines = xim::menu_lines(MenuGroup::file, 0, 0, layout);

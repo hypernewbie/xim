@@ -689,13 +689,28 @@ void load_explorer_dir(const std::filesystem::path &base,
                 continue;
             std::string child = relative == "." ? std::string(name)
                 : relative + "/" + std::string(name);
-            struct stat info;
-            if (fstatat(fd, std::string(name).c_str(), &info,
-                        AT_SYMLINK_NOFOLLOW) != 0)
-                continue;
-            bool link = S_ISLNK(info.st_mode);
-            bool directory = S_ISDIR(info.st_mode);
-            bool regular = S_ISREG(info.st_mode);
+            bool link = false;
+            bool directory = false;
+            bool regular = false;
+            // ext4 and most local filesystems fill d_type, so avoid a
+            // syscall per entry. DT_UNKNOWN and special types still take the
+            // anchored lstat path.
+            if (entry->d_type == DT_DIR)
+                directory = true;
+            else if (entry->d_type == DT_REG)
+                regular = true;
+            else if (entry->d_type == DT_LNK)
+                link = true;
+            else
+            {
+                struct stat info;
+                if (fstatat(fd, std::string(name).c_str(), &info,
+                            AT_SYMLINK_NOFOLLOW) != 0)
+                    continue;
+                link = S_ISLNK(info.st_mode);
+                directory = S_ISDIR(info.st_mode);
+                regular = S_ISREG(info.st_mode);
+            }
             if (link)
             {
                 // Directory symlinks are never listed or expanded: a self
@@ -1068,9 +1083,9 @@ void explorer_loop()
         unsigned long long revision = explorer_revision;
         auto expanded = expanded_directories;
         auto more_pages = explorer_more;
+        apply_explorer_invalidations();
         lock.unlock();
 
-        apply_explorer_invalidations();
         auto view = std::make_shared<ExplorerView>();
         build_explorer_view(base, revision, *view, expanded, more_pages);
 
@@ -1767,8 +1782,10 @@ xim_project_disable(void)
         content_snapshot = empty_content;
         content_changed.notify_one();
     }
-    // Close project keeps explicit-file watches and every open buffer.
-    xim_watch_stop_project();
+    // Close project keeps explicit-file watches and every open buffer. An
+    // empty project still installs the callback so file-parent events reach
+    // the editor.
+    xim_watch_start_project("", project_watch_events, nullptr);
 }
 
 extern "C" void

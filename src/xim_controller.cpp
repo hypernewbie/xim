@@ -2,6 +2,7 @@
 #include "xim_menu.h"
 #include "xim_project.h"
 #include "xim_fsops.h"
+#include "xim_recent.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cwchar>
@@ -346,6 +347,8 @@ void show_notice_if_idle()
     notice_show_pending = false;
 }
 
+void update_status_note();
+
 void add_notice(int fnum, const std::string &name, int kind)
 {
     for (auto &notice : buffer_notices)
@@ -353,13 +356,37 @@ void add_notice(int fnum, const std::string &name, int kind)
         {
             notice.name = name;
             notice.kind = kind;
-            set_notice_text((kind == 1 ? "Missing on disk: "
-                        : "Changed on disk: ") + tail_name(name));
+            update_status_note();
             return;
         }
     buffer_notices.push_back({fnum, name, kind});
-    set_notice_text((kind == 1 ? "Missing on disk: "
-                : "Changed on disk: ") + tail_name(name));
+    update_status_note();
+}
+
+std::string status_note_last;
+
+void update_status_note()
+{
+    int fnum = xim_engine_current_buffer();
+    int count = 0;
+    int kind = 0;
+    for (const auto &notice : buffer_notices)
+        if (notice.fnum == fnum)
+        {
+            ++count;
+            kind = notice.kind;
+        }
+    std::string note;
+    if (count > 0)
+    {
+        note = kind == 1 ? " [!] missing on disk" : " [!] changed on disk";
+        if (count > 1)
+            note += " (" + std::to_string(count) + ")";
+    }
+    if (note == status_note_last)
+        return;
+    status_note_last = note;
+    xim_engine_status_note(note.c_str());
 }
 
 void drop_notice(int fnum)
@@ -367,6 +394,7 @@ void drop_notice(int fnum)
     std::erase_if(buffer_notices, [fnum](const BufferNotice &notice) {
         return notice.fnum == fnum;
     });
+    update_status_note();
 }
 
 bool buffer_info(int fnum, unsigned long long &tick, int &modified)
@@ -437,6 +465,7 @@ void sync_tracked_buffers()
             {
                 buffer.version = xim_project_file_version(path.c_str());
                 xim_project_watch_file(path.c_str());
+                xim_recent_add_file(path.c_str());
             }
             break;
         }
@@ -444,6 +473,7 @@ void sync_tracked_buffers()
         {
             buffer.version = xim_project_file_version(path.c_str());
             xim_project_watch_file(path.c_str());
+            xim_recent_add_file(path.c_str());
         }
         next.push_back(std::move(buffer));
     }
@@ -465,6 +495,7 @@ void sync_tracked_buffers()
             xim_project_unwatch_file(old.name.c_str());
     }
     tracked_buffers = std::move(next);
+    update_status_note();
 }
 
 void mark_current_saved()
@@ -593,20 +624,32 @@ void handle_change(int kind, unsigned long long version, bool directory,
         for (auto &buffer : tracked_buffers)
             if (buffer.name == other)
                 sources.push_back(&buffer);
-        if (sources.size() == 1 && version != 0)
+        if (sources.size() == 1)
         {
             auto *buffer = sources.front();
-            if (xim_engine_rename_buffer(buffer->fnum, path.c_str()))
+            // A rename is unambiguous only when the old name is gone and the
+            // destination preserves the buffer's recorded disk identity. A
+            // writebackup rename leaves the original name in place; it is
+            // not an external rename of the open file.
+            unsigned long long source_now =
+                xim_project_file_version(buffer->name.c_str());
+            if (source_now == 0 && version != 0
+                    && version == buffer->version)
             {
-                xim_project_unwatch_file(buffer->name.c_str());
-                buffer->name = path;
-                buffer->version = version;
-                buffer->tick = 0;
-                xim_project_watch_file(path.c_str());
-                drop_notice(buffer->fnum);
-                set_notice_text("Renamed on disk: " + tail_name(path));
+                if (xim_engine_rename_buffer(buffer->fnum, path.c_str()))
+                {
+                    xim_project_unwatch_file(buffer->name.c_str());
+                    buffer->name = path;
+                    buffer->version = version;
+                    buffer->tick = 0;
+                    xim_project_watch_file(path.c_str());
+                    drop_notice(buffer->fnum);
+                    set_notice_text("Renamed on disk: " + tail_name(path));
+                }
+                else
+                    add_notice(buffer->fnum, buffer->name, 1);
             }
-            else
+            else if (source_now == 0)
                 add_notice(buffer->fnum, buffer->name, 1);
         }
         else
@@ -1122,15 +1165,18 @@ bool fs_tick()
         std::string prefix = fs_root;
         if (!fs_source.empty() && fs_source != ".")
             prefix += "/" + fs_source;
+        bool kept = false;
         for (const auto &buffer : tracked_buffers)
             if (buffer.name == prefix
                     || (buffer.name.size() > prefix.size()
                         && buffer.name.compare(0, prefix.size(), prefix) == 0
                         && buffer.name[prefix.size()] == '/'))
             {
-                text += " (buffer text kept; Missing on disk)";
-                break;
+                add_notice(buffer.fnum, buffer.name, 1);
+                kept = true;
             }
+        if (kept)
+            text += " (buffer text kept; Missing on disk)";
     }
     std::string opened = fs_root;
     if (created && !fs_destination.empty())
@@ -1169,6 +1215,240 @@ void cancel_delete()
     xim_fsops_ack(fs_id);
     clear_file_operation();
     prompt = Action::ignore;
+}
+
+// Recent files/folders. The worker owns disk state; the picker reads the
+// published lists and never blocks on a read or write.
+struct RecentRow
+{
+    std::string display;
+    std::string path;
+};
+std::vector<RecentRow> recent_file_rows;
+std::vector<RecentRow> recent_folder_rows;
+std::vector<std::string> recent_visible;
+std::string recent_message;
+unsigned long long recent_serial_seen = 0;
+bool recent_ready_seen = false;
+std::string recent_root_seen;
+
+bool reload_recent_rows()
+{
+    if (!xim_recent_ready())
+        return false;
+    unsigned long long serial = xim_recent_serial();
+    if (serial == recent_serial_seen && recent_ready_seen)
+        return false;
+    auto load = [](char *payload, std::vector<RecentRow> &rows) {
+        rows.clear();
+        std::unique_ptr<char, decltype(&xim_project_free)> guard(
+            payload, xim_project_free);
+        if (!guard)
+            return;
+        std::string_view text(guard.get());
+        while (!text.empty())
+        {
+            auto end = text.find('\n');
+            std::string_view line = text.substr(0, end);
+            text = end == std::string_view::npos
+                ? std::string_view{} : text.substr(end + 1);
+            auto tab = line.find('\t');
+            if (tab == std::string_view::npos)
+                continue;
+            rows.push_back({std::string(line.substr(0, tab)),
+                    wire_text_decode(line.substr(tab + 1))});
+        }
+    };
+    load(xim_recent_files(), recent_file_rows);
+    load(xim_recent_folders(), recent_folder_rows);
+    recent_serial_seen = serial;
+    recent_ready_seen = true;
+    return true;
+}
+
+std::vector<std::string> recent_items(bool folders)
+{
+    reload_recent_rows();
+    recent_visible.clear();
+    std::vector<std::string> displays;
+    if (!xim_recent_ready())
+        return displays;
+    auto needle = lower_text(input);
+    std::string root = xim_project_root();
+    const auto &rows = folders ? recent_folder_rows : recent_file_rows;
+    for (const auto &row : rows)
+    {
+        std::string display = row.display;
+        if (!root.empty())
+        {
+            if (row.path == root)
+                display = tail_name(root);
+            else if (row.path.size() > root.size()
+                    && row.path.compare(0, root.size(), root) == 0
+                    && row.path[root.size()] == '/')
+                display = row.path.substr(root.size() + 1);
+        }
+        if (!needle.empty()
+                && lower_text(display).find(needle) == std::string::npos
+                && lower_text(row.path).find(needle) == std::string::npos)
+            continue;
+        displays.push_back(std::move(display));
+        recent_visible.push_back(row.path);
+    }
+    return displays;
+}
+
+std::string recent_status(bool folders)
+{
+    if (!xim_recent_ready())
+        return folders ? "Loading recent folders" : "Loading recent files";
+    const auto &rows = folders ? recent_folder_rows : recent_file_rows;
+    return rows.empty()
+        ? (folders ? "No recent folders" : "No recent files") : "";
+}
+
+void remove_recent_choice(bool folders)
+{
+    if (selected >= recent_visible.size())
+        return;
+    xim_recent_remove(recent_visible[selected].c_str());
+    recent_message.clear();
+    input.clear();
+    input_cursor = 0;
+    field_has_selection() = false;
+    field_sel_start() = field_sel_end() = 0;
+    recent_serial_seen = 0;
+    reload_recent_rows();
+    selected = 0;
+}
+
+// Root validation runs off-thread; the current project stays intact until
+// the new root is known to be usable.
+enum class SwitchPhase { none, validating };
+SwitchPhase switch_phase = SwitchPhase::none;
+unsigned long long switch_id = 0;
+std::string switch_target;
+
+extern std::vector<std::string> last_picker_items;
+extern Action last_picker_action;
+extern int last_picker_first;
+extern int last_picker_selected;
+
+void finish_project_switch(const std::string &root)
+{
+    recent_message.clear();
+    accept_when_ready = false;
+    deferred_keys.clear();
+    last_picker_items.clear();
+    last_picker_action = Action::ignore;
+    last_picker_first = 0;
+    last_picker_selected = 0;
+    xim_project_cancel_query();
+    explorer_rows.clear();
+    explorer_filtered.clear();
+    explorer_selected.clear();
+    explorer_serial_seen = 0;
+    xim_project_init(root.c_str());
+    recent_root_seen = root;
+    xim_recent_add_folder(root.c_str());
+    std::string name = root;
+    auto slash = name.find_last_of('/');
+    if (slash != std::string::npos)
+        name = name.substr(slash + 1);
+    set_notice_text("Project: " + (name.empty() ? root : name));
+}
+
+void start_project_switch(const std::string &path)
+{
+    if (path.empty())
+        return;
+    if (file_operation_active())
+    {
+        set_notice_text("Busy: file operation in progress");
+        return;
+    }
+    unsigned long long id = xim_fsops_preflight(XIM_FS_VALIDATE_ROOT, "",
+            path.c_str(), "");
+    if (id == 0)
+    {
+        set_notice_text("Busy: another operation is active");
+        return;
+    }
+    switch_phase = SwitchPhase::validating;
+    switch_id = id;
+    switch_target = path;
+    prompt = Action::ignore;
+    set_notice_text("Opening folder: " + path);
+}
+
+bool switch_tick()
+{
+    if (switch_phase == SwitchPhase::none)
+        return false;
+    int state = xim_fsops_state(switch_id);
+    if (state == 0)
+        return false;
+    if (state < 0)
+    {
+        switch_phase = SwitchPhase::none;
+        set_notice_text("Folder validation failed");
+        return true;
+    }
+    bool success = xim_fsops_success(switch_id) != 0;
+    std::unique_ptr<char, decltype(&xim_project_free)> resolved(
+        xim_fsops_resolved_root(switch_id), xim_project_free);
+    std::unique_ptr<char, decltype(&xim_project_free)> error(
+        xim_fsops_error(switch_id), xim_project_free);
+    std::string message = error ? error.get() : "Folder validation failed";
+    std::string root = resolved ? resolved.get() : "";
+    xim_fsops_ack(switch_id);
+    switch_phase = SwitchPhase::none;
+    switch_id = 0;
+    switch_target.clear();
+    if (!success || root.empty())
+    {
+        set_notice_text(message);
+        return true;
+    }
+    finish_project_switch(root);
+    return true;
+}
+
+void close_project()
+{
+    if (file_operation_active())
+    {
+        set_notice_text("Busy: file operation in progress");
+        return;
+    }
+    if (switch_phase != SwitchPhase::none)
+    {
+        xim_fsops_ack(switch_id);
+        switch_phase = SwitchPhase::none;
+        switch_id = 0;
+        switch_target.clear();
+    }
+    xim_project_disable();
+    explorer_rows.clear();
+    explorer_filtered.clear();
+    explorer_selected.clear();
+    explorer_serial_seen = 0;
+    recent_root_seen.clear();
+    set_notice_text("Project closed");
+}
+
+bool recent_tick()
+{
+    bool changed = reload_recent_rows();
+    std::string root = xim_project_root();
+    if (!root.empty() && root != recent_root_seen)
+    {
+        recent_root_seen = root;
+        xim_recent_add_folder(root.c_str());
+    }
+    else if (root.empty() && !recent_root_seen.empty())
+        recent_root_seen.clear();
+    return changed;
 }
 
 struct ContentMeta
@@ -1444,6 +1724,8 @@ std::string prompt_info()
     }
     if (prompt == Action::rename_file || prompt == Action::move_file)
         return fs_source;
+    if (prompt == Action::recent_files || prompt == Action::recent_folders)
+        return recent_message;
     if (prompt == Action::search_project)
         return std::string("[") + case_label() + "]";
     if (!prompt_is_find_like())
@@ -1509,6 +1791,10 @@ std::vector<std::string> project_items(Action action, const std::string &text)
         return explorer_items();
     if (action == Action::changed_files)
         return notice_items();
+    if (action == Action::recent_files)
+        return recent_items(false);
+    if (action == Action::recent_folders)
+        return recent_items(true);
     if (action == Action::search_project)
     {
         // Cached rows: refetch only when the publish serial, query or case
@@ -1607,6 +1893,13 @@ std::vector<std::string> project_items(Action action, const std::string &text)
         items.push_back(text_all.substr(start, end - start));
         start = end + 1;
     }
+    if (action == Action::buffers && !text.empty())
+    {
+        auto needle = lower_text(text);
+        std::erase_if(items, [&needle](const std::string &row) {
+            return lower_text(row).find(needle) == std::string::npos;
+        });
+    }
     if (action == Action::files)
     {
         if (file_rows_query == text && selected < file_rows.size())
@@ -1679,6 +1972,7 @@ void begin(Action action)
     content_cache_query.clear();
     content_cache_case = -1;
     content_serial_seen = xim_project_content_serial();
+    recent_message.clear();
     selected = 0;
     last_picker_items.clear();
     last_picker_action = Action::ignore;
@@ -1745,6 +2039,14 @@ void execute(Action action)
         case Action::rename_file: case Action::move_file:
             start_file_prompt(action); break;
         case Action::delete_file: submit_delete(); break;
+        case Action::open_folder: begin(action); break;
+        case Action::close_project: close_project(); break;
+        case Action::recent_files: case Action::recent_folders:
+            begin(action); break;
+        case Action::clear_recent:
+            xim_recent_clear();
+            set_notice_text("Recent history cleared");
+            break;
         case Action::fs_delete_confirm: break;
         case Action::save:
             if (xim_engine_named())
@@ -1990,6 +2292,34 @@ bool open_picker_item(Action current, const std::vector<std::string> &list,
                 resolved, xim_project_free);
         xim_engine_command("hide edit", resolved, 0);
     }
+    else if (current == Action::recent_files || current == Action::recent_folders)
+    {
+        if (index >= recent_visible.size())
+        {
+            prompt = current;
+            return false;
+        }
+        std::string path = recent_visible[index];
+        std::error_code error;
+        bool usable = current == Action::recent_folders
+            ? std::filesystem::is_directory(path, error)
+            : std::filesystem::is_regular_file(path, error);
+        if (!usable)
+        {
+            recent_message = "Missing: " + path;
+            if (recent_message.size() > 72)
+                recent_message.resize(72);
+            prompt = current;
+            return false;
+        }
+        if (current == Action::recent_files)
+        {
+            xim_engine_command("hide edit", path.c_str(), 0);
+            xim_recent_add_file(path.c_str());
+        }
+        else
+            start_project_switch(path);
+    }
     else
     {
         char *resolved = xim_project_resolve(item.c_str());
@@ -2044,6 +2374,21 @@ bool activate_current_row(Action current)
             return false;
         }
         row = first_activatable(row % content_meta.size());
+        return open_picker_item(current, list, row);
+    }
+    if (current == Action::recent_files || current == Action::recent_folders)
+    {
+        // Use the full list, not the painted window slice.
+        std::vector<std::string> list = recent_items(
+                current == Action::recent_folders);
+        if (list.empty())
+        {
+            prompt = current;
+            return false;
+        }
+        std::size_t row = last_picker_action == current
+            ? static_cast<std::size_t>(last_picker_first + last_picker_selected)
+            : selected;
         return open_picker_item(current, list, row);
     }
     if (current == Action::explorer)
@@ -2288,6 +2633,12 @@ extern "C" void xim_dispatch(int key, int modifiers)
         if (key == '\r' || key == '\n')
         {
             Action current = prompt;
+            if (current == Action::open_folder)
+            {
+                if (!input.empty())
+                    start_project_switch(input);
+                return;
+            }
             if (current == Action::new_file || current == Action::new_folder
                     || current == Action::rename_file
                     || current == Action::move_file)
@@ -2417,7 +2768,9 @@ extern "C" void xim_dispatch(int key, int modifiers)
                 && (prompt == Action::palette || prompt == Action::files
                     || prompt == Action::buffers || prompt == Action::explorer
                     || prompt == Action::search_project
-                    || prompt == Action::changed_files))
+                    || prompt == Action::changed_files
+                    || prompt == Action::recent_files
+                    || prompt == Action::recent_folders))
         {
             std::size_t count = 0;
             if (prompt == Action::palette) count = filtered().size();
@@ -2466,6 +2819,13 @@ extern "C" void xim_dispatch(int key, int modifiers)
             field_cursor() = key == XIM_HOME ? 0 : text.size();
             if (select) field_sel_end() = field_cursor();
             else clear_prompt_selection();
+            return;
+        }
+        if (action == Action::erase
+                && (prompt == Action::recent_files
+                    || prompt == Action::recent_folders))
+        {
+            remove_recent_choice(prompt == Action::recent_folders);
             return;
         }
         if (action == Action::erase)
@@ -2574,9 +2934,13 @@ extern "C" int xim_background()
 {
     sync_tracked_buffers();
     bool changed = fs_tick();
+    changed = switch_tick() || changed;
+    changed = recent_tick() || changed;
     if (!xim_project_poll()) return changed ? 1 : 0;
     changed = service_external_changes() || changed;
     changed = fs_tick() || changed;
+    changed = switch_tick() || changed;
+    changed = recent_tick() || changed;
     bool picker = prompt == Action::files || prompt == Action::search_project;
     bool ready = prompt == Action::files ? !xim_project_pending()
         : prompt == Action::search_project ? !xim_project_content_pending()
@@ -2645,6 +3009,9 @@ static std::string prompt_label()
     if (prompt == Action::new_folder) return "New folder: ";
     if (prompt == Action::rename_file) return "Rename: ";
     if (prompt == Action::move_file) return "Move to: ";
+    if (prompt == Action::open_folder) return "Open folder: ";
+    if (prompt == Action::recent_files) return "Recent files: ";
+    if (prompt == Action::recent_folders) return "Recent folders: ";
     if (prompt == Action::explorer) return "Explorer: ";
     if (prompt == Action::search_project) return "Search: ";
     return "Command: ";
@@ -2718,14 +3085,22 @@ void render_prompt_overlay(int menu_rows)
     }
     else if (prompt == Action::files || prompt == Action::buffers
             || prompt == Action::explorer || prompt == Action::search_project
-            || prompt == Action::changed_files)
+            || prompt == Action::changed_files
+            || prompt == Action::recent_files
+            || prompt == Action::recent_folders)
     {
         auto list = project_items(prompt, input);
         if (list.empty())
         {
+            std::string recent_text;
+            if (prompt == Action::recent_files)
+                recent_text = recent_status(false);
+            else if (prompt == Action::recent_folders)
+                recent_text = recent_status(true);
             const char *status = prompt == Action::files ? xim_project_status()
                 : prompt == Action::search_project ? xim_project_content_status()
                 : prompt == Action::explorer ? explorer_status_text.c_str()
+                : !recent_text.empty() ? recent_text.c_str()
                 : nullptr;
             if (status != nullptr && *status != '\0')
                 items = std::string("  ") + status + "\n";
@@ -2803,6 +3178,11 @@ extern "C" void xim_render()
     int columns = xim_engine_columns();
     int menu_rows = xim_engine_menu_rows();
     unsigned caps = capabilities_now();
+    // The menu bar is part of every overlay frame: opening or switching a
+    // menu must not depend on an unrelated tabline redraw to highlight the
+    // active heading.
+    auto bar = xim::menu_bar(columns, menu_open ? menu_group : -1);
+    xim_engine_menu_bar(bar.text.c_str(), bar.selected_col, bar.selected_width);
     // The prompt overlay paints before the drop-down so the shared
     // background snapshot is captured from the frame with no overlay on it.
     // Drawing the menu first made the prompt recapture the painted menu,
@@ -2856,7 +3236,9 @@ bool activate_picker_row(int row, int columns)
     if (prompt != Action::files && prompt != Action::buffers
             && prompt != Action::explorer && prompt != Action::palette
             && prompt != Action::search_project
-            && prompt != Action::changed_files)
+            && prompt != Action::changed_files
+            && prompt != Action::recent_files
+            && prompt != Action::recent_folders)
         return false;
     int rows = screen_rows_for_mouse();
     // Recompute the overlay geometry used by xim_engine_overlay: items end
@@ -3023,7 +3405,9 @@ extern "C" void xim_mouse_press(int row, int col, int button, int modifiers, int
     if ((prompt == Action::files || prompt == Action::buffers
                 || prompt == Action::explorer || prompt == Action::palette
                 || prompt == Action::search_project
-                || prompt == Action::changed_files)
+                || prompt == Action::changed_files
+                || prompt == Action::recent_files
+                || prompt == Action::recent_folders)
             && button == 0)
     {
         if (activate_picker_row(row, columns)) return;
@@ -3173,7 +3557,9 @@ extern "C" void xim_mouse_wheel(int row, int col, int direction, int modifiers)
     if (prompt == Action::files || prompt == Action::buffers
             || prompt == Action::explorer || prompt == Action::palette
             || prompt == Action::search_project
-            || prompt == Action::changed_files)
+            || prompt == Action::changed_files
+            || prompt == Action::recent_files
+            || prompt == Action::recent_folders)
     {
         if (direction == 0) xim_dispatch(XIM_UP, 0);
         else if (direction == 1) xim_dispatch(XIM_DOWN, 0);

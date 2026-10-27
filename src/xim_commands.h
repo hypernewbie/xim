@@ -13,7 +13,8 @@ enum class Action
     next_buffer, prev_buffer, help, about, replace, search_project,
     toggle_case, replace_one, changed_files, reload_disk, keep_edits,
     check_external, reload_confirm, new_file, new_folder, rename_file,
-    move_file, delete_file, fs_delete_confirm
+    move_file, delete_file, fs_delete_confirm, open_folder, close_project,
+    recent_files, recent_folders, clear_recent
 };
 Action resolve(int key, int modifiers);
 struct Command { std::string_view name; Action action; };
@@ -38,6 +39,12 @@ inline constexpr Command commands[] = {
     {"New file", Action::new_file}, {"New folder", Action::new_folder},
     {"Rename", Action::rename_file}, {"Move", Action::move_file},
     {"Delete permanently", Action::delete_file},
+    {"Open folder", Action::open_folder},
+    {"Switch project", Action::open_folder},
+    {"Recent files", Action::recent_files},
+    {"Recent folders", Action::recent_folders},
+    {"Clear recent history", Action::clear_recent},
+    {"Close project", Action::close_project},
     {"Xim help", Action::help}, {"About", Action::about}
 };
 bool matches(std::string_view name, std::string_view query);

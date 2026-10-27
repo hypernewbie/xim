@@ -2,6 +2,7 @@
 #include "vim.h"
 #include "xim_input.h"
 #include "xim_project.h"
+#include "xim_recent.h"
 
 static pos_T selection_anchor;
 static int selection_buffer = 0;
@@ -269,6 +270,18 @@ xim_engine_notice(const char *text)
 	return;
     msg((char *)text);
     redraw_cmdline = TRUE;
+}
+
+    void
+xim_engine_status_note(const char *text)
+{
+    char_u line[512];
+    const char *note = text == NULL ? "" : text;
+    vim_snprintf((char *)line, sizeof(line),
+	    "%%#XimStatus# Xim %%f %%m%%=%%#XimAlert#%s"
+	    "%%#XimStatus# %%l:%%c ", note);
+    set_option_value((char_u *)"statusline", 0, line, 0);
+    redraw_curbuf_later(UPD_VALID);
 }
 
 /*
@@ -1931,6 +1944,18 @@ xim_engine_menu_popup(const char *items, int row, int col, int width, int rows,
         screen_fill(r, r + 1, MIN(col + cells, (int)Columns), MIN(col + width, (int)Columns),
                 ' ', ' ', item_attr);
     }
+    // Terminal output optimization skips unchanged popup cells, so the
+    // cursor would otherwise land on whichever cell last changed (often a
+    // menu-bar heading). Anchor it to the last visible drop-down cell so the
+    // overlay frame is deterministic.
+    if (r > row)
+    {
+        int last_row = r - 1;
+        if (last_row > Rows - 2)
+            last_row = Rows - 2;
+        if (last_row >= row)
+            windgoto(last_row, MIN(col + width, (int)Columns - 1));
+    }
     term_set_sync_output(TERM_SYNC_OUTPUT_DISABLE);
     out_flush();
     xim_drawing_overlay = FALSE;
@@ -2136,6 +2161,7 @@ xim_initialize(void)
 	// File-only start: no project, so no directory walk runs.
 	xim_project_disable();
     vim_free(root);
+    xim_recent_init();
     // Disable netrw so a directory argument opens an empty buffer rather
     // than the directory listing plugin.  Without this, filetype detection
     // launches netrw on the directory buffer and intercepts Ctrl-P / P-E
@@ -2150,6 +2176,7 @@ xim_initialize(void)
     do_highlight((char_u *)"default link XimMenuSel PmenuSel", FALSE, FALSE);
     do_highlight((char_u *)"default link XimFindMatch Search", FALSE, FALSE);
     do_highlight((char_u *)"default link XimPromptInfo Comment", FALSE, FALSE);
+    do_highlight((char_u *)"default link XimAlert WarningMsg", FALSE, FALSE);
     do_cmdline_cmd((char_u *)"set statusline=%#XimStatus#\\ Xim\\ %f\\ %m%=%l:%c\\ ");
     do_cmdline_cmd((char_u *)"syntax enable");
     setmouse();

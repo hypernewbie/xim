@@ -68,6 +68,7 @@ int xim_engine_reload_staged(int fnum, const char *data, size_t length,
 int xim_engine_reload(int fnum);
 int xim_engine_rename_buffer(int fnum, const char *name);
 void xim_engine_notice(const char *text);
+void xim_engine_status_note(const char *text);
 int xim_engine_menu_rows(void);
 int xim_engine_columns(void);
 void xim_engine_boundary(void);

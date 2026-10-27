@@ -18,14 +18,24 @@ from terminal_screen import TerminalScreen
 
 
 class Session:
-    def __init__(self, binary, directory, arguments=(), ready=b"Xim", runtime=None):
+    def __init__(self, binary, directory, arguments=(), ready=b"Xim", runtime=None,
+                 home=None):
         self.directory = directory
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         env = os.environ.copy()
         for name in ("VIM", "VIMRUNTIME", "VIMINIT", "EXINIT", "DISPLAY", "WAYLAND_DISPLAY"):
             env.pop(name, None)
-        env.update(HOME=str(directory), XDG_CONFIG_HOME=str(directory / ".config"),
+        self.temp_home = None
+        if home is None:
+            self.temp_home = Path(tempfile.mkdtemp(prefix="xim-home-",
+                                                  dir=Path(directory).parent))
+            state_home = self.temp_home
+        else:
+            state_home = Path(home)
+        env.update(HOME=str(state_home),
+                   XDG_CONFIG_HOME=str(state_home / ".config"),
+                   XDG_STATE_HOME=str(state_home / ".state"),
                    TERM="xterm-256color", LC_ALL="C.UTF-8")
         if runtime:
             env["VIMRUNTIME"] = str(runtime)
@@ -129,6 +139,8 @@ class Session:
                 self.process.kill()
                 self.process.wait()
         os.close(self.master)
+        if self.temp_home is not None:
+            shutil.rmtree(self.temp_home, ignore_errors=True)
 
 
 def run(binary, root, themes=()):
@@ -1878,7 +1890,7 @@ def external_changes(binary, root):
             session.send(b"X")
             session.drain(.2)
             alpha.write_text("external\n")
-            assert wait_screen(session, b"Changed on disk", timeout=5), \
+            assert wait_screen(session, b"changed on disk", timeout=5), \
                 session.screen.text()[-800:]
             dirty_text = session.snapshot()
             assert "Xthree" in dirty_text, dirty_text
@@ -1889,7 +1901,7 @@ def external_changes(binary, root):
             assert session.snapshot() == dirty_text
             # Missing on disk keeps the text; Save as recovers it.
             os.unlink(alpha)
-            assert wait_screen(session, b"Missing on disk", timeout=5), \
+            assert wait_screen(session, b"missing on disk", timeout=5), \
                 session.screen.text()[-800:]
             assert session.snapshot() == dirty_text
             session.send(b"\x1bOPSave as\r")
@@ -1914,7 +1926,7 @@ def external_changes(binary, root):
             session.send(b"Z")
             session.drain(.2)
             renamed.write_text("disk final\n")
-            assert wait_screen(session, b"Changed on disk", timeout=5), \
+            assert wait_screen(session, b"changed on disk", timeout=5), \
                 session.screen.text()[-800:]
             session.send(b"\x1bOPReload from disk\r")
             session.wait(b"Reload from disk?")
@@ -1961,14 +1973,16 @@ def file_operations(binary, root):
             row, column = screen_rowcol(session.screen, "ctx.txt")
             session.send(f"\x1b[<2;{column};{row}M\x1b[<2;{column};{row}m".encode())
             session.wait(b"Delete permanently")
-            for _ in range(6):
+            for _ in range(9):
                 session.send(b"\x1b[B")
             session.send(b"\r")
             session.wait(b"Rename: ")
             session.send(b"\x01")
-            session.send(b"ctx2.txt\r")
+            session.send(b"ctx2.txt")
+            session.wait(b"Rename: ctx2.txt")
+            session.send(b"\r")
             assert wait_until(lambda: (project / "ctx2.txt").exists()), \
-                "context-menu rename did not reach disk"
+                session.screen.text()[-800:]
             assert not (project / "ctx.txt").exists()
             session.send(b"\x1b")
             session.drain(.2)
@@ -1976,9 +1990,11 @@ def file_operations(binary, root):
             session.send(b"\x1bOPRename\r")
             session.wait(b"Rename: ")
             session.send(b"\x01")
-            session.send(b"renamed.txt\r")
+            session.send(b"renamed.txt")
+            session.wait(b"Rename: renamed.txt")
+            session.send(b"\r")
             assert wait_until(lambda: (project / "renamed.txt").exists()), \
-                "rename did not reach disk"
+                session.screen.text()[-800:]
             assert not (project / "created.txt").exists()
             assert session.snapshot() == "hello\n"
             session.send(b"!")
@@ -2005,7 +2021,7 @@ def file_operations(binary, root):
             assert wait_screen(session, b"sub/", timeout=5)
             session.send(b"\x1b[21~")
             session.wait(b"Delete permanently")
-            for _ in range(7):
+            for _ in range(10):
                 session.send(b"\x1b[B")
             session.send(b"\r")
             session.wait(b"Move to: ")
@@ -2026,7 +2042,7 @@ def file_operations(binary, root):
             session.send(b"d")
             assert wait_until(lambda: not (project / "moved" / "inner.txt").exists()), \
                 "permanent delete did not remove the file"
-            assert wait_screen(session, b"Missing on disk", timeout=5), \
+            assert wait_screen(session, b"missing on disk", timeout=5), \
                 session.screen.text()[-800:]
             assert session.snapshot() == "localinner\n"
             # Traversal in a new name is refused.
@@ -2039,6 +2055,123 @@ def file_operations(binary, root):
         finally:
             session.close()
     print("Native create, rename, move and permanent-delete checks passed")
+
+
+def project_switch_recents(binary, root):
+    """Plan 6: recents persist, projects switch and buffers survive."""
+    with tempfile.TemporaryDirectory(prefix="xim-switch-", dir=root) as temporary:
+        base = Path(temporary)
+        home = base / "home"
+        home.mkdir()
+        project_a = base / "project-a"
+        project_b = base / "project-b"
+        project_a.mkdir()
+        project_b.mkdir()
+        (project_a / "a.txt").write_text("alpha\n")
+        (project_b / "b.txt").write_text("beta\n")
+        (project_a / "gone.txt").write_text("gone\n")
+        session = Session(binary, project_a, (".",), home=home)
+        try:
+            session.send(b"\x10")
+            session.wait(b"Files:")
+            session.send(b"a.txt\r")
+            session.wait(b"alpha")
+            session.send(b"local")
+            # Switch projects while the buffer is dirty.
+            session.send(b"\x1bOPOpen folder\r")
+            session.wait(b"Open folder:")
+            session.send(str(project_b).encode() + b"\r")
+            assert wait_screen(session, b"Project: project-b", timeout=10), \
+                session.screen.text()[-800:]
+            session.send(b"\x05")
+            session.wait(b"Explorer:")
+            assert b"project-b" in session.screen.text(), session.screen.text()
+            session.send(b"\x1b")
+            # The dirty buffer from the old project is still available.
+            session.send(b"\x1bOPBuffers\r")
+            session.wait(b"Buffers:")
+            session.send(b"a.txt")
+            session.send(b"\r")
+            session.wait(b"alpha")
+            assert "local" in session.snapshot(), repr(session.snapshot())
+            session.send(b"\x1bOPRecent folders\r")
+            session.wait(b"Recent folders:")
+            session.send(b"project-a")
+            assert wait_screen(session, b"project-a", timeout=5)
+            session.send(b"\r")
+            assert wait_screen(session, b"Project: project-a", timeout=10), \
+                session.screen.text()[-800:]
+            # The dirty text survived both switches and undo still works.
+            session.send(b"\x1bOPBuffers\r")
+            session.wait(b"Buffers:")
+            session.send(b"a.txt\r")
+            session.wait(b"local")
+            session.send(b"\x1a")
+            assert session.snapshot() == "alpha\n", session.snapshot()
+            # A failed root leaves the current project and buffers intact.
+            session.send(b"\x1bOPOpen folder\r")
+            session.wait(b"Open folder:")
+            session.send(b"/no/such/project\r")
+            assert wait_screen(session, b"Not a folder", timeout=10), \
+                session.screen.text()[-800:]
+            session.send(b"\x05")
+            session.wait(b"Explorer:")
+            assert b"project-a" in session.screen.text(), session.screen.text()
+            session.send(b"\x1b")
+            # Open a file that will disappear before the next process.
+            session.send(b"\x10")
+            session.wait(b"Files:")
+            session.send(b"gone.txt\r")
+            session.wait(b"gone")
+            state_file = home / ".state" / "xim" / "recent.json"
+            assert wait_until(lambda: state_file.exists()
+                              and "gone.txt" in state_file.read_text()), \
+                "recent file was not persisted before exit"
+        finally:
+            session.close()
+
+        # Recents survive a restart; a missing entry reports and can be
+        # removed with Delete.
+        (project_a / "gone.txt").unlink()
+        session = Session(binary, project_a, (".",), home=home)
+        try:
+            session.send(b"\x1bOPRecent files\r")
+            session.wait(b"Recent files:")
+            assert wait_screen(session, b"gone.txt", timeout=5), \
+                session.screen.text()[-800:]
+            session.send(b"gone.txt")
+            session.send(b"\r")
+            assert wait_screen(session, b"Missing:", timeout=5), \
+                session.screen.text()[-800:]
+            session.send(b"\x1b[3~")
+            assert wait_screen(session, b"gone.txt", present=False, timeout=5), \
+                session.screen.text()[-800:]
+            session.send(b"\x1b")
+            session.send(b"\x1bOPClear recent history\r")
+            assert wait_screen(session, b"Recent history cleared", timeout=5), \
+                session.screen.text()[-800:]
+            session.send(b"\x1bOPRecent files\r")
+            session.wait(b"Recent files:")
+            assert wait_screen(session, b"No recent files", timeout=5), \
+                session.screen.text()[-800:]
+            session.send(b"\x1b")
+            session.send(b"\x10")
+            session.wait(b"Files:")
+            session.send(b"a.txt\r")
+            session.wait(b"alpha")
+            # Close project keeps buffers and disables project surfaces.
+            session.send(b"\x1bOPClose project\r")
+            assert wait_screen(session, b"Project closed", timeout=5), \
+                session.screen.text()[-800:]
+            session.send(b"\x05")
+            session.wait(b"Explorer:")
+            assert wait_screen(session, b"No project", timeout=5), \
+                session.screen.text()[-800:]
+            session.send(b"\x1b")
+            assert session.snapshot() == "alpha\n", session.snapshot()
+        finally:
+            session.close()
+    print("Recent-state, project switch and buffer retention checks passed")
 
 
 if __name__ == "__main__":
@@ -2080,5 +2213,6 @@ if __name__ == "__main__":
     find_replace(args.binary.resolve(), args.work.resolve())
     project_content_search(args.binary.resolve(), args.work.resolve())
     file_operations(args.binary.resolve(), args.work.resolve())
+    project_switch_recents(args.binary.resolve(), args.work.resolve())
     external_changes(args.binary.resolve(), args.work.resolve())
     compatibility_unchanged(args.binary.resolve(), args.work.resolve())

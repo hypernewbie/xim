@@ -259,7 +259,10 @@ int main(int argc, char **argv)
             wait_scan();
             auto explorer_rows = [&]() {
                 // Wait for a view newer than the one visible before the
-                // request; a dirty cache keeps serving the old rows.
+                // request; a dirty cache keeps serving the old rows. The
+                // serial must be stable across the row copy, otherwise the
+                // text can belong to an older published view than the serial
+                // observed after serialization.
                 unsigned long long serial = xim_project_explorer_serial();
                 std::unique_ptr<char, decltype(&xim_project_free)> warm(
                     xim_project_explorer_rows(), xim_project_free);
@@ -267,9 +270,11 @@ int main(int argc, char **argv)
                     + std::chrono::seconds(10);
                 for (;;)
                 {
+                    unsigned long long before = xim_project_explorer_serial();
                     std::unique_ptr<char, decltype(&xim_project_free)> text(
                         xim_project_explorer_rows(), xim_project_free);
-                    if (text && xim_project_explorer_serial() != serial
+                    unsigned long long after = xim_project_explorer_serial();
+                    if (text && after != serial && before == after
                             && !xim_project_explorer_pending())
                         return std::string(text.get());
                     require(std::chrono::steady_clock::now() < until,
@@ -387,6 +392,34 @@ int main(int argc, char **argv)
             require(deleted.find("a.txt") != std::string::npos
                     && (std::atoi(deleted.c_str()) & 4) != 0,
                 "delete event missing");
+        }
+        // Explicit-file coverage works without a project root.
+        {
+            auto outside = fixture / "outside-watch.txt";
+            std::ofstream(outside) << "one\n";
+            require(xim_project_watch_file(outside.c_str()) == 1,
+                "explicit file watch was refused");
+            xim_project_free(xim_project_take_changes());
+            std::ofstream(outside) << "two\n";
+            auto until = std::chrono::steady_clock::now()
+                + std::chrono::seconds(10);
+            std::string rows;
+            while (rows.empty()
+                    && std::chrono::steady_clock::now() < until)
+            {
+                std::unique_ptr<char, decltype(&xim_project_free)> text(
+                    xim_project_take_changes(), xim_project_free);
+                if (text) rows = text.get();
+                else
+                {
+                    pollfd event{xim_project_wake_fd(), POLLIN, 0};
+                    poll(&event, 1, 100);
+                    xim_project_poll();
+                }
+            }
+            require(rows.find("outside-watch.txt") != std::string::npos,
+                "explicit file watch produced no change");
+            xim_project_unwatch_file(outside.c_str());
         }
         xim_project_disable();
         require(std::string(xim_project_status()).empty(), "disabled project reports indexing");

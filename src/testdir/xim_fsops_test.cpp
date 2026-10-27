@@ -2,10 +2,12 @@
 // the test links only the worker and the POSIX filesystem.
 #include "../xim_fsops.h"
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
@@ -13,7 +15,17 @@
 #include <vector>
 #include <unistd.h>
 
-extern "C" void xim_project_notify(void) {}
+namespace
+{
+std::mutex notification_lock;
+std::condition_variable notification;
+}
+
+extern "C" void xim_project_notify(void)
+{
+    std::lock_guard guard(notification_lock);
+    notification.notify_all();
+}
 
 namespace
 {
@@ -28,12 +40,10 @@ unsigned long long submit(int kind, const std::string &root,
     unsigned long long id = xim_fsops_preflight(kind, root.c_str(),
             source.c_str(), destination.c_str());
     require(id != 0, "preflight was refused");
-    auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (xim_fsops_state(id) == 0)
-    {
-        require(std::chrono::steady_clock::now() < until, "preflight timed out");
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
+    std::unique_lock guard(notification_lock);
+    require(notification.wait_for(guard, std::chrono::seconds(10), [id] {
+                return xim_fsops_state(id) != 0;
+            }), "preflight did not wake the editor");
     return id;
 }
 
@@ -148,8 +158,8 @@ int main(int argc, char **argv)
         std::ofstream(root + "/c.txt") << "c\n";
         id = submit(XIM_FS_RENAME, root, "b.txt", "c.txt");
         require(!xim_fsops_success(id), "rename overwrote a file");
-        commit_and_wait(id);
-        require(!xim_fsops_success(id), "rename overwrote a file at commit");
+        require(xim_fsops_commit(id) == 0,
+            "failed preflight was allowed to commit");
         require(std::filesystem::exists(root + "/b.txt")
                 && std::filesystem::exists(root + "/c.txt"),
             "rename failure damaged a file");
@@ -159,6 +169,8 @@ int main(int argc, char **argv)
         xim_fsops_ack(id);
         id = submit(XIM_FS_CREATE_FILE, root, "", "../escape.txt");
         require(!xim_fsops_success(id), "traversal accepted");
+        require(xim_fsops_commit(id) == 0,
+            "invalid create preflight was allowed to commit");
         xim_fsops_ack(id);
         id = submit(XIM_FS_DELETE, root, "escape/keep.txt", "");
         require(!xim_fsops_success(id), "symlink ancestor traversal accepted");
@@ -218,6 +230,16 @@ int main(int argc, char **argv)
         require(xim_fsops_state(id) == -1, "cancel kept the plan");
         require(std::filesystem::exists(root + "/b.txt"),
             "cancel removed a file");
+
+        // A cancelled in-flight preflight must not republish a plan or keep
+        // the next request busy. Exercise both queued and executing requests.
+        for (int i = 0; i < 20; ++i)
+        {
+            id = xim_fsops_preflight(XIM_FS_VALIDATE_ROOT, "", root.c_str(), "");
+            require(id != 0, "cancelled preflight kept the worker busy");
+            xim_fsops_cancel(id);
+            require(xim_fsops_state(id) == -1, "cancel retained a result");
+        }
 
         // Root validation.
         id = submit(XIM_FS_VALIDATE_ROOT, "", root, "");

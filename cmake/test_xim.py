@@ -1949,6 +1949,9 @@ def file_operations(binary, root):
         (project / "ctx.txt").write_text("context\n")
         session = Session(binary, project, (".",))
         try:
+            # Let startup finish: preflight must wake an idle editor rather
+            # than depending on an unrelated scan, key or recents event.
+            session.drain(.7)
             # New file creates an empty disk file and opens it.
             session.send(b"\x1bOPNew file\r")
             session.wait(b"New file:")

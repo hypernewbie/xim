@@ -29,7 +29,6 @@
 namespace
 {
 constexpr std::size_t kMaxSummaryEntries = 100000;
-constexpr std::size_t kMaxPending = 8;
 
 struct Plan
 {
@@ -765,9 +764,16 @@ void run_job(const Job &job)
         if (!ok && result.message.empty())
             result.message = "Preflight failed";
         result.state = 1;
-        std::lock_guard guard(lock);
-        plans[job.id] = std::move(plan);
-        results[job.id] = std::move(result);
+        {
+            std::lock_guard guard(lock);
+            // Cancellation can retire a request while preflight is outside
+            // the lock. Never republish a result the owner already released.
+            if (!results.contains(job.id))
+                return;
+            plans[job.id] = std::move(plan);
+            results[job.id] = std::move(result);
+        }
+        xim_project_notify();
         return;
     }
     {
@@ -839,7 +845,7 @@ xim_fsops_preflight(int kind, const char *root, const char *source,
     if (!xim_fsops_init())
         return 0;
     std::lock_guard guard(lock);
-    if (plans.size() >= kMaxPending || !queue.empty())
+    if (!results.empty() || !queue.empty() || mutation_busy)
         return 0;
     unsigned long long id = next_id++;
     Job job;
@@ -859,7 +865,8 @@ xim_fsops_commit(unsigned long long id)
 {
     std::lock_guard guard(lock);
     auto found = plans.find(id);
-    if (found == plans.end() || found->second.committed)
+    if (found == plans.end() || found->second.committed
+            || !results.contains(id) || !results.at(id).success)
         return 0;
     if (mutation_busy)
         return 0;
@@ -878,11 +885,11 @@ xim_fsops_cancel(unsigned long long id)
 {
     std::lock_guard guard(lock);
     auto found = plans.find(id);
-    if (found != plans.end() && !found->second.committed)
-    {
-        plans.erase(found);
-        results.erase(id);
-    }
+    if (found != plans.end() && found->second.committed)
+        return;
+    std::erase_if(queue, [id](const Job &job) { return job.id == id; });
+    plans.erase(id);
+    results.erase(id);
 }
 
 extern "C" int
@@ -1013,6 +1020,13 @@ extern "C" void
 xim_fsops_ack(unsigned long long id)
 {
     std::lock_guard guard(lock);
+    auto found = plans.find(id);
+    // An executing commit borrows its plan outside the lock. Its owner must
+    // retain it until the worker has published the terminal result.
+    if (found != plans.end() && found->second.committed
+            && results.contains(id) && results.at(id).state == 0)
+        return;
+    std::erase_if(queue, [id](const Job &job) { return job.id == id; });
     plans.erase(id);
     results.erase(id);
 }

@@ -1,7 +1,8 @@
 # Native input contract
 
 `xim` and `vim` share the C engine. Only `xim` links `xim_controller.cpp`,
-`xim_commands.cpp`, `xim_menu.cpp`, `xim_project.cpp`, and `xim_bridge.c`. `main.c` selects native dispatch at
+`xim_commands.cpp`, `xim_menu.cpp`, `xim_project.cpp`, `xim_watch.cpp`,
+`xim_fsops.cpp`, `xim_recent.cpp`, and `xim_bridge.c`. `main.c` selects native dispatch at
 the normal top-level input seam, after the existing redraw/deferred-event
 work. Command-line windows and explicitly requested Ex execution retain
 their inherited nested dispatch. `xim --vim` chooses the compatibility path.
@@ -81,24 +82,72 @@ The current executable-location implementation targets Linux (`/proc/self/exe`).
 Engine adapters remain synchronous and main-thread-only. The project module
 has a scanner with an owned root and a path matcher with an immutable shared
 path snapshot; a third content matcher reads the indexed files and starts on
-the first project search. Requests coalesce and completion uses one latest-result slot
-plus a scan-change flag. Generations and query revisions reject obsolete
-results, with cancellation checks during walking, path matching and file
-reads. A content request carries its generation; a completed result is served
-only while that generation is still current, so a refresh invalidates it and
-the prompt shows the pending state until the new scan publishes. Content rows
-serialize outside the state mutex, and each row carries a bounded display
-excerpt (clamped on UTF-8 boundaries with ellipsis markers) next to the true
-line and column used for the jump. The content worker waits for a completed
-scan, skips files larger than
-1 MiB and files with a NUL byte in the first block, and caps results at 1000
-matches or 200 files. It reports skipped and truncated counts as one summary
-row rather than per file.
+the first project search. A separate explorer worker owns directory pages, the
+64 MiB directory cache and one immutable flattened view. Each directory page
+holds at most 200 entries; a Load more row requests the next page, and page
+tokens detect a directory change between requests. The owning thread consumes
+published row text, path identity, kind, depth, flags and revision; it never
+walks, sorts or reads an ignore file. Invalidations are queued under the state
+lock, and large retired indexes are freed by workers outside it. Requests
+coalesce and completion uses one latest-result slot plus a scan-change flag.
+Generations and query revisions reject obsolete results, with cancellation
+checks during walking, path matching and file reads. A content request carries
+its generation; a completed result is served only while that generation is
+still current, so a refresh invalidates it and the prompt shows the pending
+state until the new scan publishes. Content rows serialize outside the state
+mutex, and each row carries a bounded display excerpt (clamped on UTF-8
+boundaries with ellipsis markers) next to the true line and column used for
+the jump. The content worker waits for a completed scan, skips files larger
+than 1 MiB and files with a NUL byte in the first block, and caps results at
+1000 matches or 200 files. It reports skipped and truncated counts as one
+summary row rather than per file.
+
+The Linux watcher service owns inotify descriptors and watch records; it never
+accesses Vim globals or buffer pointers. Notifications return through the
+project wake callback, not terminal input or key injection. Project watches
+cover included directories, new subtrees and ignore-file changes; explicit
+file opens watch the parent and filter unrelated names. Events coalesce for 50
+ms with a 250 ms maximum delay, and the dirty set is capped at 4096 paths or
+1 MiB. Ordinary events patch affected index directories and explorer caches
+off-thread; overflow, root loss, ignore-file changes and an explicit refresh
+request one reconciliation. Watch failure is visible with its cause and
+leaves manual Refresh project usable. The backend interface permits another
+platform implementation without changing editor-state ownership.
+
+External changes are observations, not permission to overwrite text. A clean,
+current UTF-8 buffer under the 256 KiB reload cap stages owned disk bytes on a
+worker. The owning-thread adapter checks buffer number, name, edit tick, disk
+identity and current-buffer focus again before applying them; typing during
+the read becomes a conflict. Dirty, hidden, oversize, binary or non-UTF-8
+buffers receive a changed notice instead. A dirty reload requires explicit
+consent, and deletion keeps the buffer text with a missing notice. An external
+rename is accepted only when the old name is gone and the destination version
+equals the last accepted buffer version.
+
+Native file operations use a separate serialized worker. Preflight and commit
+anchor traversal to directory descriptors, reject absolute and `..`
+destinations, do not follow directory symlinks, create exclusively and rename
+without replacement. Create, rename, move and permanent delete return a state
+sequence; the result remains owned until the controller acknowledges the
+engine buffer update and reconciliation. Recursive delete reports partial
+progress instead of claiming rollback, and it never closes or discards buffer
+text. There is no trash, filesystem undo or cross-filesystem copy-and-delete
+move.
+
+Recent files and folders persist as JSON under `$XDG_STATE_HOME/xim` or
+`$HOME/.local/state/xim`. A dedicated worker reads and writes the file, merges
+under `flock`, writes a private temporary file and renames it atomically, with
+directory mode 0700 and file mode 0600. The owning thread consumes a published
+serial and never blocks on recents I/O. Open folder validates a root through
+the operation worker before the current project changes. Close project stops
+the index, content search and project watches while retaining buffers,
+explicit-file watches and recents. Old picker continuations are cleared before
+a switch, so deferred input cannot replay into the new project.
+
 Refresh never joins the old scan on the editor thread. Retired large indexes
 are freed by workers outside the state mutex, not during a main-thread refresh
-or a completion-slot update. Shutdown cancels first,
-then joins all three workers; a blocking filesystem call can still delay
-shutdown.
+or a completion-slot update. Shutdown cancels first, then joins all workers; a
+blocking filesystem call can still delay shutdown.
 
 A nonblocking close-on-exec pipe wakes the existing Unix select/poll wait.
 The native top-level seam processes completions before entering safe_vgetc();
@@ -111,13 +160,16 @@ Enter during matching retains the exact query. Subsequent decoded keys/paste
 are owned by a bounded 256-entry queue and replayed after activation. At queue
 capacity further terminal bytes remain unread until completion. Escape clears
 the pending choice and queued input. No worker accesses borrowed strings,
-adapter functions, Vim globals or rendering. Explorer listing is still bounded
-synchronous filesystem work; it is not part of the asynchronous matcher.
+adapter functions, Vim globals or rendering. Explorer listing, directory-page
+requests, watch reconciliation, staged reads, file operations and recents I/O
+run on their own workers; only their published results reach the owning
+thread.
 
 See `runtime/doc/xim.txt` for shortcuts, startup policy and compatibility gaps.
-`xim_commands`, `xim_menu`, `xim_project`, `xim_native_pty`, and
-`xim_native_screens` cover dispatch, menu registry/geometry/hit testing,
-project ownership/cancellation/ranking, real-terminal workflows and rendered
-UI respectively. Screen tests are
+`xim_commands`, `xim_menu`, `xim_project`, `xim_fsops`, `xim_recent`,
+`xim_native_pty`, and `xim_native_screens` cover dispatch, menu
+registry/geometry/hit testing, project ownership/cancellation/ranking/watch
+reconciliation, filesystem operations, recents persistence, real-terminal
+workflows and rendered UI respectively. Screen tests are
 registered with `BUILD_FULL_TEST=ON`; they are separate from the inherited
 Make_all.mak target list.

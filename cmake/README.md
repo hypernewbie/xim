@@ -130,6 +130,20 @@ find keystrokes-to-highlight, replace-all, cold and warm project-search
 completion, and a one-second idle sample. `--self-test` runs one sample of
 each. Run it serially.
 
+For Plan 6 explorer, external-change and file-operation completion:
+
+```sh
+python3 cmake/benchmark_xim_live.py --binary build/dev/src/xim \
+    --work build/plan6/perf --output build/plan6/live-perf.json
+```
+
+It creates a 10000-file project and a 100000-child directory once, then
+measures cached explorer movement, the first explorer page, an external create
+becoming visible and a New-file completion. The first-page samples start a
+fresh process per sample; the other samples use one warm process. Fixture
+writeback is flushed and one untimed create warms the operation path, so no
+benchmark overlaps fixture creation. Run it serially.
+
 ## Compatibility performance comparison
 
 Build the inherited reference with `make CC=clang` from `src/`, then build the

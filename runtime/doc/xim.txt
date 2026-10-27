@@ -1,8 +1,8 @@
 *xim.txt*	Native non-modal terminal editing
-					Last change: 2026 Oct 14
+					Last change: 2026 Oct 27
 
 Xim's native input layer uses the existing Vim text engine.  This document
-describes the first native editing milestone.
+describes the native editing and project workflow.
 
 ==============================================================================
 1. Starting Xim						*xim-start*
@@ -59,6 +59,10 @@ Command palette	Ctrl-Shift-P	F1 or F2
 Menus		F10		mouse: top bar
 Search project	Ctrl-Shift-F	Navigate > Search project
 Refresh project			palette: Refresh project
+Open folder			File > Open folder
+Recent files			File > Recent files
+Recent folders			File > Recent folders
+Close project			File > Close project
 
 The palette filters command names by case-insensitive substring.  Up/Down
 move the selection in every list prompt (palette, quick open, explorer,
@@ -106,27 +110,37 @@ A query containing a slash is treated as a path: the picker checks the
 filesystem directly and offers the file even before the index arrives, and
 out-of-root results show an absolute path.
 
-Enumeration and file matching run on two persistent background workers.
-The picker shows "Indexing project..." until the snapshot arrives, or
-"Finding files..." while a query is pending.  Completed results appear without
-another keypress.  Only the latest query is shown; Enter during matching waits
-for that query, and subsequent typing or paste belongs to the opened file.
-Escape cancels a pending choice.  Results stay capped at 200.
+Enumeration, path matching and project content search run on background
+workers.  Directory pages use separate worker-owned records, so expanding a
+directory never walks the whole tree or blocks typing.  The picker shows
+"Indexing project..." until the snapshot arrives, or "Finding files..." while
+a query is pending.  Completed results appear without another keypress.  Only
+the latest query is shown; Enter during matching waits for that query, and
+subsequent typing or paste belongs to the opened file.  Escape cancels a
+pending choice.  Results stay capped at 200.
 
-Use Refresh project in the palette to rebuild the index after files change.
-Refresh keeps explorer expansion and cancels obsolete work without waiting for
-the previous walk to finish.  There is no automatic filesystem watcher.
-Workers never access editor buffers or draw the interface.  Native overlays
-update changed cells rather than erasing the document on each prompt key.
+A Linux inotify watcher keeps the index and the explorer current after
+external changes.  New, changed, renamed and deleted entries appear without a
+keypress; a content change invalidates completed project-search results.  The
+watcher also covers the parent directories of explicitly opened files.  The
+explorer status area reports "Watcher unavailable" or "Watcher partial" with
+the cause, and a network filesystem can omit events even when a watch
+succeeds.  Overflow or an uncertain state requests one reconciliation scan.
+Refresh project retries watch setup, rebuilds the index, keeps explorer
+expansion and cancels obsolete work without waiting for the previous walk.
 
-The explorer shows one directory level at a time.  Enter expands or collapses
-a directory and opens a file.  Directory symlinks are never expanded, so a
-link cannot lead outside the root or loop; a file symlink is listed under its
-own name and opens its target.  Picking a file or buffer switches to it
-without a Save/Discard prompt and keeps any unsaved buffer in the buffer
-list.  Buffer rows show a stable number, '*' for the active buffer and '+' for
-unsaved changes.  Long paths are shortened in the middle so the filename stays
-visible.  Two unnamed buffers remain separate choices.
+The explorer shows worker-owned directory pages of at most 200 entries.
+Directories come before files in lexical order, empty directories are listed,
+and a Load more row requests the next page, so every entry remains reachable
+beyond the first page and the old 500-row limit.  Enter expands or collapses a
+directory and opens a file.  Directory symlinks are never expanded, so a link
+cannot lead outside the root or loop; a file symlink is listed under its own
+name and opens its target.  Picking a file or buffer switches to it without a
+Save/Discard prompt and keeps any unsaved buffer in the buffer list.  Buffer
+rows show a stable number, '*' for the active buffer and '+' for unsaved
+changes.  Rows carry their own path identity, not indentation, and control
+characters are escaped.  Long paths are shortened in the middle so the
+filename stays visible.  Two unnamed buffers remain separate choices.
 
 Project search
 								*xim-search*
@@ -151,6 +165,79 @@ search is available only for a directory or a bare start.
 
 Content search reads the on-disk text of indexed files.  Unsaved buffer
 changes are not searched; save the buffer first to search the edited text.
+
+External changes
+								*xim-external*
+A disk change to an open, clean UTF-8 file of at most 256 KiB reloads
+automatically.  The staged bytes are applied only while the buffer, its edit
+revision and the disk identity still match the observation that started the
+read; typing during the read turns the completion into a conflict.  The reload
+keeps the caret position and leaves one undo step back to the previous text.
+Larger files, non-UTF-8 files and hidden buffers are not reloaded
+automatically.  A dirty buffer keeps its edits.
+
+The status line shows "[!] changed on disk" or "[!] missing on disk" for the
+active buffer.  File > Changed files lists every pending notice.  File >
+Reload from disk applies the disk text; on a dirty buffer it requires [r]
+consent, because that discards local edits.  File > Keep edits accepts the
+current text as the new base without writing it, so a later save still uses
+the engine's overwrite checks.  File > Check external changes re-observes
+tracked files without waiting for the watcher.  An external deletion keeps the
+buffer text and marks it missing; a later save can recreate the file
+explicitly.  An unambiguous external rename updates the buffer path; an
+ambiguous move only marks the old path missing.  Autocommands from a reload
+run on the owning thread.
+
+File operations
+							*xim-file-operations*
+File > New file, New folder, Rename, Move and Delete permanently use the
+explorer selection, or the active document when it belongs to the project.  A
+right-click on an explorer row opens the same actions for that row.  Names and
+Move destinations are relative to the project root.  New file creates an
+empty disk file and opens it; New file and New folder accept a relative path
+only when its parents exist.  Rename does not accept path separators.  Move
+requires an existing destination parent and refuses a folder's own descendant.
+Existing destinations are errors: no action overwrites, merges or silently
+truncates a file, directory or distinct open buffer.  A move across
+filesystems fails visibly and leaves the source intact.
+
+Delete permanently operates on files and nonempty directories.  Its
+confirmation shows the exact target, a worker-summarized entry count and the
+number of affected dirty buffers, and Delete must be chosen explicitly.
+Symlinks are unlinked, never followed.  A recursive delete can fail after
+partial progress; the result reports what remains instead of claiming
+rollback.  Deleted buffers are not closed or discarded: their text stays
+available, marked missing on disk.  Filesystem changes are not covered by
+buffer undo; Ctrl-Z cannot recover a deleted disk entry.  Trash, filesystem
+undo and recursive copy are not provided.
+
+Preflight and mutation run on a serialized worker.  Only one namespace change
+runs at a time; a conflicting request reports Busy.  Rename and Move preserve
+dirty text, modified flags, undo history and window identity, and they update
+every affected buffer path, including descendants of a moved directory.
+Failures keep the prompt input and report the actual cause.  Project switching
+and Quit wait for an unresolved mutation instead of abandoning a committed
+disk change.
+
+Recent files and projects
+								*xim-recent*
+File > Recent files and Recent folders list successful opens, saves and
+project selections.  Entries are absolute, deduplicated and shown relative to
+the current project when possible.  They persist in
+$XDG_STATE_HOME/xim/recent.json, or $HOME/.local/state/xim/recent.json when
+XDG_STATE_HOME is unset, empty or relative.  The state file is data, not
+Vimscript.  Reads and writes run off-thread; writes are atomic, the state
+directory is mode 0700 and the file mode 0600, and instances merge under a
+file lock.  A missing entry reports its path and can be removed from the list.
+File > Clear recent history deletes the lists.
+
+File > Open folder validates a directory off-thread and keeps the current
+project unchanged if validation fails.  File > Close project stops indexing,
+content search and project watching but keeps open buffers, explicit-file
+watches and recents.  Switching projects preserves named, unnamed and dirty
+buffers, including files outside the new root, and cancels old picker
+continuations before the root changes.  Explorer expansion restarts from the
+new root; the status line reports the project name.
 
 Save on an unnamed buffer opens Save as.  The explicit Open prompt, Close,
 and Quit protect modified buffers with Save, Discard, and Cancel choices.

@@ -49,7 +49,7 @@ in other checkouts. The requirements in this file do not depend on those notes.
 - Choose explicit minimum tool versions. Do not constrain new code to ancient
   compiler capabilities.
 
-## Current milestone: Plan 4 native menus and mouse
+## Current milestone: Plan 6 live project and file operations
 
 Plan 0 closeout fixes and the operator-authorized Plan 1 native editing layer
 are implemented. Evidence is in `cmake/PLAN0_CLOSEOUT.md` and
@@ -93,6 +93,19 @@ found twelve defects; the closeout fixes are verified in
 `temp/XIM_PLAN5_REVIEW.md`. F3/Shift-F3 navigate while the find prompt is
 open, F10 opens the menu bar over any prompt, and Help > Xim help opens
 `runtime/doc/xim.txt`.
+
+The operator authorized the live-project slice on 2026-10-27. Plan 6 ships
+worker-owned explorer pages (200 entries per page, 64 MiB cache), a Linux
+inotify watcher with bounded coalescing and reconciliation, safe clean-buffer
+reload with dirty-buffer consent, serialized native create/rename/move/permanent
+delete with anchored path handling, recent files and folders, and Open/Close
+project without losing buffers. Evidence is in `cmake/PLAN6_VALIDATION.md`;
+behavior is documented in `runtime/doc/xim.txt` and the boundary contract in
+`cmake/XIM_INPUT.md`. Editor buffers and rendering stay on the owning thread;
+watcher, operation and recents workers use published owned results. The slice
+excludes trash, filesystem undo, recursive copy, cross-filesystem move emulation,
+multi-root workspaces and the Windows backend.
+
 Keep these gates in effect for subsequent changes:
 
 - Build from tracked sources without Make-generated source-tree headers.

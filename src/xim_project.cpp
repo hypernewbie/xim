@@ -1,4 +1,5 @@
 #include "xim_project.h"
+#include "xim_watch.h"
 
 #include <algorithm>
 #include <atomic>
@@ -66,6 +67,7 @@ std::string result_query;
 std::vector<std::string> results;
 unsigned result_generation = 0;
 unsigned result_revision = 0;
+unsigned long long result_index_revision = 0;
 bool query_active = false;
 std::thread scan_worker;
 std::thread query_worker;
@@ -345,6 +347,9 @@ std::vector<std::string> enumerate(const std::filesystem::path &base,
 	}
 	if (is_dir)
 	{
+	    // Register the watch before reading the ignore file, so a change in
+	    // this subtree during enumeration is queued rather than lost.
+	    xim_watch_watch_dir(entry->path().c_str());
 	    auto gitignore = entry->path() / ".gitignore";
 	    std::error_code open_error;
 	    if (std::filesystem::exists(gitignore, open_error))
@@ -437,6 +442,49 @@ std::string explorer_error;
 std::shared_ptr<const ExplorerView> explorer_view;
 std::thread explorer_worker;
 std::condition_variable explorer_changed;
+
+// External-change queue drained by the owning thread. Paths are absolute.
+struct PendingChange
+{
+    int kind = 0;
+    bool directory = false;
+    unsigned long long version = 0;
+    std::string path;
+    std::string other;
+};
+std::vector<PendingChange> pending_changes;
+void project_watch_events(void *, const xim_watch_event *, size_t, int);
+std::size_t pending_change_bytes = 0;
+bool change_overflow = false;
+unsigned long long changes_serial = 0;
+bool root_lost = false;
+// Reconciliation state. Ordinary file events patch their parent directory;
+// directory moves, overflow and ignore-file changes request a full scan.
+std::set<std::string> dirty_dirs;
+bool reconcile_requested = false;
+bool full_reconcile_requested = false;
+unsigned long long index_revision = 1;
+
+// Staged reads run on their own worker so an event handler never performs a
+// large disk read inside input or redraw dispatch.
+struct ReadRequest
+{
+    unsigned long long id = 0;
+    std::string path;
+    std::size_t limit = 0;
+};
+struct ReadResult
+{
+    int state = 0;  // 0 pending, 1 ready, -1 failed
+    bool binary = false;
+    unsigned long long version = 0;
+    std::string data;
+};
+std::map<unsigned long long, ReadResult> read_results;
+std::vector<ReadRequest> read_queue;
+std::thread read_worker;
+std::condition_variable read_changed;
+unsigned long long next_read_id = 1;
 
 std::string wire_encode(std::string_view path)
 {
@@ -723,9 +771,18 @@ ExplorerDir &ensure_explorer_dir(const std::filesystem::path &base,
                 return found->second;
             }
         }
+        std::size_t pages = found->second.pages;
         explorer_cache_bytes -= std::min(explorer_cache_bytes,
                 found->second.bytes);
         cache.erase(found);
+        ExplorerDir fresh;
+        load_explorer_dir(base, relative, fresh);
+        fresh.pages = std::max(fresh.pages, pages);
+        fresh.used = ++explorer_clock;
+        explorer_cache_bytes += fresh.bytes;
+        auto [slot, inserted] = cache.emplace(relative, std::move(fresh));
+        (void)inserted;
+        return slot->second;
     }
     ExplorerDir fresh;
     load_explorer_dir(base, relative, fresh);
@@ -944,6 +1001,52 @@ std::string explorer_status_locked()
     if (explorer_view && !explorer_view->status.empty())
         return explorer_view->status;
     return {};
+}
+
+unsigned long long path_version(const std::string &path)
+{
+    struct stat info;
+    if (lstat(path.c_str(), &info) != 0)
+        return 0;
+    if (S_ISLNK(info.st_mode))
+    {
+        struct stat target;
+        if (stat(path.c_str(), &target) == 0)
+            info = target;
+    }
+    unsigned long long value = static_cast<unsigned long long>(info.st_dev);
+    value = value * 1099511628211ull
+        ^ static_cast<unsigned long long>(info.st_ino);
+    value = value * 1099511628211ull
+        ^ static_cast<unsigned long long>(info.st_size);
+    value = value * 1099511628211ull
+        ^ static_cast<unsigned long long>(info.st_mtim.tv_sec) * 1000000007ull;
+    value = value * 1099511628211ull
+        ^ static_cast<unsigned long long>(info.st_mtim.tv_nsec);
+    return value;
+}
+
+std::string base_name_of(std::string_view path);
+
+// Called under state_lock. Returns false for paths outside the project.
+bool relative_to_root(const std::string &absolute, std::string &relative)
+{
+    if (root.empty())
+        return false;
+    std::string base = root.generic_string();
+    if (absolute == base)
+    {
+        relative = ".";
+        return true;
+    }
+    if (absolute.size() > base.size()
+            && absolute.compare(0, base.size(), base) == 0
+            && absolute[base.size()] == '/')
+    {
+        relative = absolute.substr(base.size() + 1);
+        return true;
+    }
+    return false;
 }
 
 void explorer_loop()
@@ -1325,17 +1428,118 @@ char *duplicate_content_rows(const ContentResults &results)
     return result;
 }
 
+std::shared_ptr<Index> build_full_index(const std::filesystem::path &base,
+        unsigned generation)
+{
+    auto paths = enumerate(base, generation);
+    auto index = std::make_shared<Index>();
+    index->reserve(paths.size());
+    for (auto &path : paths)
+    {
+        if (obsolete(generation)) return nullptr;
+        auto folded = lowercase(path);
+        index->push_back({std::move(path), std::move(folded)});
+    }
+    return index;
+}
+
+// Files directly inside one directory, using the same ignore rules as the
+// recursive walk. Directory symlinks are not descended.
+std::vector<std::string> list_directory_files(const std::filesystem::path &base,
+        const std::string &relative)
+{
+    std::vector<std::string> result;
+    int fd = open_project_dir(base, relative);
+    if (fd < 0) return result;
+    int listing_fd = dup(fd);
+    if (listing_fd < 0) { close(fd); return result; }
+    DIR *stream = fdopendir(listing_fd);
+    if (stream == nullptr) { close(listing_fd); close(fd); return result; }
+    auto rules = explorer_rules(base, relative);
+    for (;;)
+    {
+        struct dirent *entry = readdir(stream);
+        if (entry == nullptr) break;
+        std::string_view name(entry->d_name);
+        if (name.empty() || name == "." || name == "..") continue;
+        struct stat info;
+        if (fstatat(fd, std::string(name).c_str(), &info,
+                    AT_SYMLINK_NOFOLLOW) != 0)
+            continue;
+        bool regular = S_ISREG(info.st_mode);
+        bool directory = S_ISDIR(info.st_mode);
+        if (S_ISLNK(info.st_mode))
+        {
+            struct stat target;
+            if (fstatat(fd, std::string(name).c_str(), &target, 0) != 0)
+                continue;
+            directory = S_ISDIR(target.st_mode);
+            regular = S_ISREG(target.st_mode);
+        }
+        if (directory || !regular) continue;
+        std::string child = relative == "." ? std::string(name)
+            : relative + "/" + std::string(name);
+        if (has_ignored_component(child)
+                || ignored_by_rules(rules, child, false))
+            continue;
+        result.push_back(std::move(child));
+    }
+    closedir(stream);
+    close(fd);
+    return result;
+}
+
+std::shared_ptr<Index> patch_index(const std::filesystem::path &base,
+        const std::set<std::string> &dirs, unsigned generation)
+{
+    std::vector<IndexedPath> additions;
+    for (const auto &dir : dirs)
+    {
+        if (obsolete(generation)) return nullptr;
+        for (auto &path : list_directory_files(base, dir))
+        {
+            auto folded = lowercase(path);
+            additions.push_back({std::move(path), std::move(folded)});
+        }
+    }
+    auto current = snapshot;
+    auto index = std::make_shared<Index>();
+    index->reserve(current->size() + additions.size());
+    for (const auto &entry : *current)
+    {
+        if (obsolete(generation)) return nullptr;
+        if (dirs.contains(explorer_parent(entry.path))) continue;
+        index->push_back(entry);
+    }
+    for (auto &entry : additions)
+        index->push_back(std::move(entry));
+    std::sort(index->begin(), index->end(),
+            [](const IndexedPath &left, const IndexedPath &right) {
+                return left.path < right.path;
+            });
+    return index;
+}
+
 void scan_loop()
 {
     for (;;)
     {
         std::unique_lock lock(state_lock);
         scan_changed.wait(lock, [] {
-            return stopping.load() || scan_requested || retired_index != nullptr;
+            return stopping.load() || scan_requested || retired_index != nullptr
+                || full_reconcile_requested || !dirty_dirs.empty();
         });
         if (stopping.load()) return;
         auto retired = std::move(retired_index);
-        if (!scan_requested)
+        bool full = scan_requested || full_reconcile_requested || !scan_complete;
+        std::vector<std::string> dirs;
+        if (!full)
+            dirs.assign(dirty_dirs.begin(), dirty_dirs.end());
+        dirty_dirs.clear();
+        reconcile_requested = false;
+        full_reconcile_requested = false;
+        scan_requested = false;
+        if (!full && dirs.empty())
         {
             lock.unlock();
             retired.reset();
@@ -1343,18 +1547,18 @@ void scan_loop()
         }
         auto base = root; // owned root; never read mutable root off-thread
         unsigned generation = current_generation.load();
-        scan_requested = false;
         lock.unlock();
         retired.reset(); // large snapshots are freed off-thread, outside the mutex
-        auto paths = enumerate(base, generation);
-        auto index = std::make_shared<Index>();
-        index->reserve(paths.size());
-        for (auto &path : paths)
+        std::shared_ptr<Index> index;
+        if (full)
+            index = build_full_index(base, generation);
+        else
         {
-            if (obsolete(generation)) break;
-            auto folded = lowercase(path);
-            index->push_back({std::move(path), std::move(folded)});
+            std::set<std::string> dirty(dirs.begin(), dirs.end());
+            index = patch_index(base, dirty, generation);
         }
+        if (index == nullptr)
+            continue;
         lock.lock();
         if (obsolete(generation))
         {
@@ -1362,7 +1566,9 @@ void scan_loop()
             continue;
         }
         snapshot = std::move(index);
-        scan_complete = true;
+        ++index_revision;
+        if (full)
+            scan_complete = true;
         completion = true;
         if (query_active)
         {
@@ -1482,6 +1688,7 @@ xim_project_init(const char *path)
             requested = std::move(canonical);
     }
     if (!ensure_workers()) return;
+    std::string watch_root;
     {
         std::lock_guard lock(state_lock);
         root = error ? std::filesystem::current_path() : requested;
@@ -1489,6 +1696,15 @@ xim_project_init(const char *path)
         current_query.fetch_add(1);
         query_active = false;
         query_requested = false;
+        ++index_revision;
+        pending_changes.clear();
+        pending_change_bytes = 0;
+        change_overflow = false;
+        ++changes_serial;
+        dirty_dirs.clear();
+        reconcile_requested = false;
+        full_reconcile_requested = false;
+        root_lost = false;
         expanded_directories.clear();
         explorer_more.clear();
         explorer_invalidations.clear();
@@ -1504,7 +1720,9 @@ xim_project_init(const char *path)
         content_requested = false;
         content_snapshot = empty_content;
         content_changed.notify_one();
+        watch_root = root.generic_string();
     }
+    xim_watch_start_project(watch_root.c_str(), project_watch_events, nullptr);
     start_scan();
 }
 
@@ -1513,37 +1731,59 @@ xim_project_init(const char *path)
 extern "C" void
 xim_project_disable(void)
 {
-    std::lock_guard lock(state_lock);
-    current_generation.fetch_add(1);
-    current_query.fetch_add(1);
-    active = false;
-    scan_requested = false;
-    query_requested = false;
-    query_active = false;
-    scan_complete = false;
-    root.clear();
-    expanded_directories.clear();
-    explorer_more.clear();
-    explorer_invalidations.clear();
-    explorer_view.reset();
-    explorer_dirty = true;
-    explorer_requested = false;
-    explorer_error.clear();
-    explorer_reset_requested = true;
-    ++explorer_revision;
-    explorer_changed.notify_one();
-    retire_snapshot();
-    results.clear();
-    current_content.fetch_add(1);
-    content_active = false;
-    content_requested = false;
-    content_snapshot = empty_content;
-    content_changed.notify_one();
+    // Keep the worker wake path alive in file-only mode so explicit-file
+    // watches and staged reads can reach the editor.
+    if (!ensure_workers()) return;
+    {
+        std::lock_guard lock(state_lock);
+        current_generation.fetch_add(1);
+        current_query.fetch_add(1);
+        ++index_revision;
+        active = false;
+        scan_requested = false;
+        query_requested = false;
+        query_active = false;
+        scan_complete = false;
+        root.clear();
+        dirty_dirs.clear();
+        reconcile_requested = false;
+        full_reconcile_requested = false;
+        root_lost = false;
+        expanded_directories.clear();
+        explorer_more.clear();
+        explorer_invalidations.clear();
+        explorer_view.reset();
+        explorer_dirty = true;
+        explorer_requested = false;
+        explorer_error.clear();
+        explorer_reset_requested = true;
+        ++explorer_revision;
+        explorer_changed.notify_one();
+        retire_snapshot();
+        results.clear();
+        current_content.fetch_add(1);
+        content_active = false;
+        content_requested = false;
+        content_snapshot = empty_content;
+        content_changed.notify_one();
+    }
+    // Close project keeps explicit-file watches and every open buffer.
+    xim_watch_stop_project();
 }
 
 extern "C" void
 xim_project_refresh(void)
 {
+    std::string base;
+    {
+        std::lock_guard lock(state_lock);
+        if (!active) return;
+        base = root.generic_string();
+        root_lost = false;
+        explorer_error.clear();
+    }
+    // Refresh retries watch setup after a failure or a root replacement.
+    xim_watch_start_project(base.c_str(), project_watch_events, nullptr);
     start_scan();
 }
 
@@ -1558,10 +1798,13 @@ xim_project_shutdown(void)
     query_changed.notify_one();
     content_changed.notify_one();
     explorer_changed.notify_one();
+    read_changed.notify_one();
     if (scan_worker.joinable()) scan_worker.join();
     if (query_worker.joinable()) query_worker.join();
     if (content_worker.joinable()) content_worker.join();
     if (explorer_worker.joinable()) explorer_worker.join();
+    if (read_worker.joinable()) read_worker.join();
+    xim_watch_shutdown();
     for (int &fd : wake_pipe)
     {
         if (fd >= 0) close(fd);
@@ -1600,7 +1843,9 @@ extern "C" int xim_project_pending(void)
 {
     std::lock_guard lock(state_lock);
     return query_active && (result_generation != current_generation.load()
-        || result_revision != current_query.load() || result_query != requested_query
+        || result_revision != current_query.load()
+        || result_index_revision != index_revision
+        || result_query != requested_query
         || (active && !scan_complete && results.empty()));
 }
 
@@ -1608,11 +1853,16 @@ extern "C" const char *
 xim_project_status(void)
 {
     static thread_local std::string text;
-    std::lock_guard lock(state_lock);
-    text = worker_error != nullptr ? worker_error
-        : active && !scan_complete ? "Indexing project..."
-        : query_active && (result_revision != current_query.load()
-            || result_generation != current_generation.load()) ? "Finding files..." : "";
+    std::string watch;
+    {
+        std::lock_guard lock(state_lock);
+        watch = xim_watch_status();
+        text = worker_error != nullptr ? worker_error
+            : active && !scan_complete ? "Indexing project..."
+            : !watch.empty() ? watch
+            : query_active && (result_revision != current_query.load()
+                || result_generation != current_generation.load()) ? "Finding files." : "";
+    }
     return text.c_str();
 }
 
@@ -1676,6 +1926,7 @@ void query_loop()
         auto text = requested_query;
         unsigned generation = current_generation.load();
         unsigned revision = current_query.load();
+        unsigned long long index_rev = index_revision;
         query_requested = false;
         lock.unlock();
         auto candidates = match_paths(*paths, text, generation, revision);
@@ -1693,6 +1944,7 @@ void query_loop()
         }
         lock.lock();
         if (obsolete(generation) || revision != current_query.load()
+                || index_rev != index_revision
                 || !query_active || paths != snapshot)
         {
             lock.unlock();
@@ -1702,6 +1954,7 @@ void query_loop()
         result_query = std::move(text);
         result_generation = generation;
         result_revision = revision;
+        result_index_revision = index_rev;
         completion = true;
         notify_editor();
         lock.unlock(); // releasing an old shared index must not hold state_lock
@@ -1750,6 +2003,99 @@ void content_loop()
         lock.unlock();
     }
 }
+
+void project_watch_events(void *, const xim_watch_event *events, size_t count,
+        int flags)
+{
+    std::lock_guard lock(state_lock);
+    if (stopping.load())
+        return;
+    bool needs_full = (flags & XIM_WATCH_ROOT_LOST) != 0;
+    if (flags & XIM_WATCH_ROOT_LOST)
+    {
+        root_lost = true;
+        explorer_error = "Project unavailable: root deleted or replaced";
+    }
+    if ((flags & XIM_WATCH_OVERFLOW) != 0)
+    {
+        change_overflow = true;
+        needs_full = true;
+    }
+    for (size_t i = 0; i < count; ++i)
+    {
+        const auto &event = events[i];
+        std::string path = event.path == nullptr ? "" : event.path;
+        std::string other = event.other == nullptr ? "" : event.other;
+        std::size_t bytes = path.size() + other.size() + 32;
+        if (pending_changes.size() >= 4096
+                || pending_change_bytes + bytes > (1u << 20))
+            change_overflow = true;
+        else
+        {
+            pending_changes.push_back({event.kind, event.is_directory != 0,
+                    event.version, path, other});
+            pending_change_bytes += bytes;
+        }
+        ++changes_serial;
+        std::string relative;
+        bool inside = relative_to_root(path, relative);
+        std::string relative_other;
+        bool other_inside = relative_to_root(other, relative_other);
+        if (inside)
+            invalidate_explorer(relative, event.is_directory != 0
+                    || (event.kind & (XIM_WATCH_DELETE | XIM_WATCH_MOVE)) != 0);
+        if (other_inside)
+            invalidate_explorer(relative_other, event.is_directory != 0);
+        if (!active)
+            continue;
+        bool is_ignore = inside
+            && (base_name_of(relative) == ".gitignore"
+                || relative == ".git/info/exclude");
+        if ((event.kind & (XIM_WATCH_CREATE | XIM_WATCH_DELETE
+                        | XIM_WATCH_MOVE | XIM_WATCH_ATTRIB)) == 0)
+            continue;  // content-only writes do not change the path set
+        if (is_ignore || event.is_directory || (flags & XIM_WATCH_OVERFLOW)
+                || (flags & XIM_WATCH_ROOT_LOST))
+            needs_full = true;
+        else
+        {
+            if (inside)
+            {
+                dirty_dirs.insert(explorer_parent(relative));
+                reconcile_requested = true;
+            }
+            if (other_inside)
+            {
+                dirty_dirs.insert(explorer_parent(relative_other));
+                reconcile_requested = true;
+            }
+        }
+    }
+    if (needs_full)
+    {
+        full_reconcile_requested = true;
+        reconcile_requested = true;
+    }
+    // Any watcher event can invalidate content results for the active query.
+    current_content.fetch_add(1);
+    if (content_active)
+    {
+        content_requested = true;
+        content_changed.notify_one();
+    }
+    if (reconcile_requested)
+        scan_changed.notify_one();
+    completion = true;
+    notify_editor();
+}
+
+std::string base_name_of(std::string_view path)
+{
+    auto slash = path.find_last_of('/');
+    return std::string(slash == std::string_view::npos
+            ? path : path.substr(slash + 1));
+}
+
 }
 
 extern "C" char *
@@ -1768,7 +2114,9 @@ xim_project_files(const char *query)
         query_changed.notify_one();
     }
     if (result_generation != current_generation.load()
-            || result_revision != current_query.load() || result_query != text)
+            || result_revision != current_query.load()
+            || result_index_revision != index_revision
+            || result_query != text)
         return nullptr;
     return duplicate_lines(results);
 }
@@ -2020,6 +2368,232 @@ xim_project_resolve(const char *item)
 	return nullptr;
     text_out.copy(result, text_out.size());
     result[text_out.size()] = '\0';
+    return result;
+}
+
+namespace
+{
+void read_loop()
+{
+    for (;;)
+    {
+        std::unique_lock lock(state_lock);
+        read_changed.wait(lock, [] {
+            return stopping.load() || !read_queue.empty();
+        });
+        if (stopping.load()) return;
+        if (read_queue.empty()) continue;
+        ReadRequest request = std::move(read_queue.front());
+        read_queue.erase(read_queue.begin());
+        lock.unlock();
+
+        ReadResult result;
+        int fd = open(request.path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            result.state = -1;
+        else
+        {
+            struct stat before;
+            if (fstat(fd, &before) != 0 || !S_ISREG(before.st_mode)
+                    || before.st_size < 0
+                    || static_cast<unsigned long long>(before.st_size)
+                        > request.limit)
+                result.state = -1;
+            else
+            {
+                std::string data;
+                data.resize(static_cast<std::size_t>(before.st_size));
+                std::size_t used = 0;
+                bool failed = false;
+                while (used < data.size())
+                {
+                    ssize_t count = read(fd, data.data() + used,
+                            data.size() - used);
+                    if (count <= 0)
+                    {
+                        if (count < 0 && errno == EINTR)
+                            continue;
+                        failed = true;
+                        break;
+                    }
+                    used += static_cast<std::size_t>(count);
+                }
+                struct stat after;
+                if (failed || fstat(fd, &after) != 0
+                        || after.st_size != before.st_size
+                        || after.st_mtim.tv_sec != before.st_mtim.tv_sec
+                        || after.st_mtim.tv_nsec != before.st_mtim.tv_nsec
+                        || after.st_ino != before.st_ino
+                        || after.st_dev != before.st_dev)
+                    result.state = -1;
+                else
+                {
+                    result.state = 1;
+                    result.version = path_version(request.path);
+                    result.binary = data.find('\0') != std::string::npos;
+                    result.data = std::move(data);
+                }
+            }
+            close(fd);
+        }
+        lock.lock();
+        if (!stopping.load())
+        {
+            read_results[request.id] = std::move(result);
+            while (read_results.size() > 64)
+                read_results.erase(read_results.begin());
+            completion = true;
+            notify_editor();
+        }
+        lock.unlock();
+    }
+}
+
+bool ensure_read_worker()
+{
+    if (read_worker.joinable()) return true;
+    if (worker_error != nullptr) return false;
+    try
+    {
+        read_worker = std::thread(read_loop);
+    }
+    catch (const std::system_error &)
+    {
+        worker_error = "Read worker startup failed";
+        return false;
+    }
+    return true;
+}
+}
+
+extern "C" unsigned long long
+xim_project_stage_read(const char *absolute_path, size_t limit)
+{
+    if (absolute_path == nullptr || *absolute_path != '/')
+        return 0;
+    if (!ensure_workers() || !ensure_read_worker())
+        return 0;
+    std::lock_guard lock(state_lock);
+    if (read_queue.size() >= 32)
+        return 0;
+    unsigned long long id = next_read_id++;
+    read_queue.push_back({id, absolute_path, limit});
+    // Publish the pending state now: a read id must be distinguishable from
+    // an unknown id before the worker has produced a result.
+    read_results[id] = ReadResult{};
+    read_changed.notify_one();
+    return id;
+}
+
+extern "C" int
+xim_project_read_state(unsigned long long id)
+{
+    std::lock_guard lock(state_lock);
+    auto found = read_results.find(id);
+    return found == read_results.end() ? -1 : found->second.state;
+}
+
+extern "C" char *
+xim_project_read_take(unsigned long long id, size_t *length,
+        unsigned long long *version, int *binary)
+{
+    std::lock_guard lock(state_lock);
+    auto found = read_results.find(id);
+    if (found == read_results.end() || found->second.state != 1)
+        return nullptr;
+    ReadResult result = std::move(found->second);
+    read_results.erase(found);
+    auto *data = static_cast<char *>(std::malloc(result.data.size() + 1));
+    if (data == nullptr)
+        return nullptr;
+    result.data.copy(data, result.data.size());
+    data[result.data.size()] = '\0';
+    if (length != nullptr) *length = result.data.size();
+    if (version != nullptr) *version = result.version;
+    if (binary != nullptr) *binary = result.binary ? 1 : 0;
+    return data;
+}
+
+extern "C" void
+xim_project_read_discard(unsigned long long id)
+{
+    std::lock_guard lock(state_lock);
+    read_results.erase(id);
+}
+
+extern "C" char *
+xim_project_take_changes(void)
+{
+    std::vector<PendingChange> changes;
+    bool overflow = false;
+    {
+        std::lock_guard lock(state_lock);
+        changes.swap(pending_changes);
+        pending_change_bytes = 0;
+        overflow = change_overflow;
+        change_overflow = false;
+    }
+    if (changes.empty() && !overflow)
+        return nullptr;
+    std::string combined;
+    for (const auto &change : changes)
+    {
+        combined += std::to_string(change.kind);
+        combined += '\t';
+        combined += std::to_string(change.version);
+        combined += '\t';
+        combined += change.directory ? '1' : '0';
+        combined += '\t';
+        combined += wire_encode(change.path);
+        combined += '\t';
+        combined += wire_encode(change.other);
+        combined += '\n';
+    }
+    if (overflow)
+        combined += "32\t0\t0\t\t\n";
+    auto *result = static_cast<char *>(std::malloc(combined.size() + 1));
+    if (result == nullptr)
+        return nullptr;
+    combined.copy(result, combined.size());
+    result[combined.size()] = '\0';
+    return result;
+}
+
+extern "C" const char *
+xim_project_watch_status(void)
+{
+    return xim_watch_status();
+}
+
+extern "C" int
+xim_project_watch_file(const char *absolute_path)
+{
+    return xim_watch_watch_file(absolute_path);
+}
+
+extern "C" void
+xim_project_unwatch_file(const char *absolute_path)
+{
+    xim_watch_unwatch_file(absolute_path);
+}
+
+extern "C" unsigned long long
+xim_project_file_version(const char *absolute_path)
+{
+    if (absolute_path == nullptr || *absolute_path != '/')
+        return 0;
+    return path_version(absolute_path);
+}
+
+extern "C" char *
+xim_project_wire_decode(const char *wire_path)
+{
+    std::string decoded = wire_decode(wire_path == nullptr ? "" : wire_path);
+    auto *result = static_cast<char *>(std::malloc(decoded.size() + 1));
+    if (result == nullptr)
+        return nullptr;
+    decoded.copy(result, decoded.size());
+    result[decoded.size()] = '\0';
     return result;
 }
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -41,6 +43,31 @@ const char *xim_project_root(void);
 const char *xim_project_explorer_status(void);
 /* Project-relative wire path to an absolute path the engine can open. */
 char *xim_project_resolve_wire(const char *wire_path);
+/* Decode a wire path without resolving it; caller frees with
+ * xim_project_free. */
+char *xim_project_wire_decode(const char *wire_path);
+
+/* External change service. Watcher events are queued and drained by the
+ * owning thread as rows:
+ *   KIND \t VERSION \t ISDIR \t PATH \t OTHER
+ * KIND is a xim_watch_kind bit set, paths are absolute wire paths and OTHER
+ * is the move source (empty for other kinds). The result must be freed with
+ * xim_project_free. */
+char *xim_project_take_changes(void);
+const char *xim_project_watch_status(void);
+int xim_project_watch_file(const char *absolute_path);
+void xim_project_unwatch_file(const char *absolute_path);
+unsigned long long xim_project_file_version(const char *absolute_path);
+
+/* Staged disk reads. The worker reads the file and verifies its identity
+ * before and after; the owning thread applies the bytes. Returns 0 when the
+ * read could not be queued. */
+unsigned long long xim_project_stage_read(const char *absolute_path,
+        size_t limit);
+int xim_project_read_state(unsigned long long id);
+char *xim_project_read_take(unsigned long long id, size_t *length,
+        unsigned long long *version, int *binary);
+void xim_project_read_discard(unsigned long long id);
 /* Project content search. Nonblocking like xim_project_files; rows are
  * DISPLAY \t PATH \t LNUM \t COL with an empty PATH on a file header row.
  * The result must be freed with xim_project_free. */

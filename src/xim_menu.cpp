@@ -9,6 +9,10 @@ constexpr MenuItem kFileItems[] = {
     {"Open", "Ctrl-O", Action::open, 0, 0},
     {"Save", "Ctrl-S", Action::save, 0, 0},
     {"Save as", "Ctrl-Shift-S", Action::save_as, 0, 0},
+    {"Changed files", "", Action::changed_files, 0, 0},
+    {"Reload from disk", "", Action::reload_disk, 0, 0},
+    {"Keep edits", "", Action::keep_edits, 0, 0},
+    {"Check external changes", "", Action::check_external, 0, 0},
     {"Close", "Ctrl-W", Action::close, 0, 0},
     {"Quit", "Ctrl-Q", Action::quit, 0, 0},
 };

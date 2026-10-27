@@ -380,7 +380,8 @@ target_link_libraries(vim PRIVATE vim_core)
 # Native input policy is linked only into xim; vim keeps its modal dispatch.
 if(NOT XIM_FEATURE_LEVEL STREQUAL "tiny")
     add_executable(xim main.c ${VIM_OBJ_MAIN_SRC}
-        xim_bridge.c xim_controller.cpp xim_commands.cpp xim_menu.cpp xim_project.cpp)
+        xim_bridge.c xim_controller.cpp xim_commands.cpp xim_menu.cpp xim_project.cpp
+        xim_watch.cpp)
     target_compile_definitions(xim PRIVATE XIM_NATIVE_ENTRY)
     target_link_libraries(xim PRIVATE vim_core)
     xim_apply_cxx_settings(xim)
@@ -407,7 +408,7 @@ if(NOT XIM_FEATURE_LEVEL STREQUAL "tiny")
 
     find_package(Threads REQUIRED)
     target_link_libraries(xim PRIVATE Threads::Threads)
-    add_executable(xim_project_test testdir/xim_project_test.cpp)
+    add_executable(xim_project_test testdir/xim_project_test.cpp xim_watch.cpp)
     xim_apply_default_flags(xim_project_test)
     xim_apply_cxx_settings(xim_project_test)
     target_link_libraries(xim_project_test PRIVATE Threads::Threads)

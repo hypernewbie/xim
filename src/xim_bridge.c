@@ -61,6 +61,217 @@ xim_engine_named(void)
 }
 
 /*
+ * Buffer inventory for the external-change service. Index order follows the
+ * buffer list and skips the dummy buffer, matching xim_engine_buffers().
+ */
+    int
+xim_engine_buffer_count(void)
+{
+    int count = 0;
+    for (buf_T *buf = firstbuf; buf != NULL; buf = buf->b_next)
+	if ((buf->b_flags & BF_DUMMY) == 0)
+	    ++count;
+    return count;
+}
+
+    int
+xim_engine_buffer_info(int index, int *fnum, unsigned long long *tick,
+	int *modified)
+{
+    int current = 0;
+    for (buf_T *buf = firstbuf; buf != NULL; buf = buf->b_next)
+    {
+	if (buf->b_flags & BF_DUMMY)
+	    continue;
+	if (current++ != index)
+	    continue;
+	if (fnum != NULL) *fnum = buf->b_fnum;
+	if (tick != NULL) *tick = (unsigned long long)CHANGEDTICK(buf);
+	if (modified != NULL) *modified = bufIsChanged(buf) ? 1 : 0;
+	return 1;
+    }
+    return 0;
+}
+
+    char *
+xim_engine_buffer_name(int fnum)
+{
+    buf_T *buf = buflist_findnr(fnum);
+    if (buf == NULL || buf->b_ffname == NULL)
+	return NULL;
+    return (char *)vim_strsave(buf->b_ffname);
+}
+
+    int
+xim_engine_current_buffer(void)
+{
+    return curbuf->b_fnum;
+}
+
+    int
+xim_engine_buffer_utf8(int fnum)
+{
+    buf_T *buf = buflist_findnr(fnum);
+    if (buf == NULL)
+	return 0;
+    if (buf->b_p_fenc == NULL || *buf->b_p_fenc == NUL)
+	return 1;
+    return STRCMP(buf->b_p_fenc, (char_u *)"utf-8") == 0
+	|| STRCMP(buf->b_p_fenc, (char_u *)"utf8") == 0;
+}
+
+/*
+ * Apply staged disk bytes to a clean, current buffer while keeping undo.
+ * The caller already verified the buffer number, name, modification state
+ * and changedtick. Only UTF-8 text is staged; other encodings use the
+ * explicit engine reload so the full conversion rules apply.
+ */
+    int
+xim_engine_reload_staged(int fnum, const char *data, size_t length,
+	unsigned long long expected_tick)
+{
+    buf_T *buf = buflist_findnr(fnum);
+    if (buf == NULL || buf != curbuf || bufIsChanged(buf))
+	return 0;
+    if ((unsigned long long)CHANGEDTICK(buf) != expected_tick)
+	return 0;
+    if (!xim_engine_buffer_utf8(fnum))
+	return 0;
+
+    // Split into lines using the separator present in the staged bytes.
+    int crlf = 0;
+    int mac = 0;
+    if (memchr(data, '\n', length) == NULL && memchr(data, '\r', length) != NULL)
+	mac = 1;
+    else if (memchr(data, '\r', length) != NULL)
+	crlf = 1;
+
+    garray_T lines;
+    ga_init2(&lines, sizeof(char_u *), 128);
+    size_t start = 0;
+    int added = 0;
+    for (size_t i = 0; i <= length; ++i)
+    {
+	int at_end = i == length;
+	int separator = !at_end && (mac ? data[i] == '\r' : data[i] == '\n');
+	if (!separator && !at_end)
+	    continue;
+	// A trailing separator does not create an extra empty last line.
+	if (at_end && start == length)
+	    break;
+	size_t end = i;
+	if (crlf && !mac && end > start && data[end - 1] == '\r')
+	    --end;
+	char_u *line = vim_strnsave((char_u *)data + start, end - start);
+	if (line == NULL)
+	{
+	    for (int n = 0; n < added; ++n)
+		vim_free(((char_u **)lines.ga_data)[n]);
+	    ga_clear(&lines);
+	    return 0;
+	}
+	if (ga_grow(&lines, 1) == FAIL)
+	{
+	    vim_free(line);
+	    for (int n = 0; n < added; ++n)
+		vim_free(((char_u **)lines.ga_data)[n]);
+	    ga_clear(&lines);
+	    return 0;
+	}
+	((char_u **)lines.ga_data)[lines.ga_len++] = line;
+	++added;
+	if (at_end)
+	    break;
+	start = i + 1;
+    }
+    if (added == 0)
+    {
+	char_u *empty = vim_strsave((char_u *)"");
+	if (empty == NULL || ga_grow(&lines, 1) == FAIL)
+	{
+	    vim_free(empty);
+	    ga_clear(&lines);
+	    return 0;
+	}
+	((char_u **)lines.ga_data)[lines.ga_len++] = empty;
+	added = 1;
+    }
+
+    linenr_T old_count = buf->b_ml.ml_line_count;
+    if (u_save((linenr_T)0, old_count + 1) == FAIL)
+    {
+	for (int n = 0; n < added; ++n)
+	    vim_free(((char_u **)lines.ga_data)[n]);
+	ga_clear(&lines);
+	return 0;
+    }
+    for (int i = 0; i < added; ++i)
+    {
+	char_u *line = ((char_u **)lines.ga_data)[i];
+	if (i < old_count)
+	    ml_replace((linenr_T)(i + 1), line, TRUE);
+	else
+	    ml_append((linenr_T)i, line, 0, FALSE);
+	if (i < old_count)
+	    line = NULL;  // ml_replace with copy owns a copy
+	vim_free(line);
+    }
+    for (linenr_T lnum = old_count; lnum > added; --lnum)
+	ml_delete(lnum);
+    ga_clear(&lines);
+    unchanged(buf, FALSE, TRUE);
+    check_cursor();
+    curwin->w_set_curswant = TRUE;
+    redraw_curbuf_later(UPD_NOT_VALID);
+    return 1;
+}
+
+/*
+ * Explicit reload for the acknowledged Reload action. This is the only path
+ * allowed to perform an unbounded synchronous read; the caller is a direct
+ * user choice, never an event handler.
+ */
+    int
+xim_engine_reload(int fnum)
+{
+    buf_T *buf = buflist_findnr(fnum);
+    if (buf == NULL)
+	return 0;
+    int errors = called_emsg;
+    if (buf != curbuf)
+    {
+	char command[64];
+	vim_snprintf(command, sizeof(command), "hide buffer %d", fnum);
+	do_cmdline_cmd((char_u *)command);
+	buf = buflist_findnr(fnum);
+	if (buf == NULL || buf != curbuf)
+	    return 0;
+    }
+    do_cmdline_cmd((char_u *)"edit!");
+    return called_emsg == errors ? 1 : 0;
+}
+
+    int
+xim_engine_rename_buffer(int fnum, const char *name)
+{
+    buf_T *buf = buflist_findnr(fnum);
+    if (buf == NULL || name == NULL || *name == NUL)
+	return 0;
+    buf_set_name(fnum, (char_u *)name);
+    buf_name_changed(buf);
+    return 1;
+}
+
+    void
+xim_engine_notice(const char *text)
+{
+    if (text == NULL || *text == NUL)
+	return;
+    msg((char *)text);
+    redraw_cmdline = TRUE;
+}
+
+/*
  * Return a newline-separated list of listed buffer names for the native
  * buffer picker.  The caller frees the result with xim_engine_free().
  */

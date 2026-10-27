@@ -84,6 +84,7 @@ int main(int argc, char **argv)
     {
         require(argc == 2, "expected private build-tree fixture directory");
         std::filesystem::path fixture(argv[1]);
+        std::filesystem::remove_all(fixture);
         std::filesystem::create_directories(fixture / "one");
         std::filesystem::create_directories(fixture / "two");
         xim_project_init((fixture / "one").c_str());
@@ -322,6 +323,66 @@ int main(int argc, char **argv)
             rows = explorer_rows();
             require(rows.find("  inner.txt\tsub/inner.txt\tf\t1") != std::string::npos,
                 "expanded child row missing");
+        }
+        // Watcher: external create/modify/delete events and staged reads.
+        {
+            auto watched = fixture / "watched";
+            std::filesystem::create_directories(watched);
+            xim_project_init(watched.c_str());
+            wait_scan();
+            xim_project_free(xim_project_take_changes());
+            auto take_changes = [&]() {
+                auto until = std::chrono::steady_clock::now()
+                    + std::chrono::seconds(10);
+                for (;;)
+                {
+                    std::unique_ptr<char, decltype(&xim_project_free)> rows(
+                        xim_project_take_changes(), xim_project_free);
+                    if (rows) return std::string(rows.get());
+                    require(std::chrono::steady_clock::now() < until,
+                        "watcher change timed out");
+                    pollfd event{xim_project_wake_fd(), POLLIN, 0};
+                    poll(&event, 1, 100);
+                    xim_project_poll();
+                }
+            };
+            std::ofstream(watched / "a.txt") << "hello\n";
+            auto created = take_changes();
+            require(created.find("a.txt") != std::string::npos
+                    && (std::atoi(created.c_str()) & 1) != 0,
+                "create event missing");
+            std::ofstream(watched / "a.txt") << "hello edited\n";
+            auto modified = take_changes();
+            require(modified.find("a.txt") != std::string::npos,
+                "modify event missing");
+            unsigned long long read_id = xim_project_stage_read(
+                    (watched / "a.txt").c_str(), 4096);
+            require(read_id != 0, "staged read not queued");
+            auto until = std::chrono::steady_clock::now()
+                + std::chrono::seconds(5);
+            while (xim_project_read_state(read_id) == 0)
+            {
+                require(std::chrono::steady_clock::now() < until,
+                    "staged read timed out");
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            require(xim_project_read_state(read_id) == 1, "staged read failed");
+            size_t read_length = 0;
+            unsigned long long read_version = 0;
+            int read_binary = 0;
+            std::unique_ptr<char, decltype(&xim_project_free)> read_data(
+                xim_project_read_take(read_id, &read_length, &read_version,
+                    &read_binary), xim_project_free);
+            require(read_data && read_length == std::string("hello edited\n").size()
+                    && std::string(read_data.get(), read_length) == "hello edited\n",
+                "staged read bytes differ");
+            require(read_version != 0 && !read_binary,
+                "staged read identity/binary flag differs");
+            std::filesystem::remove(watched / "a.txt");
+            auto deleted = take_changes();
+            require(deleted.find("a.txt") != std::string::npos
+                    && (std::atoi(deleted.c_str()) & 4) != 0,
+                "delete event missing");
         }
         xim_project_disable();
         require(std::string(xim_project_status()).empty(), "disabled project reports indexing");

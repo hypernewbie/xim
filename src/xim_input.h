@@ -56,6 +56,18 @@ int xim_engine_replace_one(const char *find, const char *replace,
         int case_sensitive);
 void xim_engine_overlay(const char *prompt, const char *items, const char *info,
         int error);
+/* Buffer identity, external-change and rename adapters. Main thread only. */
+int xim_engine_buffer_count(void);
+int xim_engine_buffer_info(int index, int *fnum,
+        unsigned long long *tick, int *modified);
+char *xim_engine_buffer_name(int fnum);
+int xim_engine_current_buffer(void);
+int xim_engine_buffer_utf8(int fnum);
+int xim_engine_reload_staged(int fnum, const char *data, size_t length,
+        unsigned long long expected_tick);
+int xim_engine_reload(int fnum);
+int xim_engine_rename_buffer(int fnum, const char *name);
+void xim_engine_notice(const char *text);
 int xim_engine_menu_rows(void);
 int xim_engine_columns(void);
 void xim_engine_boundary(void);

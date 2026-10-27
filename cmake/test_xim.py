@@ -1834,6 +1834,99 @@ def compatibility_unchanged(binary, root):
     print("xim --vim compatibility checks passed")
 
 
+def external_changes(binary, root):
+    """Plan 6: watcher-driven reload, dirty protection and rename tracking."""
+    with tempfile.TemporaryDirectory(prefix="xim-external-", dir=root) as temporary:
+        project = Path(temporary)
+        alpha = project / "alpha.txt"
+        alpha.write_text("one\ntwo\nthree\n")
+        session = Session(binary, project, (".",))
+        try:
+            session.send(b"\x10")
+            session.wait(b"Files:")
+            session.send(b"alpha\r")
+            session.wait(b"three")
+            # Put the caret on line 3; an external stable write reloads the
+            # clean current buffer and keeps the caret.
+            session.send(b"\x1b[B\x1b[B")
+            session.drain(.1)
+            alpha.write_text("one\ntwo\nthree\nfour\n")
+            assert wait_screen(session, b"four", timeout=5), session.screen.text()[-500:]
+            assert session.snapshot() == "one\ntwo\nthree\nfour\n", repr(session.snapshot())
+            session.ex("call writefile([string(line('.')), string(col('.'))], 'caret')")
+            line, _ = (project / "caret").read_text().strip().split()
+            assert int(line) == 3, line
+            # An external create appears in the explorer without a key.
+            (project / "beta.txt").write_text("beta\n")
+            session.send(b"\x05")
+            session.wait(b"Explorer:")
+            assert wait_screen(session, b"beta.txt", timeout=5), \
+                session.screen.text()[-800:]
+            os.unlink(project / "beta.txt")
+            assert wait_screen(session, b"beta.txt", present=False, timeout=5), \
+                session.screen.text()[-800:]
+            session.send(b"\x1b")
+            # Quick open sees an externally created file without a refresh.
+            (project / "quick.txt").write_text("quick\n")
+            session.send(b"\x10")
+            assert wait_screen(session, b"quick.txt", timeout=5), \
+                session.screen.text()[-800:]
+            session.send(b"\x1b")
+            os.unlink(project / "quick.txt")
+            # A dirty buffer is protected: external bytes become a notice,
+            # never a silent overwrite.
+            session.send(b"X")
+            session.drain(.2)
+            alpha.write_text("external\n")
+            assert wait_screen(session, b"Changed on disk", timeout=5), \
+                session.screen.text()[-800:]
+            dirty_text = session.snapshot()
+            assert "Xthree" in dirty_text, dirty_text
+            # Keep edits dismisses the notice without changing text.
+            session.send(b"\x1bOPKeep edits\r")
+            assert wait_screen(session, b"Kept local edits", timeout=5), \
+                session.screen.text()[-800:]
+            assert session.snapshot() == dirty_text
+            # Missing on disk keeps the text; Save as recovers it.
+            os.unlink(alpha)
+            assert wait_screen(session, b"Missing on disk", timeout=5), \
+                session.screen.text()[-800:]
+            assert session.snapshot() == dirty_text
+            session.send(b"\x1bOPSave as\r")
+            session.wait(b"Save as:")
+            session.send(b"recovered.txt\r")
+            assert session.wait_for_file(project / "recovered.txt",
+                                         dirty_text.strip()), \
+                (project / "recovered.txt").read_text()
+            # External rename updates the buffer name without losing edits.
+            renamed = project / "renamed.txt"
+            os.rename(project / "recovered.txt", renamed)
+            assert wait_screen(session, b"Renamed on disk", timeout=5), \
+                session.screen.text()[-800:]
+            session.send(b"Y")
+            session.send(b"\x13")
+            assert session.wait_for_file(renamed,
+                                         dirty_text.strip().replace("Xthree", "XYthree")), \
+                renamed.read_text()
+            assert not (project / "recovered.txt").exists()
+            # Reload from disk on a dirty buffer asks for consent, then
+            # replaces the text.
+            session.send(b"Z")
+            session.drain(.2)
+            renamed.write_text("disk final\n")
+            assert wait_screen(session, b"Changed on disk", timeout=5), \
+                session.screen.text()[-800:]
+            session.send(b"\x1bOPReload from disk\r")
+            session.wait(b"Reload from disk?")
+            session.send(b"r")
+            assert wait_screen(session, b"disk final", timeout=5), \
+                session.screen.text()[-800:]
+            assert session.snapshot() == "disk final\n"
+        finally:
+            session.close()
+    print("Watcher reload, dirty protection and rename checks passed")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -1872,4 +1965,5 @@ if __name__ == "__main__":
     find_highlight_window(args.binary.resolve(), args.work.resolve())
     find_replace(args.binary.resolve(), args.work.resolve())
     project_content_search(args.binary.resolve(), args.work.resolve())
+    external_changes(args.binary.resolve(), args.work.resolve())
     compatibility_unchanged(args.binary.resolve(), args.work.resolve())

@@ -262,6 +262,484 @@ std::vector<std::string> explorer_items()
 // list resolves a row to a file, line and column on activation. Completed
 // rows are cached per publish so caret moves and mouse hits do not
 // reserialize the result set.
+// External-change state. The watcher reports disk observations; these
+// records track the buffer identity, the last accepted disk version and any
+// pending staged read. Only the owning thread touches buffers.
+struct TrackedBuffer
+{
+    int fnum = 0;
+    std::string name;
+    unsigned long long tick = 0;
+    unsigned long long version = 0;
+    unsigned long long read_id = 0;
+    bool read_pending = false;
+};
+struct BufferNotice
+{
+    int fnum = 0;
+    std::string name;
+    int kind = 0;  // 0 changed, 1 missing
+};
+std::vector<TrackedBuffer> tracked_buffers;
+std::vector<BufferNotice> buffer_notices;
+std::string notice_text;
+bool notice_show_pending = false;
+extern bool menu_open;
+constexpr std::size_t kAutoReloadLimit = 256 * 1024;
+constexpr std::string_view kReloadPrompt =
+    "Reload from disk? [r] Reload  [Esc] Cancel";
+
+void begin(Action action);
+void execute(Action action);
+void perform_reload_current();
+
+std::string wire_text_decode(std::string_view text)
+{
+    auto digit = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::string out;
+    out.reserve(text.size());
+    for (std::size_t i = 0; i < text.size(); ++i)
+    {
+        if (text[i] == '%' && i + 2 < text.size())
+        {
+            int high = digit(text[i + 1]);
+            int low = digit(text[i + 2]);
+            if (high >= 0 && low >= 0)
+            {
+                out += static_cast<char>((high << 4) | low);
+                i += 2;
+                continue;
+            }
+        }
+        out += text[i];
+    }
+    return out;
+}
+
+std::string tail_name(const std::string &path)
+{
+    auto slash = path.find_last_of('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+void set_notice_text(const std::string &text)
+{
+    notice_text = text;
+    notice_show_pending = true;
+}
+
+void show_notice_if_idle()
+{
+    if (!notice_show_pending || notice_text.empty())
+        return;
+    if (prompt != Action::ignore || menu_open)
+        return;
+    xim_engine_notice(notice_text.c_str());
+    notice_show_pending = false;
+}
+
+void add_notice(int fnum, const std::string &name, int kind)
+{
+    for (auto &notice : buffer_notices)
+        if (notice.fnum == fnum)
+        {
+            notice.name = name;
+            notice.kind = kind;
+            set_notice_text((kind == 1 ? "Missing on disk: "
+                        : "Changed on disk: ") + tail_name(name));
+            return;
+        }
+    buffer_notices.push_back({fnum, name, kind});
+    set_notice_text((kind == 1 ? "Missing on disk: "
+                : "Changed on disk: ") + tail_name(name));
+}
+
+void drop_notice(int fnum)
+{
+    std::erase_if(buffer_notices, [fnum](const BufferNotice &notice) {
+        return notice.fnum == fnum;
+    });
+}
+
+bool buffer_info(int fnum, unsigned long long &tick, int &modified)
+{
+    int count = xim_engine_buffer_count();
+    for (int i = 0; i < count; ++i)
+    {
+        int found = 0;
+        unsigned long long found_tick = 0;
+        int found_modified = 0;
+        if (!xim_engine_buffer_info(i, &found, &found_tick, &found_modified))
+            continue;
+        if (found != fnum)
+            continue;
+        tick = found_tick;
+        modified = found_modified;
+        return true;
+    }
+    return false;
+}
+
+TrackedBuffer *tracked_by_fnum(int fnum)
+{
+    for (auto &buffer : tracked_buffers)
+        if (buffer.fnum == fnum)
+            return &buffer;
+    return nullptr;
+}
+
+void sync_tracked_buffers()
+{
+    int count = xim_engine_buffer_count();
+    std::vector<TrackedBuffer> next;
+    std::vector<TrackedBuffer> previous = tracked_buffers;
+    for (int i = 0; i < count; ++i)
+    {
+        int fnum = 0;
+        int modified = 0;
+        unsigned long long tick = 0;
+        if (!xim_engine_buffer_info(i, &fnum, &tick, &modified))
+            continue;
+        char *name = xim_engine_buffer_name(fnum);
+        if (name == nullptr || *name == '\0')
+        {
+            if (name != nullptr) xim_engine_free(name);
+            continue;
+        }
+        std::string path(name);
+        xim_engine_free(name);
+        TrackedBuffer buffer;
+        buffer.fnum = fnum;
+        buffer.name = path;
+        buffer.tick = tick;
+        bool matched = false;
+        for (const auto &old : previous)
+        {
+            if (old.fnum != fnum)
+                continue;
+            matched = true;
+            if (old.name == path)
+            {
+                buffer.version = old.version;
+                buffer.read_id = old.read_id;
+                buffer.read_pending = old.read_pending;
+            }
+            else
+            {
+                buffer.version = xim_project_file_version(path.c_str());
+                xim_project_watch_file(path.c_str());
+            }
+            break;
+        }
+        if (!matched)
+        {
+            buffer.version = xim_project_file_version(path.c_str());
+            xim_project_watch_file(path.c_str());
+        }
+        next.push_back(std::move(buffer));
+    }
+    // A buffer that disappeared from the list loses its pending notice and
+    // its parent-directory watch.
+    std::erase_if(buffer_notices, [&next](const BufferNotice &notice) {
+        for (const auto &buffer : next)
+            if (buffer.fnum == notice.fnum)
+                return false;
+        return true;
+    });
+    for (const auto &old : previous)
+    {
+        bool present = false;
+        for (const auto &buffer : next)
+            if (buffer.fnum == old.fnum)
+                present = true;
+        if (!present)
+            xim_project_unwatch_file(old.name.c_str());
+    }
+    tracked_buffers = std::move(next);
+}
+
+void mark_current_saved()
+{
+    int fnum = xim_engine_current_buffer();
+    for (auto &buffer : tracked_buffers)
+        if (buffer.fnum == fnum)
+        {
+            buffer.version = xim_project_file_version(buffer.name.c_str());
+            drop_notice(fnum);
+        }
+    sync_tracked_buffers();
+}
+
+void mark_all_saved()
+{
+    for (auto &buffer : tracked_buffers)
+        buffer.version = xim_project_file_version(buffer.name.c_str());
+    buffer_notices.clear();
+    sync_tracked_buffers();
+}
+
+void consider_reload(TrackedBuffer &buffer, unsigned long long version)
+{
+    unsigned long long tick = 0;
+    int modified = 0;
+    if (!buffer_info(buffer.fnum, tick, modified))
+        return;
+    buffer.tick = tick;
+    if (version == buffer.version)
+    {
+        drop_notice(buffer.fnum);
+        return;
+    }
+    if (modified || xim_engine_current_buffer() != buffer.fnum
+            || !xim_engine_buffer_utf8(buffer.fnum) || buffer.read_pending)
+    {
+        add_notice(buffer.fnum, buffer.name, 0);
+        return;
+    }
+    unsigned long long id = xim_project_stage_read(buffer.name.c_str(),
+            kAutoReloadLimit);
+    if (id == 0)
+    {
+        add_notice(buffer.fnum, buffer.name, 0);
+        return;
+    }
+    buffer.read_id = id;
+    buffer.read_pending = true;
+}
+
+bool process_pending_reads()
+{
+    bool activity = false;
+    for (auto &buffer : tracked_buffers)
+    {
+        if (!buffer.read_pending)
+            continue;
+        int state = xim_project_read_state(buffer.read_id);
+        if (state == 0)
+            continue;
+        buffer.read_pending = false;
+        activity = true;
+        if (state < 0)
+        {
+            xim_project_read_discard(buffer.read_id);
+            add_notice(buffer.fnum, buffer.name, 0);
+            continue;
+        }
+        std::size_t length = 0;
+        unsigned long long version = 0;
+        int binary = 0;
+        std::unique_ptr<char, decltype(&xim_project_free)> data(
+            xim_project_read_take(buffer.read_id, &length, &version, &binary),
+            xim_project_free);
+        if (!data)
+        {
+            add_notice(buffer.fnum, buffer.name, 0);
+            continue;
+        }
+        unsigned long long tick = 0;
+        int modified = 0;
+        if (binary || !buffer_info(buffer.fnum, tick, modified)
+                || tick != buffer.tick || modified
+                || xim_engine_current_buffer() != buffer.fnum)
+        {
+            // Typing during the read, a rename or an encoding boundary turns
+            // the completion into a conflict instead of overwriting text.
+            add_notice(buffer.fnum, buffer.name, 0);
+            continue;
+        }
+        if (!xim_engine_reload_staged(buffer.fnum, data.get(), length,
+                    buffer.tick))
+        {
+            add_notice(buffer.fnum, buffer.name, 0);
+            continue;
+        }
+        buffer.version = version;
+        drop_notice(buffer.fnum);
+        set_notice_text("Reloaded from disk: " + tail_name(buffer.name));
+    }
+    return activity;
+}
+
+void handle_change(int kind, unsigned long long version, bool directory,
+        const std::string &path, const std::string &other)
+{
+    if ((kind & 32) != 0)
+    {
+        // Overflow: re-observe every tracked file rather than trusting a
+        // partial event stream.
+        for (auto &buffer : tracked_buffers)
+        {
+            unsigned long long current =
+                xim_project_file_version(buffer.name.c_str());
+            if (current == 0)
+                add_notice(buffer.fnum, buffer.name, 1);
+            else if (current != buffer.version)
+                consider_reload(buffer, current);
+        }
+        return;
+    }
+    if ((kind & 8) != 0 && !other.empty())
+    {
+        std::vector<TrackedBuffer *> sources;
+        for (auto &buffer : tracked_buffers)
+            if (buffer.name == other)
+                sources.push_back(&buffer);
+        if (sources.size() == 1 && version != 0)
+        {
+            auto *buffer = sources.front();
+            if (xim_engine_rename_buffer(buffer->fnum, path.c_str()))
+            {
+                xim_project_unwatch_file(buffer->name.c_str());
+                buffer->name = path;
+                buffer->version = version;
+                buffer->tick = 0;
+                xim_project_watch_file(path.c_str());
+                drop_notice(buffer->fnum);
+                set_notice_text("Renamed on disk: " + tail_name(path));
+            }
+            else
+                add_notice(buffer->fnum, buffer->name, 1);
+        }
+        else
+            for (auto *buffer : sources)
+                add_notice(buffer->fnum, buffer->name, 1);
+    }
+    for (auto &buffer : tracked_buffers)
+    {
+        if (buffer.name != path || directory)
+            continue;
+        if ((kind & 4) != 0)
+            add_notice(buffer.fnum, buffer.name, 1);
+        else if ((kind & (1 | 2 | 16 | 8)) != 0)
+        {
+            if (version == 0 || version != buffer.version)
+                consider_reload(buffer, version);
+            else
+                drop_notice(buffer.fnum);
+        }
+    }
+}
+
+bool service_external_changes()
+{
+    sync_tracked_buffers();
+    bool activity = false;
+    std::unique_ptr<char, decltype(&xim_project_free)> rows(
+        xim_project_take_changes(), xim_project_free);
+    if (rows)
+    {
+        activity = true;
+        std::string_view text(rows.get());
+        while (!text.empty())
+        {
+            auto end = text.find('\n');
+            std::string_view line = text.substr(0, end);
+            text = end == std::string_view::npos
+                ? std::string_view{} : text.substr(end + 1);
+            std::string_view fields[5];
+            std::size_t field = 0;
+            std::size_t start = 0;
+            for (; field < 5; ++field)
+            {
+                auto tab = line.find('\t', start);
+                fields[field] = line.substr(start,
+                        tab == std::string_view::npos
+                            ? std::string_view::npos : tab - start);
+                if (tab == std::string_view::npos)
+                {
+                    ++field;
+                    break;
+                }
+                start = tab + 1;
+            }
+            if (field < 5)
+                continue;
+            int kind = std::atoi(std::string(fields[0]).c_str());
+            unsigned long long version =
+                std::strtoull(std::string(fields[1]).c_str(), nullptr, 10);
+            bool directory = !fields[2].empty() && fields[2][0] == '1';
+            std::string path = wire_text_decode(fields[3]);
+            std::string other = wire_text_decode(fields[4]);
+            handle_change(kind, version, directory, path, other);
+        }
+    }
+    activity = process_pending_reads() || activity;
+    sync_tracked_buffers();
+    return activity;
+}
+
+void check_external_changes()
+{
+    for (auto &buffer : tracked_buffers)
+    {
+        unsigned long long current =
+            xim_project_file_version(buffer.name.c_str());
+        if (current == 0)
+            add_notice(buffer.fnum, buffer.name, 1);
+        else if (current != buffer.version)
+            consider_reload(buffer, current);
+        else
+            drop_notice(buffer.fnum);
+    }
+    process_pending_reads();
+}
+
+void keep_current_edits()
+{
+    int fnum = xim_engine_current_buffer();
+    for (auto &buffer : tracked_buffers)
+        if (buffer.fnum == fnum)
+        {
+            buffer.version = xim_project_file_version(buffer.name.c_str());
+            drop_notice(fnum);
+            set_notice_text("Kept local edits: " + tail_name(buffer.name));
+            return;
+        }
+}
+
+void perform_reload_current()
+{
+    prompt = Action::ignore;
+    int fnum = xim_engine_current_buffer();
+    auto *buffer = tracked_by_fnum(fnum);
+    if (buffer == nullptr)
+    {
+        set_notice_text("No disk file for the active buffer");
+        return;
+    }
+    if (xim_project_file_version(buffer->name.c_str()) == 0)
+    {
+        add_notice(fnum, buffer->name, 1);
+        return;
+    }
+    if (!xim_engine_reload(fnum))
+    {
+        set_notice_text("Reload failed for " + tail_name(buffer->name));
+        return;
+    }
+    buffer->version = xim_project_file_version(buffer->name.c_str());
+    drop_notice(fnum);
+    set_notice_text("Reloaded from disk: " + tail_name(buffer->name));
+    sync_tracked_buffers();
+}
+
+std::vector<std::string> notice_items()
+{
+    std::vector<std::string> rows;
+    for (const auto &notice : buffer_notices)
+    {
+        rows.push_back(std::to_string(notice.fnum) + ": "
+                + (notice.kind == 1 ? "[missing] " : "[changed] ")
+                + notice.name);
+    }
+    return rows;
+}
+
 struct ContentMeta
 {
     std::string path;
@@ -516,6 +994,14 @@ std::string prompt_info()
             : slash == std::string::npos ? root : root.substr(slash + 1);
         if (xim_project_explorer_pending())
             info += "  loading";
+        const char *watch = xim_project_watch_status();
+        if (watch != nullptr && *watch != '\0')
+        {
+            info += "  ";
+            info += watch;
+        }
+        if (info.size() > 72)
+            info.resize(72);
         return info;
     }
     if (prompt == Action::search_project)
@@ -581,6 +1067,8 @@ std::vector<std::string> project_items(Action action, const std::string &text)
 {
     if (action == Action::explorer)
         return explorer_items();
+    if (action == Action::changed_files)
+        return notice_items();
     if (action == Action::search_project)
     {
         // Cached rows: refetch only when the publish serial, query or case
@@ -799,7 +1287,12 @@ void execute(Action action)
     switch (action)
     {
         case Action::save:
-            if (xim_engine_named()) xim_engine_command("update", "", 1);
+            if (xim_engine_named())
+            {
+                xim_engine_command("update", "", 1);
+                if (!xim_engine_unsaved(0))
+                    mark_current_saved();
+            }
             else begin(Action::save_as);
             break;
         case Action::save_as: case Action::open: case Action::find:
@@ -838,6 +1331,20 @@ void execute(Action action)
             // its text, which turns the quoted message into an Ex error.
             xim_engine_command("echo 'Xim: one-run terminal editor'", "", 0);
             break;
+        case Action::changed_files: begin(action); break;
+        case Action::reload_disk:
+        {
+            int fnum = xim_engine_current_buffer();
+            unsigned long long tick = 0;
+            int modified = 0;
+            if (buffer_info(fnum, tick, modified) && modified)
+                prompt = Action::reload_confirm;
+            else
+                perform_reload_current();
+            break;
+        }
+        case Action::keep_edits: keep_current_edits(); break;
+        case Action::check_external: check_external_changes(); break;
         case Action::copy: case Action::cut:
         {
             if (prompt != Action::ignore && field_has_selection())
@@ -981,7 +1488,7 @@ bool open_picker_item(Action current, const std::vector<std::string> &list,
             + std::to_string(meta.col + 1) + ")";
         xim_engine_command(jump.c_str(), "", 0);
     }
-    else if (current == Action::buffers)
+    else if (current == Action::buffers || current == Action::changed_files)
     {
         auto number = item.substr(0, item.find(':'));
         xim_engine_command("hide buffer", number.c_str(), 0);
@@ -1092,7 +1599,8 @@ bool activate_current_row(Action current)
             : selected;
         return open_picker_item(current, list, row);
     }
-    if (current == Action::files || current == Action::buffers)
+    if (current == Action::files || current == Action::buffers
+            || current == Action::changed_files)
     {
         // Enter uses the last rendered rows when available so a click and
         // Enter agree on the same visible list.
@@ -1229,6 +1737,12 @@ extern "C" void xim_dispatch(int key, int modifiers)
             pending_save_as_retry = false;
             return;
         }
+        if (prompt == Action::reload_confirm)
+        {
+            if (key == 'r' || key == 'R')
+                perform_reload_current();
+            return;
+        }
         if (prompt == Action::confirm)
         {
             if (key == 'd' || key == 'D') perform_pending(true);
@@ -1251,7 +1765,12 @@ extern "C" void xim_dispatch(int key, int modifiers)
                         auto error = xim_engine_error();
                         pending_error = error ? error : "Write failed";
                     }
-                    else if (!xim_engine_unsaved(pending == Action::quit)) perform_pending(false);
+                    else
+                    {
+                        mark_all_saved();
+                        if (!xim_engine_unsaved(pending == Action::quit))
+                            perform_pending(false);
+                    }
                 }
             }
             return;
@@ -1391,6 +1910,8 @@ extern "C" void xim_dispatch(int key, int modifiers)
                         }
                         else if (current == Action::ex)
                             xim_engine_command(command, argument, 0);
+                        if (current == Action::save_as)
+                            mark_current_saved();
                         if (current == Action::save_as && save_then_continue)
                         {
                             save_then_continue = false;
@@ -1420,7 +1941,8 @@ extern "C" void xim_dispatch(int key, int modifiers)
         if ((key == XIM_UP || key == XIM_DOWN)
                 && (prompt == Action::palette || prompt == Action::files
                     || prompt == Action::buffers || prompt == Action::explorer
-                    || prompt == Action::search_project))
+                    || prompt == Action::search_project
+                    || prompt == Action::changed_files))
         {
             std::size_t count = 0;
             if (prompt == Action::palette) count = filtered().size();
@@ -1575,7 +2097,9 @@ extern "C" int xim_input_blocked() { return deferred_keys.size() >= kMaxDeferred
 
 extern "C" int xim_background()
 {
+    sync_tracked_buffers();
     if (!xim_project_poll()) return 0;
+    bool changed = service_external_changes();
     bool picker = prompt == Action::files || prompt == Action::search_project;
     bool ready = prompt == Action::files ? !xim_project_pending()
         : prompt == Action::search_project ? !xim_project_content_pending()
@@ -1591,7 +2115,9 @@ extern "C" int xim_background()
             else xim_dispatch(entry.key, entry.modifiers);
         return 1;
     }
-    return 0;
+    // A reload, rename or notice changed visible state: return to the main
+    // loop so the document and message line are redrawn without a keypress.
+    return changed ? 1 : 0;
 }
 
 extern "C" int xim_prompt_place(int screen_col)
@@ -1637,6 +2163,7 @@ static std::string prompt_label()
     if (prompt == Action::ex) return "Ex: ";
     if (prompt == Action::files) return "Files: ";
     if (prompt == Action::buffers) return "Buffers: ";
+    if (prompt == Action::changed_files) return "Changed: ";
     if (prompt == Action::explorer) return "Explorer: ";
     if (prompt == Action::search_project) return "Search: ";
     return "Command: ";
@@ -1660,6 +2187,13 @@ namespace
 {
 void render_prompt_overlay(int menu_rows)
 {
+    if (prompt == Action::reload_confirm)
+    {
+        rendered_prompt_text = kReloadPrompt;
+        rendered_prompt_cursor = static_cast<int>(kReloadPrompt.size());
+        xim_engine_overlay(rendered_prompt_text.c_str(), "", "", false);
+        return;
+    }
     if (prompt == Action::confirm)
     {
         auto error = pending_error.empty() ? "" : pending_error + "\n";
@@ -1695,7 +2229,8 @@ void render_prompt_overlay(int menu_rows)
         }
     }
     else if (prompt == Action::files || prompt == Action::buffers
-            || prompt == Action::explorer || prompt == Action::search_project)
+            || prompt == Action::explorer || prompt == Action::search_project
+            || prompt == Action::changed_files)
     {
         auto list = project_items(prompt, input);
         if (list.empty())
@@ -1787,6 +2322,7 @@ extern "C" void xim_render()
     // layer and paints last.
     render_prompt_overlay(menu_rows);
     render_menu_popup(columns, menu_rows, caps);
+    show_notice_if_idle();
 }
 
 // Mouse handling: menus and visible prompts first, documents via the engine.
@@ -1803,7 +2339,8 @@ bool activate_picker_row(int row, int columns)
     (void)columns;
     if (prompt != Action::files && prompt != Action::buffers
             && prompt != Action::explorer && prompt != Action::palette
-            && prompt != Action::search_project)
+            && prompt != Action::search_project
+            && prompt != Action::changed_files)
         return false;
     int rows = screen_rows_for_mouse();
     // Recompute the overlay geometry used by xim_engine_overlay: items end
@@ -1954,7 +2491,8 @@ extern "C" void xim_mouse_press(int row, int col, int button, int modifiers, int
     }
     if ((prompt == Action::files || prompt == Action::buffers
                 || prompt == Action::explorer || prompt == Action::palette
-                || prompt == Action::search_project)
+                || prompt == Action::search_project
+                || prompt == Action::changed_files)
             && button == 0)
     {
         if (activate_picker_row(row, columns)) return;
@@ -2103,7 +2641,8 @@ extern "C" void xim_mouse_wheel(int row, int col, int direction, int modifiers)
     }
     if (prompt == Action::files || prompt == Action::buffers
             || prompt == Action::explorer || prompt == Action::palette
-            || prompt == Action::search_project)
+            || prompt == Action::search_project
+            || prompt == Action::changed_files)
     {
         if (direction == 0) xim_dispatch(XIM_UP, 0);
         else if (direction == 1) xim_dispatch(XIM_DOWN, 0);

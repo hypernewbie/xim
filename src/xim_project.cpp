@@ -7,6 +7,8 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <memory>
 #include <filesystem>
@@ -17,6 +19,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
 #include <system_error>
 #include <thread>
 #include <vector>
@@ -27,10 +30,16 @@ namespace
 // Enumeration is bounded so a huge tree cannot consume unbounded memory.
 constexpr std::size_t kMaxIndexedFiles = 100000;
 constexpr std::size_t kMaxResults = 200;
-constexpr std::size_t kMaxExplorerRows = 500;
+
+// Explorer contract: bounded pages, cached directory records and an owned
+// flattened view. The cache budget applies to inactive directories; expanded
+// directories are reloaded on demand if they are evicted.
+constexpr std::size_t kExplorerPage = 200;
+constexpr std::size_t kExplorerDirCap = 200000;
+constexpr std::size_t kExplorerRowCap = 20000;
+constexpr std::size_t kExplorerCacheBudget = 64u * 1024u * 1024u;
 
 std::filesystem::path root;
-std::set<std::string> expanded_directories;
 
 struct IndexedPath
 {
@@ -357,95 +366,6 @@ std::vector<std::string> enumerate(const std::filesystem::path &base,
     return result;
 }
 
-void collect_listing(std::vector<std::string> &out, const std::string &parent,
-	int depth,
-	std::map<std::string, std::vector<gitignore_rule>> &rules_by_dir)
-{
-    std::vector<std::pair<bool, std::string>> children;
-    std::error_code error;
-    auto absolute = parent == "." ? root : root / std::filesystem::path(parent);
-    // The walker calls this once for the project root before expanding
-    // anything, so register the root's .gitignore here as well.  The
-    // recursive enumeration pass already handles descendants; the
-    // explorer needs them too so its visible tree matches the index.
-    if (parent == ".")
-    {
-	std::error_code open_error;
-	auto root_gitignore = root / ".gitignore";
-	if (std::filesystem::exists(root_gitignore, open_error))
-	{
-	    auto rules = parse_gitignore(root_gitignore);
-	    if (!rules.empty())
-		rules_by_dir.emplace(".", std::move(rules));
-	}
-    }
-    for (auto entry = std::filesystem::directory_iterator(absolute,
-		 std::filesystem::directory_options::skip_permission_denied, error);
-	 entry != std::filesystem::directory_iterator();
-	 entry.increment(error))
-    {
-	error.clear();
-	auto text = entry->path().lexically_relative(root).generic_string();
-	if (text.empty() || text == "." || text == ".."
-		|| text.compare(0, 3, "../") == 0)
-	    continue;
-	// Do not follow directory symlinks here: expanding one would walk
-	// the target tree (and loop forever on a self-link).  File symlinks
-	// keep their in-tree name; opening one still resolves the target.
-	bool linked = entry->is_symlink(error);
-	auto is_dir = !linked && entry->is_directory(error);
-	if (has_ignored_component(text)
-		|| ignored_by_rules(rules_by_dir, text, is_dir))
-	    continue;
-	if (is_dir)
-	    children.emplace_back(true, text);
-	else if (entry->is_regular_file(error))
-	    children.emplace_back(false, text);
-    }
-    std::sort(children.begin(), children.end(),
-	    [](const auto &left, const auto &right) {
-		if (left.first != right.first)
-		    return left.first > right.first;
-		return left.second < right.second;
-	    });
-    for (const auto &[directory, relative] : children)
-    {
-	if (directory)
-	{
-	    out.push_back(std::string(depth * 2, ' '));
-	    out.back() += expanded_directories.contains(relative) ? "- " : "+ ";
-	    out.back() += relative + "/";
-	    if (expanded_directories.contains(relative))
-	    {
-		// Load this directory's .gitignore before recursing so the
-		// children honor its rules.
-		std::error_code open_error;
-		auto gitignore = root / std::filesystem::path(relative) / ".gitignore";
-		bool owned = false;
-		if (std::filesystem::exists(gitignore, open_error))
-		{
-		    auto rules = parse_gitignore(gitignore);
-		    if (!rules.empty())
-		    {
-			rules_by_dir.emplace(relative, std::move(rules));
-			owned = true;
-		    }
-		}
-		collect_listing(out, relative, depth + 1, rules_by_dir);
-		if (owned)
-		    rules_by_dir.erase(relative);
-	    }
-	}
-	else
-	{
-	    out.push_back(std::string(depth * 2 + 2, ' '));
-	    out.back() += relative;
-	}
-	if (out.size() >= kMaxExplorerRows)
-	    return;
-    }
-}
-
 char *duplicate_lines(const std::vector<std::string> &lines)
 {
     std::string combined;
@@ -460,6 +380,628 @@ char *duplicate_lines(const std::vector<std::string> &lines)
     combined.copy(result, combined.size());
     result[combined.size()] = '\0';
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// Explorer: worker-owned directory pages and an owned flattened view. The
+// editor only ever copies published rows; no directory walk, sort or ignore
+// read happens on the owning thread.
+// ---------------------------------------------------------------------------
+struct ExplorerEntry
+{
+    std::string name;
+    bool directory = false;
+    bool link = false;
+};
+struct ExplorerDir
+{
+    std::vector<ExplorerEntry> entries;
+    bool truncated = false;
+    std::string error;
+    unsigned long long identity = 0;
+    std::size_t pages = 1;
+    std::size_t bytes = 0;
+    unsigned long long used = 0;
+};
+struct ExplorerRow
+{
+    std::string display;
+    std::string path;      // wire-encoded project-relative identity
+    char kind = 'f';
+    int depth = 0;
+    int flags = 0;
+    unsigned long long revision = 0;
+};
+struct ExplorerView
+{
+    std::vector<ExplorerRow> rows;
+    std::string status;
+    unsigned long long revision = 0;
+};
+
+// Worker-owned directory cache. Only the explorer worker mutates it; the
+// owning thread requests invalidation through the guarded flags below.
+std::map<std::string, ExplorerDir> explorer_dirs;
+std::size_t explorer_cache_bytes = 0;
+unsigned long long explorer_clock = 0;
+// Guarded by state_lock.
+std::set<std::string> expanded_directories;
+std::map<std::string, std::size_t> explorer_more;
+std::vector<std::pair<std::string, bool>> explorer_invalidations;
+bool explorer_reset_requested = false;
+unsigned long long explorer_revision = 1;
+unsigned long long explorer_publishes = 0;
+bool explorer_dirty = true;
+bool explorer_requested = false;
+std::string explorer_error;
+std::shared_ptr<const ExplorerView> explorer_view;
+std::thread explorer_worker;
+std::condition_variable explorer_changed;
+
+std::string wire_encode(std::string_view path)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(path.size());
+    for (unsigned char c : path)
+    {
+        if (c == '%' || c == '\t' || c == '\n' || c == '\r')
+        {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 0xf];
+        }
+        else
+            out += static_cast<char>(c);
+    }
+    return out;
+}
+
+std::string wire_decode(std::string_view text)
+{
+    auto digit = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::string out;
+    out.reserve(text.size());
+    for (std::size_t i = 0; i < text.size(); ++i)
+    {
+        if (text[i] == '%' && i + 2 < text.size())
+        {
+            int high = digit(text[i + 1]);
+            int low = digit(text[i + 2]);
+            if (high >= 0 && low >= 0)
+            {
+                out += static_cast<char>((high << 4) | low);
+                i += 2;
+                continue;
+            }
+        }
+        out += text[i];
+    }
+    return out;
+}
+
+// Control bytes are escaped so a filename cannot inject terminal output.
+std::string sanitize_display(std::string_view text)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(text.size());
+    for (unsigned char c : text)
+    {
+        if (c < 0x20 || c == 0x7f)
+        {
+            out += "\\x";
+            out += hex[c >> 4];
+            out += hex[c & 0xf];
+        }
+        else
+            out += static_cast<char>(c);
+    }
+    return out;
+}
+
+std::string explorer_parent(std::string_view relative)
+{
+    auto slash = relative.find_last_of('/');
+    if (slash == std::string_view::npos)
+        return ".";
+    return std::string(relative.substr(0, slash));
+}
+
+unsigned long long explorer_dir_identity(int fd)
+{
+    struct stat info;
+    if (fstat(fd, &info) != 0)
+        return 0;
+    unsigned long long value = static_cast<unsigned long long>(info.st_dev);
+    value = value * 1099511628211ull
+        ^ static_cast<unsigned long long>(info.st_ino);
+    value = value * 1099511628211ull
+        ^ static_cast<unsigned long long>(info.st_mtime) * 1000000007ull;
+    value = value * 1099511628211ull
+        ^ static_cast<unsigned long long>(info.st_mtim.tv_nsec);
+    value = value * 1099511628211ull
+        ^ static_cast<unsigned long long>(info.st_size);
+    return value;
+}
+
+int open_project_dir(const std::filesystem::path &base, std::string_view relative)
+{
+    int fd = open(base.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    if (relative.empty() || relative == ".")
+        return fd;
+    std::string_view rest(relative);
+    while (!rest.empty())
+    {
+        auto slash = rest.find('/');
+        std::string part(rest.substr(0, slash));
+        if (part.empty() || part == "." || part == "..")
+        {
+            close(fd);
+            return -1;
+        }
+        int next = openat(fd, part.c_str(),
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        close(fd);
+        if (next < 0)
+            return -1;
+        fd = next;
+        if (slash == std::string_view::npos)
+            break;
+        rest.remove_prefix(slash + 1);
+    }
+    return fd;
+}
+
+// Rules for the children of a directory: every .gitignore from the root down
+// to and including the directory itself. Reading these is worker-only work.
+std::map<std::string, std::vector<gitignore_rule>>
+explorer_rules(const std::filesystem::path &base, std::string_view relative)
+{
+    std::map<std::string, std::vector<gitignore_rule>> rules;
+    auto load = [&](const std::string &owner, const std::filesystem::path &dir) {
+        auto file = dir / ".gitignore";
+        std::error_code error;
+        if (!std::filesystem::exists(file, error))
+            return;
+        auto parsed = parse_gitignore(file);
+        if (!parsed.empty())
+            rules.emplace(owner, std::move(parsed));
+    };
+    load(".", base);
+    if (relative.empty() || relative == ".")
+        return rules;
+    std::string current;
+    std::string_view rest(relative);
+    while (!rest.empty())
+    {
+        auto slash = rest.find('/');
+        std::string part(rest.substr(0, slash));
+        if (part.empty() || part == "." || part == "..")
+            break;
+        if (!current.empty())
+            current += '/';
+        current += part;
+        load(current, base / std::filesystem::path(current));
+        if (slash == std::string_view::npos)
+            break;
+        rest.remove_prefix(slash + 1);
+    }
+    return rules;
+}
+
+// List one directory into the cache. Directory descriptors anchor every
+// lookup: a concurrent symlink swap cannot redirect the walk.
+void load_explorer_dir(const std::filesystem::path &base,
+        const std::string &relative, ExplorerDir &out)
+{
+    out = ExplorerDir{};
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        int fd = open_project_dir(base, relative);
+        if (fd < 0)
+        {
+            out.error = std::string("unreadable: ") + strerror(errno);
+            return;
+        }
+        unsigned long long before = explorer_dir_identity(fd);
+        int listing_fd = dup(fd);
+        if (listing_fd < 0)
+        {
+            close(fd);
+            out.error = "unreadable: descriptor unavailable";
+            return;
+        }
+        DIR *stream = fdopendir(listing_fd);
+        if (stream == nullptr)
+        {
+            close(listing_fd);
+            close(fd);
+            out.error = std::string("unreadable: ") + strerror(errno);
+            return;
+        }
+        auto rules = explorer_rules(base, relative);
+        std::vector<ExplorerEntry> entries;
+        bool truncated = false;
+        errno = 0;
+        for (;;)
+        {
+            struct dirent *entry = readdir(stream);
+            if (entry == nullptr)
+                break;
+            std::string_view name(entry->d_name);
+            if (name.empty() || name == "." || name == "..")
+                continue;
+            std::string child = relative == "." ? std::string(name)
+                : relative + "/" + std::string(name);
+            struct stat info;
+            if (fstatat(fd, std::string(name).c_str(), &info,
+                        AT_SYMLINK_NOFOLLOW) != 0)
+                continue;
+            bool link = S_ISLNK(info.st_mode);
+            bool directory = S_ISDIR(info.st_mode);
+            bool regular = S_ISREG(info.st_mode);
+            if (link)
+            {
+                // Directory symlinks are never listed or expanded: a self
+                // link cannot recurse and a link cannot escape the root.
+                // A file symlink keeps its in-tree alias as an entry.
+                struct stat target;
+                if (fstatat(fd, std::string(name).c_str(), &target, 0) == 0)
+                {
+                    if (S_ISDIR(target.st_mode))
+                        continue;
+                    regular = S_ISREG(target.st_mode);
+                }
+                else
+                    regular = false;
+                directory = false;
+            }
+            if (!directory && !regular)
+                continue;
+            if (has_ignored_component(child)
+                    || ignored_by_rules(rules, child, directory))
+                continue;
+            entries.push_back({std::string(name), directory, link});
+            if (entries.size() >= kExplorerDirCap)
+            {
+                truncated = true;
+                break;
+            }
+        }
+        int read_error = errno;
+        closedir(stream);
+        unsigned long long after = explorer_dir_identity(fd);
+        close(fd);
+        if (read_error != 0)
+        {
+            out.error = std::string("unreadable: ") + strerror(read_error);
+            return;
+        }
+        std::sort(entries.begin(), entries.end(),
+                [](const ExplorerEntry &left, const ExplorerEntry &right) {
+                    if (left.directory != right.directory)
+                        return left.directory > right.directory;
+                    return left.name < right.name;
+                });
+        if (before != 0 && before == after)
+        {
+            out.entries = std::move(entries);
+            out.truncated = truncated;
+            out.identity = after;
+            for (const auto &entry : out.entries)
+                out.bytes += entry.name.size() + 32;
+            return;
+        }
+        // The directory changed while it was read; read it again rather than
+        // publishing a page that mixes two states.
+    }
+    out.error = "changed while reading";
+}
+
+ExplorerDir &ensure_explorer_dir(const std::filesystem::path &base,
+        const std::string &relative, std::map<std::string, ExplorerDir> &cache)
+{
+    auto found = cache.find(relative);
+    if (found != cache.end())
+    {
+        int fd = open_project_dir(base, relative);
+        if (fd >= 0)
+        {
+            unsigned long long identity = explorer_dir_identity(fd);
+            close(fd);
+            if (identity != 0 && identity == found->second.identity)
+            {
+                found->second.used = ++explorer_clock;
+                return found->second;
+            }
+        }
+        explorer_cache_bytes -= std::min(explorer_cache_bytes,
+                found->second.bytes);
+        cache.erase(found);
+    }
+    ExplorerDir fresh;
+    load_explorer_dir(base, relative, fresh);
+    fresh.used = ++explorer_clock;
+    explorer_cache_bytes += fresh.bytes;
+    auto [slot, inserted] = cache.emplace(relative, std::move(fresh));
+    (void)inserted;
+    return slot->second;
+}
+
+void evict_explorer_cache(std::map<std::string, ExplorerDir> &cache,
+        const std::set<std::string> &expanded)
+{
+    while (explorer_cache_bytes > kExplorerCacheBudget)
+    {
+        auto victim = cache.end();
+        for (auto it = cache.begin(); it != cache.end(); ++it)
+        {
+            if (it->first == "." || expanded.contains(it->first))
+                continue;
+            if (victim == cache.end() || it->second.used < victim->second.used)
+                victim = it;
+        }
+        if (victim == cache.end())
+            break;  // every remaining directory is visible
+        explorer_cache_bytes -= std::min(explorer_cache_bytes,
+                victim->second.bytes);
+        cache.erase(victim);
+    }
+}
+
+void append_explorer_row(ExplorerView &view, std::string display,
+        std::string path, char kind, int depth, int flags,
+        unsigned long long revision, std::size_t &rows, bool &limited)
+{
+    if (rows >= kExplorerRowCap)
+    {
+        limited = true;
+        return;
+    }
+    view.rows.push_back({std::move(display), std::move(path), kind, depth,
+            flags, revision});
+    ++rows;
+}
+
+void flatten_explorer(const std::filesystem::path &base,
+        const std::string &relative, int depth, ExplorerView &view,
+        std::size_t &rows, bool &limited, const std::set<std::string> &expanded,
+        const std::map<std::string, std::size_t> &more_pages)
+{
+    auto &dir = ensure_explorer_dir(base, relative, explorer_dirs);
+    if (!dir.error.empty())
+    {
+        append_explorer_row(view,
+                std::string(depth * 2, ' ') + "[unreadable: "
+                    + sanitize_display(relative) + ": " + dir.error + "]",
+                {}, 's', depth, 0, view.revision, rows, limited);
+        return;
+    }
+    auto requested = more_pages.find(relative);
+    if (requested != more_pages.end()
+            && requested->second + 1 > dir.pages)
+        dir.pages = requested->second + 1;
+    std::size_t shown = std::min(dir.entries.size(), dir.pages * kExplorerPage);
+    for (std::size_t i = 0; i < shown; ++i)
+    {
+        const auto &entry = dir.entries[i];
+        std::string child = relative == "." ? entry.name
+            : relative + "/" + entry.name;
+        bool expanded_dir = entry.directory && !entry.link
+            && expanded.contains(child);
+        std::string display(depth * 2, ' ');
+        if (entry.directory)
+            display += expanded_dir ? "- " : "+ ";
+        else
+            display += "  ";
+        display += sanitize_display(entry.name);
+        if (entry.directory)
+            display += '/';
+        if (entry.link)
+            display += " @";
+        append_explorer_row(view, std::move(display), wire_encode(child),
+                entry.directory ? 'd' : 'f', depth,
+                expanded_dir ? 1 : 0, view.revision, rows, limited);
+        if (limited)
+            return;
+        if (expanded_dir)
+        {
+            flatten_explorer(base, child, depth + 1, view, rows, limited,
+                    expanded, more_pages);
+            if (limited)
+                return;
+        }
+    }
+    if (shown < dir.entries.size())
+    {
+        std::string display(depth * 2, ' ');
+        display += "  [load more: ";
+        display += std::to_string(dir.entries.size() - shown);
+        display += " entries]";
+        append_explorer_row(view, std::move(display), wire_encode(relative),
+                'm', depth, 0, view.revision, rows, limited);
+    }
+    if (dir.truncated)
+    {
+        std::string display(depth * 2, ' ');
+        display += "  [listing truncated at ";
+        display += std::to_string(kExplorerDirCap);
+        display += " entries]";
+        append_explorer_row(view, std::move(display), {}, 's', depth, 0,
+                view.revision, rows, limited);
+    }
+}
+
+void build_explorer_view(const std::filesystem::path &base,
+        unsigned long long revision, ExplorerView &view,
+        const std::set<std::string> &expanded,
+        const std::map<std::string, std::size_t> &more_pages)
+{
+    view.revision = revision;
+    std::size_t rows = 0;
+    bool limited = false;
+    int fd = open_project_dir(base, ".");
+    if (fd < 0)
+    {
+        view.status = std::string("Project unavailable: ") + strerror(errno);
+        append_explorer_row(view, view.status, {}, 's', 0, 0, revision,
+                rows, limited);
+        return;
+    }
+    close(fd);
+    flatten_explorer(base, ".", 0, view, rows, limited, expanded, more_pages);
+    if (limited)
+    {
+        append_explorer_row(view,
+                "  [explorer row limit reached; collapse a directory]",
+                {}, 's', 0, 0, revision, rows, limited);
+        view.status = "Explorer row limit reached";
+    }
+    evict_explorer_cache(explorer_dirs, expanded);
+}
+
+// Called with state_lock held.
+void mark_explorer_dirty()
+{
+    explorer_dirty = true;
+    explorer_changed.notify_one();
+}
+
+// Called with state_lock held. Queues a cache invalidation for the worker;
+// the cache itself is worker-owned, so the owning thread never touches it.
+void invalidate_explorer(std::string_view path, bool subtree)
+{
+    if (explorer_invalidations.size() >= 256)
+    {
+        explorer_reset_requested = true;
+        explorer_invalidations.clear();
+    }
+    else if (path.empty() || path == ".")
+        explorer_reset_requested = true;
+    else
+        explorer_invalidations.emplace_back(std::string(path), subtree);
+    ++explorer_revision;
+    mark_explorer_dirty();
+}
+
+void apply_explorer_invalidations()
+{
+    if (explorer_reset_requested)
+    {
+        explorer_reset_requested = false;
+        explorer_dirs.clear();
+        explorer_cache_bytes = 0;
+        explorer_invalidations.clear();
+        return;
+    }
+    for (const auto &[path, subtree] : explorer_invalidations)
+    {
+        std::string parent = explorer_parent(path);
+        auto found = explorer_dirs.find(parent);
+        if (found != explorer_dirs.end())
+        {
+            explorer_cache_bytes -= std::min(explorer_cache_bytes,
+                    found->second.bytes);
+            explorer_dirs.erase(found);
+        }
+        if (subtree)
+        {
+            std::string prefix(path);
+            prefix += '/';
+            for (auto it = explorer_dirs.begin(); it != explorer_dirs.end(); )
+            {
+                if (it->first == path
+                        || it->first.compare(0, prefix.size(), prefix) == 0)
+                {
+                    explorer_cache_bytes -= std::min(explorer_cache_bytes,
+                            it->second.bytes);
+                    it = explorer_dirs.erase(it);
+                }
+                else
+                    ++it;
+            }
+        }
+    }
+    explorer_invalidations.clear();
+}
+
+std::string explorer_status_locked()
+{
+    if (!active)
+        return "No project";
+    if (!explorer_error.empty())
+        return explorer_error;
+    if (explorer_dirty || explorer_requested)
+        return "Refreshing explorer";
+    if (explorer_view && !explorer_view->status.empty())
+        return explorer_view->status;
+    return {};
+}
+
+void explorer_loop()
+{
+    for (;;)
+    {
+        std::unique_lock lock(state_lock);
+        explorer_changed.wait(lock, [] {
+            return stopping.load() || (active && explorer_dirty);
+        });
+        if (stopping.load())
+            return;
+        if (!active || !explorer_dirty)
+            continue;
+        explorer_dirty = false;
+        explorer_requested = true;
+        auto base = root;
+        unsigned generation = current_generation.load();
+        unsigned long long revision = explorer_revision;
+        auto expanded = expanded_directories;
+        auto more_pages = explorer_more;
+        lock.unlock();
+
+        apply_explorer_invalidations();
+        auto view = std::make_shared<ExplorerView>();
+        build_explorer_view(base, revision, *view, expanded, more_pages);
+
+        lock.lock();
+        if (obsolete(generation) || base != root)
+        {
+            explorer_requested = false;
+            continue;
+        }
+        explorer_view = std::move(view);
+        explorer_requested = false;
+        ++explorer_publishes;
+        completion = true;
+        notify_editor();
+        lock.unlock();
+    }
+}
+
+bool ensure_explorer_worker()
+{
+    if (explorer_worker.joinable())
+        return true;
+    if (worker_error != nullptr)
+        return false;
+    try
+    {
+        explorer_worker = std::thread(explorer_loop);
+    }
+    catch (const std::system_error &)
+    {
+        worker_error = "Explorer worker startup failed";
+        return false;
+    }
+    return true;
 }
 
 std::vector<std::string> match_paths(const Index &paths, std::string_view query,
@@ -919,6 +1461,7 @@ void start_scan()
     if (!active) return;
     current_generation.fetch_add(1);
     retire_snapshot();
+    invalidate_explorer("", false);
     results.clear();
     scan_complete = false;
     scan_requested = true;
@@ -932,6 +1475,12 @@ xim_project_init(const char *path)
     std::error_code error;
     auto requested = path == nullptr || *path == '\0'
 	? std::filesystem::current_path() : std::filesystem::absolute(path, error);
+    if (!error)
+    {
+        auto canonical = std::filesystem::weakly_canonical(requested, error);
+        if (!error)
+            requested = std::move(canonical);
+    }
     if (!ensure_workers()) return;
     {
         std::lock_guard lock(state_lock);
@@ -940,8 +1489,22 @@ xim_project_init(const char *path)
         current_query.fetch_add(1);
         query_active = false;
         query_requested = false;
+        expanded_directories.clear();
+        explorer_more.clear();
+        explorer_invalidations.clear();
+        explorer_view.reset();
+        explorer_dirty = true;
+        explorer_requested = false;
+        explorer_error.clear();
+        explorer_reset_requested = true;
+        ++explorer_revision;
+        explorer_changed.notify_one();
+        current_content.fetch_add(1);
+        content_active = false;
+        content_requested = false;
+        content_snapshot = empty_content;
+        content_changed.notify_one();
     }
-    expanded_directories.clear();
     start_scan();
 }
 
@@ -960,6 +1523,15 @@ xim_project_disable(void)
     scan_complete = false;
     root.clear();
     expanded_directories.clear();
+    explorer_more.clear();
+    explorer_invalidations.clear();
+    explorer_view.reset();
+    explorer_dirty = true;
+    explorer_requested = false;
+    explorer_error.clear();
+    explorer_reset_requested = true;
+    ++explorer_revision;
+    explorer_changed.notify_one();
     retire_snapshot();
     results.clear();
     current_content.fetch_add(1);
@@ -985,9 +1557,11 @@ xim_project_shutdown(void)
     scan_changed.notify_one();
     query_changed.notify_one();
     content_changed.notify_one();
+    explorer_changed.notify_one();
     if (scan_worker.joinable()) scan_worker.join();
     if (query_worker.joinable()) query_worker.join();
     if (content_worker.joinable()) content_worker.join();
+    if (explorer_worker.joinable()) explorer_worker.join();
     for (int &fd : wake_pipe)
     {
         if (fd >= 0) close(fd);
@@ -1271,58 +1845,137 @@ xim_project_content_status(void)
     return text.c_str();
 }
 
-extern "C" char *
-xim_project_explorer(const char *query)
+extern "C" void
+xim_project_notify(void)
 {
-    std::vector<std::string> listing;
-    if (!active)
-	return duplicate_lines(listing);
-    std::map<std::string, std::vector<gitignore_rule>> rules_by_dir;
-    collect_listing(listing, ".", 0, rules_by_dir);
-    if (query == nullptr || *query == '\0')
-	return duplicate_lines(listing);
-    std::vector<std::string> matches;
-    auto needle = lowercase(query);
-    for (const auto &line : listing)
-	if (lowercase(line).find(needle) != std::string::npos)
-	    matches.push_back(line);
-    return duplicate_lines(matches);
+    notify_editor();
+}
+
+extern "C" char *
+xim_project_explorer_rows(void)
+{
+    if (!ensure_workers()) return nullptr;
+    if (!ensure_explorer_worker()) return nullptr;
+    std::shared_ptr<const ExplorerView> view;
+    {
+        std::lock_guard lock(state_lock);
+        if (!active)
+            return duplicate_lines({});
+        if (explorer_view != nullptr)
+            view = explorer_view;
+        if (explorer_dirty || explorer_view == nullptr)
+        {
+            if (!explorer_requested)
+            {
+                explorer_requested = true;
+                explorer_changed.notify_one();
+            }
+            if (view == nullptr)
+                return nullptr;
+        }
+    }
+    // Serialize outside the lock: a view is immutable once published.
+    std::string combined;
+    for (const auto &row : view->rows)
+    {
+        combined += row.display;
+        combined += '\t';
+        combined += row.path;
+        combined += '\t';
+        combined += row.kind;
+        combined += '\t';
+        combined += std::to_string(row.depth);
+        combined += '\t';
+        combined += std::to_string(row.flags);
+        combined += '\t';
+        combined += std::to_string(row.revision);
+        combined += '\n';
+    }
+    auto *result = static_cast<char *>(std::malloc(combined.size() + 1));
+    if (result == nullptr)
+        return nullptr;
+    combined.copy(result, combined.size());
+    result[combined.size()] = '\0';
+    return result;
 }
 
 extern "C" int
-xim_project_explorer_activate(const char *item, char **selected)
+xim_project_explorer_pending(void)
 {
-    std::string_view text(item == nullptr ? "" : item);
-    while (!text.empty() && (text.front() == ' ' || text.front() == '+' || text.front() == '-'))
-	text.remove_prefix(1);
-    while (!text.empty() && text.front() == ' ')
-	text.remove_prefix(1);
-    bool directory = false;
-    if (!text.empty() && text.back() == '/')
-    {
-	directory = true;
-	text.remove_suffix(1);
-    }
-    if (*selected != nullptr)
-	xim_project_free(*selected);
-    *selected = nullptr;
-    if (text.empty())
-	return 0;
-    if (directory)
-    {
-	std::string relative(text);
-	if (expanded_directories.contains(relative))
-	    expanded_directories.erase(relative);
-	else
-	    expanded_directories.insert(relative);
-	return 0;
-    }
-    *selected = static_cast<char *>(std::malloc(text.size() + 1));
-    if (*selected == nullptr)
-	return -1;
-    text.copy(*selected, text.size());
-    (*selected)[text.size()] = '\0';
+    std::lock_guard lock(state_lock);
+    return active && (explorer_dirty || explorer_requested
+            || explorer_view == nullptr) ? 1 : 0;
+}
+
+extern "C" unsigned long long
+xim_project_explorer_serial(void)
+{
+    std::lock_guard lock(state_lock);
+    return explorer_publishes;
+}
+
+extern "C" int
+xim_project_explorer_toggle(const char *wire_path)
+{
+    if (wire_path == nullptr)
+        return 0;
+    std::string path = wire_decode(wire_path);
+    if (path.empty() || path == "." || path.front() == '/'
+            || path.find("/../") != std::string::npos
+            || path.starts_with("../") || path == "..")
+        return 0;
+    std::lock_guard lock(state_lock);
+    if (!active)
+        return 0;
+    if (expanded_directories.contains(path))
+        expanded_directories.erase(path);
+    else
+        expanded_directories.insert(path);
+    mark_explorer_dirty();
     return 1;
+}
+
+extern "C" void
+xim_project_explorer_more(const char *wire_path)
+{
+    if (wire_path == nullptr)
+        return;
+    std::string path = wire_decode(wire_path);
+    if (path.empty())
+        path = ".";
+    if (path.front() == '/' || path.find("/../") != std::string::npos
+            || path.starts_with("../") || path == "..")
+        return;
+    std::lock_guard lock(state_lock);
+    if (!active)
+        return;
+    ++explorer_more[path];
+    mark_explorer_dirty();
+}
+
+extern "C" const char *
+xim_project_root(void)
+{
+    static thread_local std::string text;
+    std::lock_guard lock(state_lock);
+    text = root.empty() ? "" : root.generic_string();
+    return text.c_str();
+}
+
+extern "C" const char *
+xim_project_explorer_status(void)
+{
+    static thread_local std::string text;
+    std::lock_guard lock(state_lock);
+    text = worker_error != nullptr ? worker_error : explorer_status_locked();
+    return text.c_str();
+}
+
+extern "C" char *
+xim_project_resolve_wire(const char *wire_path)
+{
+    std::string path = wire_decode(wire_path == nullptr ? "" : wire_path);
+    return xim_project_resolve(path.c_str());
 }
 
 extern "C" char *

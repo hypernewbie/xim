@@ -2,7 +2,9 @@
 // 100000-path owned snapshot fixture without a production test-only API.
 #include "../xim_project.cpp"
 #include <chrono>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <poll.h>
 #include <stdexcept>
 
@@ -236,6 +238,90 @@ int main(int argc, char **argv)
             std::string col_text = rows.substr(meta + 1,
                 rows.find('\n', meta) - meta - 1);
             require(col_text == "9000", col_text.c_str());
+        }
+        // Explorer pages: bounded first page, deterministic order, empty
+        // directories, row identity separate from display text and a page
+        // token that detects a directory change between requests.
+        {
+            auto exp = fixture / "explorer";
+            std::filesystem::create_directories(exp / "empty-dir");
+            std::filesystem::create_directories(exp / "sub");
+            std::ofstream(exp / "sub" / "inner.txt") << "inner\n";
+            for (int i = 0; i < 450; ++i)
+            {
+                std::ostringstream name;
+                name << "file_" << std::setw(4) << std::setfill('0') << i << ".txt";
+                std::ofstream(exp / name.str()) << "x\n";
+            }
+            std::ofstream(exp / "bad\tname.txt") << "tab\n";
+            xim_project_init(exp.c_str());
+            wait_scan();
+            auto explorer_rows = [&]() {
+                // Wait for a view newer than the one visible before the
+                // request; a dirty cache keeps serving the old rows.
+                unsigned long long serial = xim_project_explorer_serial();
+                std::unique_ptr<char, decltype(&xim_project_free)> warm(
+                    xim_project_explorer_rows(), xim_project_free);
+                auto until = std::chrono::steady_clock::now()
+                    + std::chrono::seconds(10);
+                for (;;)
+                {
+                    std::unique_ptr<char, decltype(&xim_project_free)> text(
+                        xim_project_explorer_rows(), xim_project_free);
+                    if (text && xim_project_explorer_serial() != serial
+                            && !xim_project_explorer_pending())
+                        return std::string(text.get());
+                    require(std::chrono::steady_clock::now() < until,
+                        "explorer view timed out");
+                    pollfd event{xim_project_wake_fd(), POLLIN, 0};
+                    poll(&event, 1, 100);
+                    xim_project_poll();
+                }
+            };
+            auto rows = explorer_rows();
+            auto count_rows = [](const std::string &text) {
+                std::size_t count = 0;
+                for (char c : text) if (c == '\n') ++count;
+                return count;
+            };
+            // 451 files (450 numbered plus one tab name) and two directories
+            // give 453 entries; page one shows 200 plus the load-more row.
+            require(count_rows(rows) == 201, "explorer first page size differs");
+            require(rows.find("+ empty-dir/\tempty-dir\td\t0") != std::string::npos,
+                "empty directory missing or lacks identity");
+            require(rows.find("+ sub/\tsub\td\t0") != std::string::npos,
+                "subdirectory missing or lacks identity");
+            auto first_file = rows.find("  file_0000.txt\tfile_0000.txt\tf\t0");
+            auto load_more = rows.find("[load more:");
+            require(first_file != std::string::npos, "file row missing");
+            require(load_more != std::string::npos
+                    && first_file < load_more, "load-more row placement differs");
+            require(rows.find("\\x09") != std::string::npos
+                    && rows.find("bad%09name.txt") != std::string::npos,
+                "control-character display/path escaping differs");
+            xim_project_explorer_more(".");
+            rows = explorer_rows();
+            require(count_rows(rows) == 401, "second explorer page size differs");
+            xim_project_explorer_more(".");
+            rows = explorer_rows();
+            require(count_rows(rows) == 453, "final explorer page size differs");
+            require(rows.find("[load more:") == std::string::npos,
+                "load-more row survived the final page");
+            // A directory change between requests must reload the page data
+            // rather than mixing two listings.
+            std::ofstream(exp / "zz_new.txt") << "new\n";
+            xim_project_explorer_more(".");
+            rows = explorer_rows();
+            require(rows.find("zz_new.txt\tzz_new.txt\tf\t0") != std::string::npos,
+                "changed page token did not refresh the listing");
+            xim_project_explorer_toggle("empty-dir");
+            rows = explorer_rows();
+            require(rows.find("- empty-dir/\tempty-dir\td\t0\t1") != std::string::npos,
+                "explorer expansion flag missing");
+            xim_project_explorer_toggle("sub");
+            rows = explorer_rows();
+            require(rows.find("  inner.txt\tsub/inner.txt\tf\t1") != std::string::npos,
+                "expanded child row missing");
         }
         xim_project_disable();
         require(std::string(xim_project_status()).empty(), "disabled project reports indexing");

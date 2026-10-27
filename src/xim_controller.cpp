@@ -103,6 +103,161 @@ int confirm_choice_at(int col)
 }
 std::vector<std::string> file_rows;
 std::string file_rows_query;
+// Explorer rows keep display text and path identity separate. The worker
+// publishes the list; caret moves, filtering and clicks only touch this cache.
+struct ExplorerRow
+{
+    std::string display;
+    std::string path;
+    char kind = 'f';
+    int depth = 0;
+    int flags = 0;
+};
+std::vector<ExplorerRow> explorer_rows;
+std::vector<std::size_t> explorer_filtered;
+std::vector<std::size_t> last_picker_rows;
+std::string explorer_selected;
+unsigned long long explorer_serial_seen = 0;
+std::string explorer_status_text;
+
+std::string lower_text(std::string_view text)
+{
+    std::string out(text);
+    for (char &c : out)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    return out;
+}
+
+void parse_explorer_rows(const char *payload)
+{
+    std::vector<ExplorerRow> rows;
+    std::string_view text(payload == nullptr ? "" : payload);
+    while (!text.empty())
+    {
+        auto end = text.find('\n');
+        std::string_view line = text.substr(0, end);
+        text = end == std::string_view::npos
+            ? std::string_view{} : text.substr(end + 1);
+        std::string_view fields[6];
+        std::size_t field = 0;
+        std::size_t start = 0;
+        for (; field < 6; ++field)
+        {
+            auto tab = line.find('\t', start);
+            fields[field] = line.substr(start, tab == std::string_view::npos
+                    ? std::string_view::npos : tab - start);
+            if (tab == std::string_view::npos)
+            {
+                ++field;
+                break;
+            }
+            start = tab + 1;
+        }
+        if (field < 6)
+            continue;
+        ExplorerRow row;
+        row.display = std::string(fields[0]);
+        row.path = std::string(fields[1]);
+        row.kind = fields[2].empty() ? 's' : fields[2][0];
+        row.depth = std::atoi(std::string(fields[3]).c_str());
+        row.flags = std::atoi(std::string(fields[4]).c_str());
+        rows.push_back(std::move(row));
+    }
+    explorer_rows = std::move(rows);
+}
+
+// Repair the selected path after a refresh: exact identity first, then the
+// nearest surviving parent, then the nearest row position.
+void repair_explorer_selection()
+{
+    auto contains = [&](const std::string &path) {
+        for (const auto &row : explorer_rows)
+            if (row.path == path)
+                return true;
+        return false;
+    };
+    if (explorer_rows.empty())
+    {
+        explorer_selected.clear();
+        selected = 0;
+        return;
+    }
+    if (!explorer_selected.empty() && contains(explorer_selected))
+        return;
+    std::string candidate = explorer_selected;
+    while (!candidate.empty())
+    {
+        auto slash = candidate.find_last_of('/');
+        candidate = slash == std::string::npos
+            ? std::string{} : candidate.substr(0, slash);
+        if (!candidate.empty() && contains(candidate))
+        {
+            explorer_selected = candidate;
+            return;
+        }
+    }
+    if (selected >= explorer_rows.size())
+        selected = explorer_rows.size() - 1;
+    explorer_selected = explorer_rows[selected].path;
+}
+
+void ensure_explorer_rows()
+{
+    unsigned long long serial = xim_project_explorer_serial();
+    if (serial == explorer_serial_seen && !explorer_rows.empty())
+        return;
+    char *payload = xim_project_explorer_rows();
+    if (payload == nullptr)
+    {
+        explorer_status_text = xim_project_explorer_status();
+        return;
+    }
+    std::unique_ptr<char, decltype(&xim_project_free)> guard(
+            payload, xim_project_free);
+    parse_explorer_rows(guard.get());
+    explorer_serial_seen = serial;
+    explorer_status_text = xim_project_explorer_status();
+    repair_explorer_selection();
+}
+
+std::vector<std::string> explorer_items()
+{
+    ensure_explorer_rows();
+    explorer_filtered.clear();
+    auto needle = lower_text(input);
+    for (std::size_t i = 0; i < explorer_rows.size(); ++i)
+    {
+        const auto &row = explorer_rows[i];
+        if (row.kind == 's' || needle.empty()
+                || lower_text(row.display).find(needle) != std::string::npos
+                || lower_text(row.path).find(needle) != std::string::npos)
+            explorer_filtered.push_back(i);
+    }
+    std::vector<std::string> displays;
+    displays.reserve(explorer_filtered.size());
+    for (std::size_t index : explorer_filtered)
+        displays.push_back(explorer_rows[index].display);
+    if (explorer_filtered.empty())
+        return displays;
+    std::size_t found = explorer_filtered.size();
+    for (std::size_t i = 0; i < explorer_filtered.size(); ++i)
+        if (explorer_rows[explorer_filtered[i]].path == explorer_selected)
+        {
+            found = i;
+            break;
+        }
+    if (found == explorer_filtered.size())
+    {
+        if (selected >= explorer_filtered.size())
+            selected = explorer_filtered.size() - 1;
+        found = selected;
+        explorer_selected = explorer_rows[explorer_filtered[found]].path;
+    }
+    selected = found;
+    return displays;
+}
+
 // Project content results. Display rows feed the picker; the parallel meta
 // list resolves a row to a file, line and column on activation. Completed
 // rows are cached per publish so caret moves and mouse hits do not
@@ -353,6 +508,16 @@ void clear_find_highlight()
 // Right-aligned prompt status: match count and the active case rule.
 std::string prompt_info()
 {
+    if (prompt == Action::explorer)
+    {
+        std::string root = xim_project_root();
+        auto slash = root.find_last_of('/');
+        std::string info = root.empty() ? "No project"
+            : slash == std::string::npos ? root : root.substr(slash + 1);
+        if (xim_project_explorer_pending())
+            info += "  loading";
+        return info;
+    }
     if (prompt == Action::search_project)
         return std::string("[") + case_label() + "]";
     if (!prompt_is_find_like())
@@ -414,6 +579,8 @@ std::vector<const xim::Command *> filtered()
 
 std::vector<std::string> project_items(Action action, const std::string &text)
 {
+    if (action == Action::explorer)
+        return explorer_items();
     if (action == Action::search_project)
     {
         // Cached rows: refetch only when the publish serial, query or case
@@ -483,7 +650,6 @@ std::vector<std::string> project_items(Action action, const std::string &text)
     switch (action)
     {
         case Action::files: sources = xim_project_files(text.c_str()); break;
-        case Action::explorer: sources = xim_project_explorer(text.c_str()); break;
         case Action::buffers: sources = xim_engine_buffers(); break;
         default: break;
     }
@@ -576,6 +742,10 @@ void begin(Action action)
     replace_error = false;
     file_rows.clear();
     file_rows_query.clear();
+    explorer_rows.clear();
+    explorer_filtered.clear();
+    explorer_selected.clear();
+    explorer_serial_seen = 0;
     content_rows.clear();
     content_meta.clear();
     content_cache_query.clear();
@@ -818,27 +988,40 @@ bool open_picker_item(Action current, const std::vector<std::string> &list,
     }
     else if (current == Action::explorer)
     {
-        char *path = nullptr;
-        xim_project_explorer_activate(item.c_str(), &path);
-        if (path != nullptr)
-        {
-            std::unique_ptr<char, decltype(&xim_project_free)> guard(
-                    path, xim_project_free);
-            char *resolved = xim_project_resolve(path);
-            if (resolved != nullptr)
-            {
-                std::unique_ptr<char, decltype(&xim_project_free)> resolved_guard(
-                        resolved, xim_project_free);
-                xim_engine_command("hide edit", resolved, 0);
-            }
-            else
-                xim_engine_command("hide edit", path, 0);
-        }
-        else
+        if (index >= explorer_filtered.size())
         {
             prompt = current;
             return false;
         }
+        const ExplorerRow row = explorer_rows[explorer_filtered[index]];
+        explorer_selected = row.path;
+        if (row.kind == 'd')
+        {
+            xim_project_explorer_toggle(row.path.c_str());
+            prompt = current;
+            return false;
+        }
+        if (row.kind == 'm')
+        {
+            xim_project_explorer_more(row.path.c_str());
+            prompt = current;
+            return false;
+        }
+        if (row.kind != 'f')
+        {
+            prompt = current;
+            return false;
+        }
+        char *resolved = xim_project_resolve_wire(row.path.c_str());
+        if (resolved == nullptr)
+        {
+            explorer_status_text = "Cannot open the selected entry";
+            prompt = current;
+            return false;
+        }
+        std::unique_ptr<char, decltype(&xim_project_free)> resolved_guard(
+                resolved, xim_project_free);
+        xim_engine_command("hide edit", resolved, 0);
     }
     else
     {
@@ -896,8 +1079,20 @@ bool activate_current_row(Action current)
         row = first_activatable(row % content_meta.size());
         return open_picker_item(current, list, row);
     }
-    if (current == Action::files || current == Action::buffers
-            || current == Action::explorer)
+    if (current == Action::explorer)
+    {
+        std::vector<std::string> list = explorer_items();
+        if (list.empty())
+        {
+            prompt = current;
+            return false;
+        }
+        std::size_t row = last_picker_action == current
+            ? static_cast<std::size_t>(last_picker_first + last_picker_selected)
+            : selected;
+        return open_picker_item(current, list, row);
+    }
+    if (current == Action::files || current == Action::buffers)
     {
         // Enter uses the last rendered rows when available so a click and
         // Enter agree on the same visible list.
@@ -1237,6 +1432,10 @@ extern "C" void xim_dispatch(int key, int modifiers)
                             key == XIM_UP ? -1 : 1);
                 else
                     selected = (selected + count + (key == XIM_UP ? -1 : 1)) % count;
+                if (prompt == Action::explorer
+                        && selected < explorer_filtered.size())
+                    explorer_selected =
+                        explorer_rows[explorer_filtered[selected]].path;
             }
             return;
         }
@@ -1503,6 +1702,7 @@ void render_prompt_overlay(int menu_rows)
         {
             const char *status = prompt == Action::files ? xim_project_status()
                 : prompt == Action::search_project ? xim_project_content_status()
+                : prompt == Action::explorer ? explorer_status_text.c_str()
                 : nullptr;
             if (status != nullptr && *status != '\0')
                 items = std::string("  ") + status + "\n";

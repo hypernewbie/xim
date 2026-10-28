@@ -1,0 +1,66 @@
+name: Xim native platform probe
+
+# This is a bring-up diagnostic, not a release workflow. A platform must build
+# and pass native tests before it can produce a release artifact.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-24.04-x64
+            runner: ubuntu-24.04
+          - platform: macos-arm64
+            runner: macos-15
+          - platform: windows-x64
+            runner: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ubuntu toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-19 libc++-19-dev libc++abi-19-dev ninja-build libncurses-dev
+          echo 'CC=clang-19' >> "$GITHUB_ENV"
+          echo 'CXX=clang++-19' >> "$GITHUB_ENV"
+
+      - name: Install macOS toolchain
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm ninja
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo 'CC=clang' >> "$GITHUB_ENV"
+          echo 'CXX=clang++' >> "$GITHUB_ENV"
+
+      - name: Set Windows SDK environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set Windows Clang compilers
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          clang-cl --version
+          "CC=clang-cl" >> $env:GITHUB_ENV
+          "CXX=clang-cl" >> $env:GITHUB_ENV
+
+      - name: Configure
+        run: cmake -S . -B build/platform-probe -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build/platform-probe --parallel 4
+
+      - name: Test native editor
+        run: ctest --test-dir build/platform-probe -L xim_native --output-on-failure

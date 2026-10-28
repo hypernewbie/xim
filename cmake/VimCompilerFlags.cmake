@@ -23,6 +23,11 @@ set(XIM_COMPILE_FLAGS
     -D_FORTIFY_SOURCE=1
 )
 
+# The inherited source uses MACOS_X to select Darwin-specific behavior.
+if(APPLE)
+    list(APPEND XIM_COMPILE_FLAGS -DMACOS_X)
+endif()
+
 add_library(xim_compile_policy INTERFACE)
 target_compile_options(xim_compile_policy INTERFACE ${XIM_COMPILE_FLAGS})
 
@@ -31,9 +36,10 @@ target_compile_options(xim_compile_policy INTERFACE ${XIM_COMPILE_FLAGS})
 # `-Wl,--as-needed` matches the reference Makefile's `LINK_AS_NEEDED=yes`
 # branch, which calls the linker directly. Skipping link.sh is intentional:
 # its only job was iterative library pruning that `--as-needed` already does.
-set(XIM_LINK_FLAGS
-    -Wl,--as-needed
-)
+set(XIM_LINK_FLAGS)
+if(NOT APPLE)
+    list(APPEND XIM_LINK_FLAGS -Wl,--as-needed)
+endif()
 target_link_options(xim_compile_policy INTERFACE ${XIM_LINK_FLAGS})
 
 # Apply these to every target in this directory tree (and below) by

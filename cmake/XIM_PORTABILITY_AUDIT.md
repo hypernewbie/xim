@@ -55,11 +55,12 @@ worker ownership boundary.
 
 ## Evidence and limits
 
-GitHub Actions run `40780957694` passed the Ubuntu native and extracted
+GitHub Actions run `40785099782` passed the Ubuntu native and extracted
 archive tests, including a clean Ubuntu container. On macOS it passed the
-independent file-operation and file-identity tests. The full macOS build still
-failed on the inotify source. The Windows configuration still failed on the
-Unix terminal-library requirement. The Linux development run passed all 23
+independent file-operation and file-identity tests. A keep-going build found
+no other compile failure beyond the inotify source. Linking and runtime tests
+still need the watcher. Windows configuration failed on the Unix
+terminal-library requirement. The Linux development run passed all 23
 registered tests across the two temporary-path groups. A clean tracked-source
 export passed 14/14. The native ASan/UBSan and TSan suites each passed 8/8.
 The selected builds produced no new warnings.

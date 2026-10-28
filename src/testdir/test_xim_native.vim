@@ -489,6 +489,18 @@ func Test_xim_missing_on_disk()
   call s:StopXim(buf)
 endfunc
 
+func Test_xim_recreate_consent()
+  let buf = s:StartXim()
+  call delete('Xxim.txt')
+  call WaitForAssert({-> assert_match('missing on disk', s:Screen(buf))}, 5000)
+  call term_sendkeys(buf, "\<C-S>")
+  call WaitForAssert({-> assert_match('Recreate?', s:Screen(buf))}, 5000)
+  call s:Dump(buf, 'Test_xim_recreate_consent')
+  call term_sendkeys(buf, "\<Esc>")
+  call assert_false(filereadable('Xxim.txt'))
+  call s:StopXim(buf)
+endfunc
+
 func Test_xim_recent_files()
   call mkdir('Xximrecent', 'p')
   call writefile(['recent content'], 'Xximrecent/r.txt')

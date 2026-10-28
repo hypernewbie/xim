@@ -1935,6 +1935,13 @@ def external_changes(binary, root):
             assert wait_screen(session, b"disk final", timeout=5), \
                 session.screen.text()[-800:]
             assert session.snapshot() == "disk final\n"
+            # DELETE+CREATE in one watcher batch is an atomic replacement,
+            # not a missing file whose clean buffer must become modified.
+            renamed.unlink()
+            renamed.write_text("atomic final\n")
+            assert wait_screen(session, b"atomic final", timeout=5)
+            session.ex("call writefile([string(&modified)], 'atomic-state')")
+            assert (project / "atomic-state").read_text().strip() == "0"
         finally:
             session.close()
     print("Watcher reload, dirty protection and rename checks passed")
@@ -2132,6 +2139,71 @@ def file_operations(binary, root):
     print("Native create, rename, move and permanent-delete checks passed")
 
 
+def file_operations_retention(binary, root):
+    """Missing files need recreate consent, and new files retain dirty buffers."""
+    with tempfile.TemporaryDirectory(prefix="xim-fs-retain-", dir=root) as temporary:
+        project = Path(temporary)
+        path = project / "alpha.txt"
+        path.write_text("alpha\n")
+        (project / "beta.txt").write_text("beta\n")
+        session = Session(binary, project, (".",))
+        try:
+            session.send(b"\x10alpha.txt\r")
+            session.wait(b"alpha")
+            session.send(b"\x1bOPDelete permanently\r")
+            assert wait_screen(session, b"[d] Delete permanently")
+            session.send(b"d")
+            assert wait_screen(session, b"missing on disk")
+            assert not path.exists()
+            session.ex("call writefile([json_encode([&modified, getline(1)])], 'missing')")
+            assert json.loads((project / "missing").read_text()) == [1, "alpha"]
+            session.send(b"\x11")
+            assert wait_screen(session, b"Save changes?")
+            session.send(b"s")
+            assert wait_screen(session, b"Recreate?")
+            assert not path.exists()
+            # Cancellation has no hidden Quit continuation. Both labels use
+            # the painted positions, not screen thirds.
+            row, column = screen_rowcol(session.screen, "[Esc] Cancel")
+            session.send(f"\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m".encode())
+            session.drain(.2)
+            assert session.process.poll() is None and not path.exists()
+            session.send(b"\x13")
+            assert wait_screen(session, b"Recreate?")
+            row, column = screen_rowcol(session.screen, "[s] Recreate")
+            session.send(f"\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m".encode())
+            assert wait_drain(session, lambda: path.exists() and path.read_text() == "alpha\n")
+            assert session.process.poll() is None
+
+            session.send(b"local")
+            session.send(b"\x1bOPNew file\r")
+            assert wait_screen(session, b"New file:")
+            session.send(b"created.txt\r")
+            assert wait_drain(session, lambda: (project / "created.txt").exists())
+            assert wait_screen(session, b"Created created.txt")
+            assert b"Save changes?" not in session.screen.text()
+            session.send(b"\x10alpha.txt\r")
+            assert wait_screen(session, b"localalpha")
+            assert session.snapshot() == "localalpha\n"
+            # A missing hidden file is included in Save-all/Quit consent.
+            session.send(b"\x10beta.txt\r")
+            assert wait_screen(session, b"beta")
+            path.unlink()
+            session.drain(.4)
+            session.send(b"\x11")
+            assert wait_screen(session, b"Save changes?")
+            session.send(b"s")
+            assert wait_screen(session, b"Recreate?")
+            assert not path.exists()
+            session.send(b"s")
+            assert wait_drain(session, lambda: session.process.poll() is not None)
+            assert path.read_text() == "localalpha\n"
+            assert session.process.returncode == 0
+        finally:
+            session.close()
+    print("Deleted-buffer retention, recreate consent and dirty New-file checks passed")
+
+
 def project_switch_recents(binary, root):
     """Plan 6: recents persist, projects switch and buffers survive."""
     with tempfile.TemporaryDirectory(prefix="xim-switch-", dir=root) as temporary:
@@ -2288,6 +2360,7 @@ if __name__ == "__main__":
     find_replace(args.binary.resolve(), args.work.resolve())
     project_content_search(args.binary.resolve(), args.work.resolve())
     file_operations(args.binary.resolve(), args.work.resolve())
+    file_operations_retention(args.binary.resolve(), args.work.resolve())
     project_switch_recents(args.binary.resolve(), args.work.resolve())
     external_changes(args.binary.resolve(), args.work.resolve())
     external_reload_formats(args.binary.resolve(), args.work.resolve())

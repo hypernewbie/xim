@@ -120,7 +120,10 @@ worker. The owning-thread adapter checks buffer number, name, edit tick, disk
 identity and current-buffer focus again before applying them; typing during
 the read becomes a conflict. Dirty, hidden, oversize, binary or non-UTF-8
 buffers receive a changed notice instead. A dirty reload requires explicit
-consent, and deletion keeps the buffer text with a missing notice. An external
+consent, and deletion marks the retained buffer text modified with a missing
+notice. Save and confirmation saves require Recreate consent bound to the
+missing buffer numbers and paths, including hidden files during Quit. A changed
+target or a cancelled choice cannot silently run the old continuation. An external
 rename is accepted only when the old name is gone and the destination version
 equals the last accepted buffer version.
 

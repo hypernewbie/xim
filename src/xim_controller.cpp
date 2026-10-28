@@ -277,6 +277,7 @@ struct TrackedBuffer
     unsigned long long read_tick = 0;
     bool read_pending = false;
     bool modified = false;
+    bool missing = false;
 };
 struct BufferNotice
 {
@@ -292,6 +293,19 @@ extern bool menu_open;
 constexpr std::size_t kAutoReloadLimit = 256 * 1024;
 constexpr std::string_view kReloadPrompt =
     "Reload from disk? [r] Reload  [Esc] Cancel";
+constexpr std::string_view kRecreatePrompt =
+    "Missing on disk. Recreate? [s] Recreate  [Esc] Cancel";
+struct MissingSave
+{
+    int fnum;
+    std::string name;
+    bool operator==(const MissingSave &) const = default;
+};
+std::vector<MissingSave> recreate_targets;
+bool recreate_all = false;
+bool recreate_from_confirm = false;
+int recreate_current = 0;
+std::string recreate_error;
 
 void begin(Action action);
 void execute(Action action);
@@ -352,6 +366,15 @@ void update_status_note();
 
 void add_notice(int fnum, const std::string &name, int kind)
 {
+    if (kind == 1)
+    {
+        for (auto &buffer : tracked_buffers)
+            if (buffer.fnum == fnum && !buffer.missing)
+            {
+                buffer.missing = true;
+                xim_engine_mark_missing(fnum);
+            }
+    }
     for (auto &notice : buffer_notices)
         if (notice.fnum == fnum)
         {
@@ -462,6 +485,7 @@ void sync_tracked_buffers()
                 buffer.read_id = old.read_id;
                 buffer.read_tick = old.read_tick;
                 buffer.read_pending = old.read_pending;
+                buffer.missing = old.missing;
             }
             else
             {
@@ -515,6 +539,10 @@ void mark_current_saved()
         if (buffer.fnum == fnum)
         {
             buffer.version = xim_project_file_version(buffer.name.c_str());
+            buffer.missing = false;
+            if (buffer.read_pending)
+                xim_project_read_discard(buffer.read_id);
+            buffer.read_pending = false;
             drop_notice(fnum);
         }
     sync_tracked_buffers();
@@ -523,7 +551,13 @@ void mark_current_saved()
 void mark_all_saved()
 {
     for (auto &buffer : tracked_buffers)
+    {
         buffer.version = xim_project_file_version(buffer.name.c_str());
+        buffer.missing = false;
+        if (buffer.read_pending)
+            xim_project_read_discard(buffer.read_id);
+        buffer.read_pending = false;
+    }
     buffer_notices.clear();
     sync_tracked_buffers();
 }
@@ -672,9 +706,11 @@ void handle_change(int kind, unsigned long long version, bool directory,
     {
         if (buffer.name != path || directory)
             continue;
-        if ((kind & 4) != 0)
+        // Atomic saves can coalesce DELETE and CREATE for the same name.
+        // A present final version is a change, not a lost in-memory copy.
+        if ((kind & 4) != 0 && version == 0)
             add_notice(buffer.fnum, buffer.name, 1);
-        else if ((kind & (1 | 2 | 16 | 8)) != 0)
+        else if ((kind & (1 | 2 | 4 | 16 | 8)) != 0)
         {
             if (version == 0 || version != buffer.version)
                 consider_reload(buffer, version);
@@ -1063,20 +1099,23 @@ int affected_dirty_buffers(const std::string &root,
     return count;
 }
 
-void apply_rename_result()
+bool apply_rename_result()
 {
+    if (!xim_fsops_renamed(fs_id))
+        return true;
     char *old_wire = xim_fsops_old_path(fs_id);
     char *new_wire = xim_fsops_new_path(fs_id);
     if (old_wire == nullptr || new_wire == nullptr)
     {
         xim_project_free(old_wire);
         xim_project_free(new_wire);
-        return;
+        return false;
     }
     std::string old_abs = wire_text_decode(old_wire);
     std::string new_abs = wire_text_decode(new_wire);
     xim_project_free(old_wire);
     xim_project_free(new_wire);
+    bool complete = true;
     for (auto &buffer : tracked_buffers)
     {
         std::string updated;
@@ -1091,10 +1130,22 @@ void apply_rename_result()
         if (xim_engine_rename_buffer(buffer.fnum, updated.c_str()))
         {
             xim_project_unwatch_file(buffer.name.c_str());
+            if (buffer.read_pending)
+                xim_project_read_discard(buffer.read_id);
+            buffer.read_pending = false;
             buffer.name = updated;
+            buffer.missing = false;
+            buffer.version = xim_project_file_version(updated.c_str());
             xim_project_watch_file(updated.c_str());
+            drop_notice(buffer.fnum);
+        }
+        else
+        {
+            add_notice(buffer.fnum, buffer.name, 1);
+            complete = false;
         }
     }
+    return complete;
 }
 
 bool file_operation_active()
@@ -1193,8 +1244,8 @@ bool fs_tick()
     std::string opened = fs_root;
     if (created && !fs_destination.empty())
         opened += "/" + fs_destination;
-    if (success)
-        apply_rename_result();
+    if (success && !apply_rename_result())
+        text += "; buffer rename failed. Text kept at its old name; use Save as.";
     bool open_after = fs_open_after;
     xim_fsops_ack(fs_id);
     clear_file_operation();
@@ -1202,7 +1253,7 @@ bool fs_tick()
     xim_project_refresh();
     set_notice_text(text);
     if (success && created && open_after)
-        protect(Action::open, opened);
+        xim_engine_command("hide edit", opened.c_str(), 0);
     return true;
 }
 
@@ -1493,6 +1544,52 @@ int last_picker_selected = 0;
 
 bool file_operation_active();
 
+std::vector<MissingSave> missing_save_targets(bool all)
+{
+    std::vector<MissingSave> targets;
+    int current = xim_engine_current_buffer();
+    for (const auto &buffer : tracked_buffers)
+    {
+        unsigned long long tick;
+        int modified;
+        if ((!all && buffer.fnum != current) || !buffer.missing
+                || !buffer_info(buffer.fnum, tick, modified) || !modified)
+            continue;
+        if (xim_project_file_version(buffer.name.c_str()) == 0)
+            targets.push_back({buffer.fnum, buffer.name});
+    }
+    return targets;
+}
+
+bool request_recreate(bool all, bool from_confirm)
+{
+    auto targets = missing_save_targets(all);
+    if (targets.empty())
+        return false;
+    recreate_targets = std::move(targets);
+    recreate_all = all;
+    recreate_from_confirm = from_confirm;
+    recreate_current = xim_engine_current_buffer();
+    recreate_error.clear();
+    prompt = Action::recreate_confirm;
+    return true;
+}
+
+bool save_current(bool recreate = false)
+{
+    if (!xim_engine_named())
+        begin(Action::save_as);
+    else if (recreate || !request_recreate(false, false))
+    {
+        if (xim_engine_command("update", "", 1) && !xim_engine_unsaved(0))
+        {
+            mark_current_saved();
+            return true;
+        }
+    }
+    return false;
+}
+
 void perform_pending(bool discard)
 {
     const char *command = pending == Action::quit ? (discard ? "qall!" : "qall")
@@ -1528,6 +1625,57 @@ void protect(Action action, std::string_view path = {})
     pending_error.clear();
     if (xim_engine_unsaved(action == Action::quit)) prompt = Action::confirm;
     else perform_pending(false);
+}
+
+void save_confirmation(bool recreate = false)
+{
+    if (pending_save_as_retry)
+    {
+        pending_error.clear();
+        begin(Action::save_as);
+    }
+    else if (!xim_engine_named())
+    {
+        save_then_continue = true;
+        begin(Action::save_as);
+    }
+    else if (recreate || !request_recreate(pending == Action::quit, true))
+    {
+        if (!xim_engine_command(pending == Action::quit ? "wall" : "update", "", 1))
+        {
+            auto error = xim_engine_error();
+            pending_error = error ? error : "Write failed";
+            prompt = Action::confirm;
+        }
+        else
+        {
+            if (pending == Action::quit) mark_all_saved();
+            else mark_current_saved();
+            if (!xim_engine_unsaved(pending == Action::quit))
+                perform_pending(false);
+        }
+    }
+}
+
+void confirm_recreate()
+{
+    if ((!recreate_all && xim_engine_current_buffer() != recreate_current)
+            || missing_save_targets(recreate_all) != recreate_targets)
+    {
+        recreate_error = "Files changed since consent was requested. Cancel and review them.";
+        return;
+    }
+    prompt = Action::ignore;
+    if (recreate_from_confirm)
+        save_confirmation(true);
+    else if (!save_current(true))
+    {
+        auto error = xim_engine_error();
+        recreate_error = error && *error ? error : "Recreate failed";
+        prompt = Action::recreate_confirm;
+        return;
+    }
+    recreate_targets.clear();
 }
 
 void append_utf8(std::string &text, int c)
@@ -2060,15 +2208,7 @@ void execute(Action action)
             set_notice_text("Recent history cleared");
             break;
         case Action::fs_delete_confirm: break;
-        case Action::save:
-            if (xim_engine_named())
-            {
-                xim_engine_command("update", "", 1);
-                if (!xim_engine_unsaved(0))
-                    mark_current_saved();
-            }
-            else begin(Action::save_as);
-            break;
+        case Action::save: save_current(); break;
         case Action::save_as: case Action::open: case Action::find:
         case Action::replace: case Action::search_project:
         case Action::palette: case Action::ex: case Action::files:
@@ -2554,6 +2694,14 @@ extern "C" void xim_dispatch(int key, int modifiers)
             pending_path.clear();
             pending_error.clear();
             pending_save_as_retry = false;
+            recreate_targets.clear();
+            recreate_error.clear();
+            return;
+        }
+        if (prompt == Action::recreate_confirm)
+        {
+            if (key == 's' || key == 'S')
+                confirm_recreate();
             return;
         }
         if (prompt == Action::fs_delete_confirm)
@@ -2571,33 +2719,7 @@ extern "C" void xim_dispatch(int key, int modifiers)
         if (prompt == Action::confirm)
         {
             if (key == 'd' || key == 'D') perform_pending(true);
-            else if (key == 's' || key == 'S')
-            {
-                if (pending_save_as_retry)
-                {
-                    pending_error.clear();
-                    begin(Action::save_as);
-                }
-                else if (!xim_engine_named())
-                {
-                    save_then_continue = true;
-                    begin(Action::save_as);
-                }
-                else
-                {
-                    if (!xim_engine_command(pending == Action::quit ? "wall" : "update", "", 1))
-                    {
-                        auto error = xim_engine_error();
-                        pending_error = error ? error : "Write failed";
-                    }
-                    else
-                    {
-                        mark_all_saved();
-                        if (!xim_engine_unsaved(pending == Action::quit))
-                            perform_pending(false);
-                    }
-                }
-            }
+            else if (key == 's' || key == 'S') save_confirmation();
             return;
         }
         if (prompt == Action::replace)
@@ -3054,6 +3176,18 @@ void render_prompt_overlay(int menu_rows)
         xim_engine_overlay(rendered_prompt_text.c_str(), "", "", false);
         return;
     }
+    if (prompt == Action::recreate_confirm)
+    {
+        rendered_prompt_text = kRecreatePrompt;
+        rendered_prompt_cursor = static_cast<int>(kRecreatePrompt.size());
+        std::string items = recreate_error;
+        if (items.empty())
+            for (const auto &target : recreate_targets)
+                items += tail_name(target.name) + "\n";
+        xim_engine_overlay(rendered_prompt_text.c_str(), items.c_str(), "",
+                !recreate_error.empty());
+        return;
+    }
     if (prompt == Action::reload_confirm)
     {
         rendered_prompt_text = kReloadPrompt;
@@ -3401,6 +3535,18 @@ extern "C" void xim_mouse_press(int row, int col, int button, int modifiers, int
         // clipboard boundary as Ctrl-V (configured '+' or internal text).
         xim_engine_click(row, col, 0, 1);
         execute(Action::paste);
+        return;
+    }
+    if (prompt == Action::recreate_confirm && button == 0 && row == rows - 1)
+    {
+        auto first = kRecreatePrompt.find("[s] Recreate");
+        auto cancel = kRecreatePrompt.find("[Esc] Cancel");
+        if (col >= static_cast<int>(first)
+                && col < static_cast<int>(first + std::string_view("[s] Recreate").size()))
+            xim_dispatch('s', 0);
+        else if (col >= static_cast<int>(cancel)
+                && col < static_cast<int>(cancel + std::string_view("[Esc] Cancel").size()))
+            xim_dispatch(27, 0);
         return;
     }
     if (prompt == Action::confirm && button == 0)

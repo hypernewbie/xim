@@ -14,7 +14,7 @@ enum class Action
     toggle_case, replace_one, changed_files, reload_disk, keep_edits,
     check_external, reload_confirm, new_file, new_folder, rename_file,
     move_file, delete_file, fs_delete_confirm, open_folder, close_project,
-    recent_files, recent_folders, clear_recent
+    recent_files, recent_folders, clear_recent, recreate_confirm
 };
 Action resolve(int key, int modifiers);
 struct Command { std::string_view name; Action action; };

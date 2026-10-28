@@ -98,7 +98,7 @@ xim_engine_buffer_info(int index, int *fnum, unsigned long long *tick,
 xim_engine_buffer_name(int fnum)
 {
     buf_T *buf = buflist_findnr(fnum);
-    if (buf == NULL || buf->b_ffname == NULL)
+    if (buf == NULL || buf->b_ffname == NULL || !bt_normal(buf))
 	return NULL;
     return (char *)vim_strsave(buf->b_ffname);
 }
@@ -322,9 +322,32 @@ xim_engine_rename_buffer(int fnum, const char *name)
     buf_T *buf = buflist_findnr(fnum);
     if (buf == NULL || name == NULL || *name == NUL)
 	return 0;
-    buf_set_name(fnum, (char_u *)name);
-    buf_name_changed(buf);
-    return 1;
+    // Never wipe another (even unloaded) buffer as a side effect of a
+    // namespace operation. The controller can retain the text for recovery.
+    buf_T *other = buflist_findname_exp((char_u *)name);
+    if (other != NULL && other != buf)
+	return 0;
+    return setfname(buf, (char_u *)name, NULL, FALSE) == OK;
+}
+
+    void
+xim_engine_mark_missing(int fnum)
+{
+    buf_T *buf = buflist_findnr(fnum);
+    if (buf == NULL || !bt_normal(buf) || buf->b_ml.ml_mfp == NULL)
+	return;
+    // The only remaining copy now lives in memory. Protect it on Close/Quit
+    // even if it was clean before deletion, and after any undo/redo.
+    if (!buf->b_changed)
+    {
+	buf->b_changed = TRUE;
+	++CHANGEDTICK(buf);
+	ml_setflags(buf);
+	check_status(buf);
+	redraw_tabline = TRUE;
+	need_maketitle = TRUE;
+    }
+    u_unchanged(buf);
 }
 
     void

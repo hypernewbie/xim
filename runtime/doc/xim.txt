@@ -185,8 +185,9 @@ consent, because that discards local edits.  File > Keep edits accepts the
 current text as the new base without writing it, so a later save still uses
 the engine's overwrite checks.  File > Check external changes re-observes
 tracked files without waiting for the watcher.  An external deletion keeps the
-buffer text and marks it missing; a later save can recreate the file
-explicitly.  An unambiguous external rename updates the buffer path; an
+buffer text, marks it modified and shows it as missing.  Save asks "Recreate?".
+Choose [s] Recreate to write the missing file, or Escape to cancel.  Save during
+Close or Quit also requires this choice for missing hidden buffers.  An unambiguous external rename updates the buffer path; an
 ambiguous move only marks the old path missing.  Autocommands from a reload
 run on the owning thread.
 
@@ -196,8 +197,9 @@ File > New file, New folder, Rename, Move and Delete permanently use the
 explorer selection, or the active document when it belongs to the project.  A
 right-click on an explorer row opens the same actions for that row.  Names and
 Move destinations are relative to the project root.  New file creates an
-empty disk file and opens it; New file and New folder accept a relative path
-only when its parents exist.  Rename does not accept path separators.  Move
+empty disk file and opens it without closing the current buffer or prompting
+about its unsaved edits.  New file and New folder accept a relative path only
+when its parents exist.  Rename does not accept path separators.  Move
 requires an existing destination parent and refuses a folder's own descendant.
 Existing destinations are errors: no action overwrites, merges or silently
 truncates a file, directory or distinct open buffer.  A move across
@@ -209,7 +211,8 @@ number of affected dirty buffers, and Delete must be chosen explicitly.
 Symlinks are unlinked, never followed.  A recursive delete can fail after
 partial progress; the result reports what remains instead of claiming
 rollback.  Deleted buffers are not closed or discarded: their text stays
-available, marked missing on disk.  Filesystem changes are not covered by
+available, marked modified and missing on disk, so Close and Quit protect even
+a previously clean in-memory copy.  Filesystem changes are not covered by
 buffer undo; Ctrl-Z cannot recover a deleted disk entry.  Trash, filesystem
 undo and recursive copy are not provided.
 

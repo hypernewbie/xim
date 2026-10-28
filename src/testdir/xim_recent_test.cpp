@@ -261,13 +261,18 @@ int main(int argc, char **argv)
         std::condition_variable released;
         bool shutdown_done = false;
         bool timed_out = false;
-        std::jthread unlocker([&] {
+        std::thread unlocker([&] {
             std::unique_lock guard(gate);
             timed_out = !released.wait_for(guard, std::chrono::seconds(2),
                     [&] { return shutdown_done; });
             flock(held, LOCK_UN);
             close(held);
         });
+        struct JoinThread
+        {
+            std::thread &thread;
+            ~JoinThread() { if (thread.joinable()) thread.join(); }
+        } joiner{unlocker};
         xim_recent_init();
         wait_ready();
         auto before = xim_recent_serial();

@@ -228,9 +228,12 @@ Preflight and mutation run on a serialized worker.  Only one namespace change
 runs at a time; a conflicting request reports Busy.  Rename and Move preserve
 dirty text, modified flags, undo history and window identity, and they update
 every affected buffer path, including descendants of a moved directory.
-Failures keep the prompt input and report the actual cause.  Project switching
-and Quit wait for an unresolved mutation instead of abandoning a committed
-disk change.
+Failures keep the prompt input and show an inline error.  Edit the name and
+press Enter to retry, or Escape to cancel.  F10 opens menus over consent
+prompts too.  Starting another prompt cancels an uncommitted Delete question
+and any old Save-as continuation, rather than leaving an invisible operation.
+Project switching and Quit wait for an unresolved mutation instead of
+abandoning a committed disk change.
 
 Recent files and projects
 								*xim-recent*

@@ -2213,6 +2213,63 @@ def file_operations(binary, root):
     print("Native create, rename, move and permanent-delete checks passed")
 
 
+def file_operation_forms(binary, root):
+    """Failed forms remain editable and superseded questions cannot trap Quit."""
+    with tempfile.TemporaryDirectory(prefix="xim-fs-forms-", dir=root) as temporary:
+        project = Path(temporary)
+        (project / "exists").mkdir()
+        (project / "alpha.txt").write_text("alpha\n")
+        session = Session(binary, project, (".",))
+        try:
+            session.send(b"\x1bOPNew folder\rexists\r")
+            assert wait_screen(session, b"Destination already exists")
+            assert b"New folder: exists" in session.screen.text()
+            session.send(b"\x01created\r")
+            assert wait_drain(session, lambda: (project / "created").is_dir())
+            session.send(b"\x10alpha.txt\r")
+            assert wait_screen(session, b"alpha")
+            session.send(b"\x1bOPRename\r\x01bad/name\r")
+            assert wait_screen(session, b"does not accept path separators")
+            assert b"Rename: bad/name" in session.screen.text()
+            session.send(b"\x01renamed.txt\r")
+            assert wait_drain(session, lambda: (project / "renamed.txt").exists())
+            assert not (project / "alpha.txt").exists()
+            session.send(b"\x1bOPDelete permanently\r")
+            assert wait_screen(session, b"[d] Delete permanently")
+            session.send(b"\x1b[21~")
+            assert wait_screen(session, b"New  Ctrl-N"), "F10 was ignored over consent"
+            session.send(b"\x1b[C\x1b[C\x1b[B\r")  # View > Explorer.
+            assert wait_screen(session, b"Explorer:")
+            session.send(b"\x1b\x11")
+            assert wait_drain(session, lambda: session.process.poll() is not None), \
+                "superseded Delete left an invisible Busy reservation"
+            assert (project / "renamed.txt").read_text() == "alpha\n"
+        finally:
+            session.close()
+
+        session = Session(binary, project)
+        try:
+            session.send(b"draft\x11")
+            assert wait_screen(session, b"Save changes?")
+            session.send(b"s")
+            assert wait_screen(session, b"Save as:")
+            # View > Command palette starts a different command. A later
+            # independent Save-as must not execute the previous Quit.
+            session.send(b"\x1b[21~")
+            assert wait_screen(session, b"New  Ctrl-N")
+            session.send(b"\x1b[C\x1b[C\r")
+            assert wait_screen(session, b"Command:")
+            session.send(b"Save as\rrescued.txt\r")
+            assert wait_drain(session, lambda: (project / "rescued.txt").exists())
+            session.drain(.2)
+            assert session.process.poll() is None, "Save-as ran a stale Quit continuation"
+            session.send(b"X\x13")
+            assert wait_drain(session, lambda: (project / "rescued.txt").read_text() == "draftX\n")
+        finally:
+            session.close()
+    print("File-form retries, F10 consent and superseded continuation checks passed")
+
+
 def file_operations_retention(binary, root):
     """Missing files need recreate consent, and new files retain dirty buffers."""
     with tempfile.TemporaryDirectory(prefix="xim-fs-retain-", dir=root) as temporary:
@@ -2458,6 +2515,7 @@ if __name__ == "__main__":
     find_replace(args.binary.resolve(), args.work.resolve())
     project_content_search(args.binary.resolve(), args.work.resolve())
     file_operations(args.binary.resolve(), args.work.resolve())
+    file_operation_forms(args.binary.resolve(), args.work.resolve())
     file_operations_retention(args.binary.resolve(), args.work.resolve())
     project_switch_recents(args.binary.resolve(), args.work.resolve())
     recent_path_display(args.binary.resolve(), args.work.resolve())

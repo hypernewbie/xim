@@ -184,7 +184,7 @@ struct Counts
 };
 
 bool scan_tree(int dirfd, dev_t root_dev, Counts &counts, std::string &error,
-        int depth)
+        int depth, unsigned long long id)
 {
     if (depth > 128)
     {
@@ -207,9 +207,27 @@ bool scan_tree(int dirfd, dev_t root_dev, Counts &counts, std::string &error,
     bool ok = true;
     for (;;)
     {
+        if ((counts.entries & 63) == 0)
+        {
+            std::lock_guard guard(lock);
+            if (stopping || !results.contains(id))
+            {
+                error = "Preflight cancelled";
+                ok = false;
+                break;
+            }
+        }
+        errno = 0;
         struct dirent *entry = readdir(stream);
         if (entry == nullptr)
+        {
+            if (errno != 0)
+            {
+                error = std::string("read directory: ") + strerror(errno);
+                ok = false;
+            }
             break;
+        }
         std::string_view name(entry->d_name);
         if (name.empty() || name == "." || name == "..")
             continue;
@@ -237,14 +255,15 @@ bool scan_tree(int dirfd, dev_t root_dev, Counts &counts, std::string &error,
                 break;
             }
             struct stat child_info;
-            if (fstat(child, &child_info) == 0 && child_info.st_dev != root_dev)
+            if (fstat(child, &child_info) != 0 || child_info.st_dev != root_dev
+                    || child_info.st_ino != info.st_ino)
             {
-                error = "mount boundary at " + std::string(name);
+                error = "directory changed or mount boundary at " + std::string(name);
                 close(child);
                 ok = false;
                 break;
             }
-            ok = scan_tree(child, root_dev, counts, error, depth + 1);
+            ok = scan_tree(child, root_dev, counts, error, depth + 1, id);
             close(child);
             if (!ok)
                 break;
@@ -320,9 +339,10 @@ bool remove_tree(int dirfd, dev_t root_dev, Removed &removed,
                 break;
             }
             struct stat child_info;
-            if (fstat(child, &child_info) == 0 && child_info.st_dev != root_dev)
+            if (fstat(child, &child_info) != 0 || child_info.st_dev != root_dev
+                    || child_info.st_ino != info.st_ino)
             {
-                failure = "mount boundary at " + leaf;
+                failure = "directory changed or mount boundary at " + leaf;
                 close(child);
                 ok = false;
                 break;
@@ -363,7 +383,7 @@ bool remove_tree(int dirfd, dev_t root_dev, Removed &removed,
     return ok;
 }
 
-bool build_preflight(Plan &plan, Result &result)
+bool build_preflight(Plan &plan, Result &result, unsigned long long id)
 {
     if (plan.kind == XIM_FS_VALIDATE_ROOT)
     {
@@ -402,7 +422,12 @@ bool build_preflight(Plan &plan, Result &result)
         return false;
     }
     struct stat root_info;
-    fstat(root_fd, &root_info);
+    if (fstat(root_fd, &root_info) != 0)
+    {
+        close(root_fd);
+        result.message = "Project root identity is unavailable";
+        return false;
+    }
     close(root_fd);
     plan.root_dev = root_info.st_dev;
     plan.root_ino = root_info.st_ino;
@@ -489,15 +514,16 @@ bool build_preflight(Plan &plan, Result &result)
                 return false;
             }
             struct stat child_info;
-            if (fstat(child, &child_info) == 0
-                    && child_info.st_dev != plan.root_dev)
+            if (fstat(child, &child_info) != 0
+                    || child_info.st_dev != plan.root_dev
+                    || child_info.st_ino != source_info.st_ino)
             {
                 close(child);
                 close(source_fd);
-                result.message = "Mount boundary is not supported";
+                result.message = "Source changed or mount boundary is not supported";
                 return false;
             }
-            bool ok = scan_tree(child, plan.root_dev, counts, error_text, 0);
+            bool ok = scan_tree(child, plan.root_dev, counts, error_text, 0, id);
             close(child);
             if (!ok)
             {
@@ -560,7 +586,13 @@ bool build_preflight(Plan &plan, Result &result)
         return false;
     }
     struct stat destination_parent_info;
-    fstat(destination_fd, &destination_parent_info);
+    if (fstat(destination_fd, &destination_parent_info) != 0)
+    {
+        close(source_fd);
+        close(destination_fd);
+        result.message = "Destination directory identity is unavailable";
+        return false;
+    }
     if (destination_parent_info.st_dev != source_info.st_dev)
     {
         close(source_fd);
@@ -673,6 +705,15 @@ bool perform_commit(Plan &plan, Result &result)
                 result.message = std::string("Open folder: ") + strerror(errno);
                 return false;
             }
+            struct stat opened;
+            if (fstat(child, &opened) != 0 || opened.st_dev != plan.root_dev
+                    || opened.st_ino != plan.source_ino)
+            {
+                close(child);
+                close(source_fd);
+                result.message = "Source directory changed before deletion";
+                return false;
+            }
             ok = remove_tree(child, plan.root_dev, removed, error, 0);
             close(child);
             if (ok && unlinkat(source_fd, source_leaf.c_str(),
@@ -759,7 +800,7 @@ void run_job(const Job &job)
         plan.root = job.root;
         plan.source = job.source;
         plan.destination = job.destination;
-        bool ok = build_preflight(plan, result);
+        bool ok = build_preflight(plan, result, job.id);
         result.success = ok;
         if (!ok && result.message.empty())
             result.message = "Preflight failed";

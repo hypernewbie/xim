@@ -139,7 +139,12 @@ sequence; the result remains owned until the controller acknowledges the
 engine buffer update and reconciliation. Recursive delete reports partial
 progress instead of claiming rollback, and it never closes or discards buffer
 text. There is no trash, filesystem undo or cross-filesystem copy-and-delete
-move.
+move. Failed mutation forms keep their source/base and input with an inline
+error. A new prompt cancels any superseded uncommitted Delete reservation or
+save continuation; internal Save-as continuations opt in explicitly. Committed
+results remain owned until acknowledgment. Preflight summaries check cancellation
+between bounded groups of entries, and opened directory identities are checked
+before traversal/deletion.
 
 Recent files and folders persist as JSON under `$XDG_STATE_HOME/xim` or
 `$HOME/.local/state/xim`. A dedicated worker applies queued deltas to the

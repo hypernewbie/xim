@@ -307,7 +307,7 @@ bool recreate_from_confirm = false;
 int recreate_current = 0;
 std::string recreate_error;
 
-void begin(Action action);
+void begin(Action action, bool continuation = false);
 void execute(Action action);
 void perform_reload_current();
 void protect(Action action, std::string_view path);
@@ -877,7 +877,11 @@ std::string fs_destination;
 std::string fs_base;
 std::string fs_summary;
 std::string fs_delete_text;
+std::string fs_prompt_error;
 bool fs_open_after = false;
+
+void fail_file_operation(const std::string &message);
+bool project_switch_active();
 
 bool project_relative(const std::string &absolute, std::string &relative)
 {
@@ -962,6 +966,11 @@ void start_file_prompt(Action action)
         set_notice_text("Busy: file operation in progress");
         return;
     }
+    if (*xim_project_root() == '\0')
+    {
+        set_notice_text("No project: use Open folder");
+        return;
+    }
     std::string relative;
     bool is_directory = false;
     bool captured = capture_file_target(relative, is_directory);
@@ -1021,21 +1030,25 @@ void submit_file_operation(int kind, const std::string &source,
         const std::string &destination, bool open_after)
 {
     std::string root = xim_project_root();
+    fs_kind = kind;
+    fs_root = root;
+    fs_source = source;
+    fs_destination = destination;
     if (root.empty())
     {
-        set_notice_text("No project: use Open folder");
+        fail_file_operation("No project: use Open folder");
         return;
     }
     if (destination_claimed(root, source, destination))
     {
-        set_notice_text("Destination is already open in a buffer");
+        fail_file_operation("Destination is already open in a buffer");
         return;
     }
     unsigned long long id = xim_fsops_preflight(kind, root.c_str(),
             source.c_str(), destination.c_str());
     if (id == 0)
     {
-        set_notice_text("Busy: another file operation is active");
+        fail_file_operation("Busy: another file operation is active");
         return;
     }
     fs_phase = FsPhase::preflight;
@@ -1069,7 +1082,7 @@ bool finish_file_prompt()
             return true;
         if (input.find('/') != std::string::npos)
         {
-            set_notice_text("Rename does not accept path separators");
+            fs_prompt_error = "Rename does not accept path separators";
             return true;
         }
         std::string parent = relative_parent(fs_source);
@@ -1195,6 +1208,57 @@ void clear_file_operation()
     fs_open_after = false;
 }
 
+void abandon_prompt_continuation()
+{
+    if (fs_kind == XIM_FS_DELETE && fs_phase != FsPhase::none
+            && fs_phase != FsPhase::commit)
+    {
+        xim_fsops_cancel(fs_id);
+        clear_file_operation();
+    }
+    if (prompt == Action::confirm || prompt == Action::recreate_confirm
+            || prompt == Action::reload_confirm
+            || (prompt == Action::save_as && save_then_continue))
+        prompt = Action::ignore;
+    pending = Action::ignore;
+    pending_path.clear();
+    pending_error.clear();
+    save_then_continue = false;
+    pending_save_as_retry = false;
+    recreate_targets.clear();
+    recreate_error.clear();
+}
+
+void fail_file_operation(const std::string &message)
+{
+    Action action = fs_kind == XIM_FS_CREATE_FILE ? Action::new_file
+        : fs_kind == XIM_FS_CREATE_DIR ? Action::new_folder
+        : fs_kind == XIM_FS_RENAME ? Action::rename_file
+        : fs_kind == XIM_FS_MOVE ? Action::move_file : Action::ignore;
+    auto source = fs_source;
+    auto base = fs_base;
+    auto destination = fs_destination;
+    auto root = fs_root;
+    clear_file_operation();
+    set_notice_text(message);
+    // Do not replace a prompt the user opened after submitting this job.
+    if (action == Action::ignore || prompt != Action::ignore
+            || root != xim_project_root())
+        return;
+    fs_source = std::move(source);
+    fs_base = std::move(base);
+    prompt = action;
+    input = action == Action::rename_file ? relative_leaf(destination)
+        : !fs_base.empty() && destination.starts_with(fs_base)
+            ? destination.substr(fs_base.size()) : destination;
+    input_cursor = input.size();
+    active_field = 0;
+    prompt_has_selection = false;
+    prompt_sel_start = prompt_sel_end = 0;
+    fs_prompt_error = display_path(message);
+    notice_show_pending = false;  // the inline form already shows the error
+}
+
 bool fs_tick()
 {
     if (fs_phase == FsPhase::none || fs_phase == FsPhase::confirm_delete)
@@ -1204,8 +1268,7 @@ bool fs_tick()
         return false;
     if (state < 0)
     {
-        clear_file_operation();
-        set_notice_text("File operation failed");
+        fail_file_operation("File operation failed");
         return true;
     }
     if (fs_phase == FsPhase::preflight)
@@ -1219,8 +1282,7 @@ bool fs_tick()
         {
             std::string message = error ? error.get() : "Preflight failed";
             xim_fsops_ack(fs_id);
-            clear_file_operation();
-            set_notice_text(message);
+            fail_file_operation(message);
             return true;
         }
         fs_summary = display_path(summary ? summary.get() : fs_source);
@@ -1240,8 +1302,7 @@ bool fs_tick()
         if (xim_fsops_commit(fs_id) == 0)
         {
             xim_fsops_ack(fs_id);
-            clear_file_operation();
-            set_notice_text("Busy: another file operation is active");
+            fail_file_operation("Busy: another file operation is active");
         }
         return true;
     }
@@ -1251,7 +1312,14 @@ bool fs_tick()
         xim_fsops_message(fs_id), xim_project_free);
     std::string text = message ? message.get() : "File operation finished";
     bool created = xim_fsops_created_file(fs_id) != 0;
-    if (success && fs_kind == XIM_FS_DELETE)
+    if (!success)
+    {
+        xim_fsops_ack(fs_id);
+        fail_file_operation(text);
+        xim_project_refresh();
+        return true;
+    }
+    if (fs_kind == XIM_FS_DELETE)
     {
         std::string prefix = fs_root;
         if (!fs_source.empty() && fs_source != ".")
@@ -1424,6 +1492,11 @@ enum class SwitchPhase { none, validating };
 SwitchPhase switch_phase = SwitchPhase::none;
 unsigned long long switch_id = 0;
 std::string switch_target;
+
+bool project_switch_active()
+{
+    return switch_phase != SwitchPhase::none;
+}
 
 extern std::vector<std::string> last_picker_items;
 extern Action last_picker_action;
@@ -1665,12 +1738,12 @@ void save_confirmation(bool recreate = false)
     if (pending_save_as_retry)
     {
         pending_error.clear();
-        begin(Action::save_as);
+        begin(Action::save_as, true);
     }
     else if (!xim_engine_named())
     {
         save_then_continue = true;
-        begin(Action::save_as);
+        begin(Action::save_as, true);
     }
     else if (recreate || !request_recreate(pending == Action::quit, true))
     {
@@ -1872,8 +1945,9 @@ void delete_prompt_selection()
 // highlight is window-local match state; it never touches 'hlsearch'.
 void prompt_input_changed()
 {
-    // Any prompt edit clears a previous read-only refusal.
+    // Any prompt edit clears a previous read-only refusal or file error.
     replace_error = false;
+    fs_prompt_error.clear();
     if (prompt == Action::search_project)
     {
         // A new query starts from the first match.
@@ -1916,7 +1990,7 @@ std::string prompt_info()
         return info;
     }
     if (prompt == Action::rename_file || prompt == Action::move_file)
-        return fs_source;
+        return display_path(fs_source);
     if (prompt == Action::recent_files || prompt == Action::recent_folders)
         return recent_message.empty() ? xim_recent_status() : recent_message;
     if (prompt == Action::search_project)
@@ -2137,8 +2211,10 @@ std::size_t next_activatable(std::size_t from, int delta)
     return from;
 }
 
-void begin(Action action)
+void begin(Action action, bool continuation)
 {
+    if (!continuation)
+        abandon_prompt_continuation();
     xim_project_cancel_query();
     accept_when_ready = false;
     xim_engine_boundary();
@@ -2166,6 +2242,7 @@ void begin(Action action)
     content_cache_case = -1;
     content_serial_seen = xim_project_content_serial();
     recent_message.clear();
+    fs_prompt_error.clear();
     selected = 0;
     last_picker_items.clear();
     last_picker_action = Action::ignore;
@@ -2212,6 +2289,20 @@ void activate_menu_item(xim::MenuGroup group, int index)
 
 void execute(Action action)
 {
+    // A focus-changing command cannot leave a confirmation bound to the old
+    // document. New prompts abandon continuations in begin(); internal
+    // Save-as continuations opt in explicitly instead.
+    if (action == Action::help || action == Action::next_buffer
+            || action == Action::prev_buffer || action == Action::reload_disk)
+        abandon_prompt_continuation();
+    if (project_switch_active()
+            && (action == Action::new_file || action == Action::new_folder
+                || action == Action::rename_file || action == Action::move_file
+                || action == Action::delete_file))
+    {
+        set_notice_text("Busy: opening a project folder");
+        return;
+    }
     if (fs_phase != FsPhase::none)
     {
         switch (action)
@@ -2737,6 +2828,11 @@ extern "C" void xim_dispatch(int key, int modifiers)
             recreate_error.clear();
             return;
         }
+        if (action == Action::menu)
+        {
+            execute(Action::menu);
+            return;
+        }
         if (prompt == Action::recreate_confirm)
         {
             if (key == 's' || key == 'S')
@@ -2784,13 +2880,6 @@ extern "C" void xim_dispatch(int key, int modifiers)
             // A distinctly reported Alt-C (modifyOtherKeys or Kitty)
             // reaches the seam with its modifier preserved.
             execute(Action::toggle_case);
-            return;
-        }
-        if (action == Action::menu)
-        {
-            // F10 opens the menu bar even while a prompt is open; the menu
-            // popup restores the prompt rows when it closes.
-            execute(Action::menu);
             return;
         }
         if (key == XIM_F3 && prompt_is_find_like())
@@ -3246,6 +3335,10 @@ void render_prompt_overlay(int menu_rows)
     if (prompt == Action::ignore) return;
     std::string label = prompt_label();
     std::string items;
+    bool file_error = !fs_prompt_error.empty()
+        && (prompt == Action::new_file || prompt == Action::new_folder
+            || prompt == Action::rename_file || prompt == Action::move_file);
+    if (file_error) items = fs_prompt_error + "\n";
     if (prompt == Action::palette)
     {
         auto list = filtered();
@@ -3339,7 +3432,7 @@ void render_prompt_overlay(int menu_rows)
     rendered_prompt_cursor = static_cast<int>(label.size())
         + cells_before(input, std::min(input_cursor, input.size()));
     std::string info = prompt_info();
-    xim_engine_overlay(rendered_prompt_text.c_str(), items.c_str(), info.c_str(), false);
+    xim_engine_overlay(rendered_prompt_text.c_str(), items.c_str(), info.c_str(), file_error);
 }
 
 void render_menu_popup(int columns, int menu_rows, unsigned caps)

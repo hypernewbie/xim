@@ -1298,6 +1298,12 @@ def buffer_switch_and_about(binary, root):
             session.send(b"\r")
             session.wait(b"one-run terminal editor")
             assert b"E15" not in session.screen.text(), "About raised E15"
+            session.send(b"\x1bOPBuffers\ralpha.txt\r")
+            assert wait_screen(session, b"DIRTYalpha")
+            session.drain(.1)
+            assert caret(session) == (1, 6), "buffer switch lost its insertion column"
+            session.send(b"X")
+            assert session.snapshot() == "DIRTYXalpha\n"
         finally:
             session.close()
     print("Next buffer and About checks passed")

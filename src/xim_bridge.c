@@ -2254,7 +2254,7 @@ xim_initialize(void)
     // launches netrw on the directory buffer and intercepts Ctrl-P / P-E
     // before xim's picker can render the overlay.
     do_cmdline_cmd((char_u *)"let g:loaded_netrw = 1");
-    do_cmdline_cmd((char_u *)"set nocompatible laststatus=2 noshowmode noshowcmd noruler noinsertmode selection=exclusive backspace=indent,eol,start ttimeout ttimeoutlen=20 mouse=a mousemodel=extend showtabline=2");
+    do_cmdline_cmd((char_u *)"set nocompatible laststatus=2 noshowmode noshowcmd noruler noinsertmode nostartofline selection=exclusive backspace=indent,eol,start ttimeout ttimeoutlen=20 mouse=a mousemodel=extend showtabline=2");
     do_highlight((char_u *)"default link XimStatus StatusLine", FALSE, FALSE);
     do_highlight((char_u *)"default link XimPrompt Pmenu", FALSE, FALSE);
     do_highlight((char_u *)"default link XimPalette Pmenu", FALSE, FALSE);

@@ -140,8 +140,9 @@ cannot lead outside the root or loop; a file symlink is listed under its own
 name and opens its target.  Picking a file or buffer switches to it without a
 Save/Discard prompt and keeps any unsaved buffer in the buffer list.  Buffer
 rows show a stable number, '*' for the active buffer and '+' for unsaved
-changes.  Rows carry their own path identity, not indentation, and control
-characters are escaped.  Long paths are shortened in the middle so the
+changes.  Buffer switches retain the last cursor column: 'startofline' is off
+by default in native mode.  Rows carry their own path identity, not indentation,
+and control characters are escaped.  Long paths are shortened in the middle so the
 filename stays visible.  Two unnamed buffers remain separate choices.
 
 Project search

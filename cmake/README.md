@@ -13,6 +13,8 @@ ctest --preset default
 The default preset uses Huge features and RelWithDebInfo. CMake checks the
 host's dependencies, requires Clang's C++26 mode, and uses libc++ when its
 compile, link, and run probe succeeds. Inherited `.c` files remain C sources.
+The [portability audit](XIM_PORTABILITY_AUDIT.md) records the native platform
+bring-up and its remaining limits.
 
 For clean-source acceptance, run:
 

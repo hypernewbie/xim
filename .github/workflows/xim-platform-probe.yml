@@ -51,11 +51,16 @@ jobs:
         with:
           arch: x64
 
-      - name: Set Windows Clang compilers
+      - name: Set Windows Clang compilers and CMake
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           clang-cl --version
+          python -m pip install 'cmake>=4.2,<5'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $cmakeBin = python -c "import cmake; print(cmake.CMAKE_BIN_DIR)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $cmakeBin >> $env:GITHUB_PATH
           "CC=clang-cl" >> $env:GITHUB_ENV
           "CXX=clang-cl" >> $env:GITHUB_ENV
 

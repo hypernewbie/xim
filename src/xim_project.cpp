@@ -2038,10 +2038,38 @@ void content_loop()
                 generation, revision);
         lock.lock();
         if (obsolete(generation) || revision != current_content.load()
-                || !content_active || paths != snapshot)
+                || !content_active)
         {
             lock.unlock();
             continue;
+        }
+        if (paths != snapshot)
+        {
+            // Finish an owned scan despite unrelated namespace churn. The
+            // scanner already queued a follow-up over the new path index.
+            // Prune vanished targets off-thread before publishing this view.
+            lock.unlock();
+            auto filtered = std::make_shared<ContentResults>(*results);
+            std::string checked;
+            bool keep = false;
+            std::erase_if(filtered->matches, [&](const ContentMatch &match) {
+                if (checked != match.path)
+                {
+                    checked = match.path;
+                    std::error_code error;
+                    keep = std::filesystem::is_regular_file(base / checked, error);
+                    if (!keep) ++filtered->files_skipped;
+                }
+                return !keep;
+            });
+            results = std::move(filtered);
+            lock.lock();
+            if (obsolete(generation) || revision != current_content.load()
+                    || !content_active)
+            {
+                lock.unlock();
+                continue;
+            }
         }
         content_snapshot = std::move(results);
         content_result_revision = revision;
@@ -2060,6 +2088,7 @@ void project_watch_events(void *, const xim_watch_event *events, size_t count,
         return;
     bool needs_full = (flags & XIM_WATCH_ROOT_LOST) != 0;
     bool content_dirty = needs_full;
+    bool cancel_content = (flags & (XIM_WATCH_ROOT_LOST | XIM_WATCH_OVERFLOW)) != 0;
     bool namespace_dirty = false;
     if (flags & XIM_WATCH_ROOT_LOST)
     {
@@ -2109,6 +2138,7 @@ void project_watch_events(void *, const xim_watch_event *events, size_t count,
                         | XIM_WATCH_MOVE | XIM_WATCH_ATTRIB)) == 0)
             continue;  // content-only writes do not change the path set
         namespace_dirty = true;
+        if (is_ignore) cancel_content = true;
         if (is_ignore || event.is_directory || (flags & XIM_WATCH_OVERFLOW)
                 || (flags & XIM_WATCH_ROOT_LOST))
             needs_full = true;
@@ -2137,7 +2167,10 @@ void project_watch_events(void *, const xim_watch_event *events, size_t count,
         ++namespace_revision;
     if (content_dirty)
     {
-        current_content.fetch_add(1);
+        // A filesystem observation requests a coalesced follow-up, not a new
+        // user query. Otherwise a busy unrelated subtree cancels every long
+        // scan before it can publish. Root/scope uncertainty still cancels.
+        if (cancel_content) current_content.fetch_add(1);
         if (content_active)
         {
             content_requested = true;

@@ -170,6 +170,9 @@ search is available only for a directory or a bare start.
 
 Content search reads the on-disk text of indexed files.  Unsaved buffer
 changes are not searched; save the buffer first to search the edited text.
+Background writes queue a follow-up scan without cancelling the active scan.
+Completed results remain an as-read view during refresh.  Activating a missing
+search target does not create a new document.
 
 External changes
 								*xim-external*

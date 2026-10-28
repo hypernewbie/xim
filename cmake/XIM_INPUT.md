@@ -113,8 +113,14 @@ old-path metadata, and the scanner installs destination watches before walking
 their children. Ordinary events patch affected index directories and explorer caches
 off-thread; overflow, root loss, ignore-file changes and an explicit refresh
 request one reconciliation. Requested and published namespace revisions keep
-path/content activation pending until that reconciliation is current. Index
-patches borrow an immutable snapshot captured under the state lock. Watch failure is visible with its cause and
+path/content activation pending until that reconciliation is current. Ordinary
+writes and namespace churn queue one content follow-up without changing the
+user-query revision or cancelling its owned scan. Completed content remains an
+as-read view during refresh; a changed index triggers off-thread pruning of
+vanished targets before publication. Activation checks that the target still
+exists. Root loss, overflow, ignore-scope changes, explicit refresh and user
+query changes still cancel obsolete content work. Index patches borrow an
+immutable snapshot captured under the state lock. Watch failure is visible with its cause and
 leaves manual Refresh project usable. The backend interface permits another
 platform implementation without changing editor-state ownership.
 

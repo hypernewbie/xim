@@ -2128,6 +2128,87 @@ def external_reload_formats(binary, root):
     print("Staged reload format, write-stamp, UTF-8, hooks and undo checks passed")
 
 
+def project_content_busy(binary, root):
+    """An unrelated busy subtree cannot cancel every owned content scan."""
+    import threading
+    with tempfile.TemporaryDirectory(prefix="xim-busy-content-", dir=root) as temporary:
+        directory = Path(temporary)
+        (directory / "cold").mkdir()
+        (directory / "hot").mkdir()
+        # A scan takes longer than the watcher's maximum coalescing window.
+        payload = b"z" * 750000 + b"\n"
+        for index in range(80):
+            (directory / "cold" / f"{index:03}.txt").write_bytes(payload)
+        (directory / "target.txt").write_text("UNIQUE_NEEDLE\n")
+        log = directory / "hot" / "log.txt"
+        log.write_text("hot\n")
+        session = Session(binary, directory, (".",))
+        try:
+            for namespace in (False, True):
+                stop = threading.Event()
+                def writer():
+                    while not stop.is_set():
+                        if namespace:
+                            transient = log.parent / "transient.txt"
+                            transient.write_text("hot\n")
+                            transient.unlink()
+                        else:
+                            log.write_text("hot\n")
+                        stop.wait(.01)
+                thread = threading.Thread(target=writer)
+                thread.start()
+                try:
+                    session.send(b"\x1bOPSearch project\r")
+                    session.wait(b"Search:")
+                    session.send(b"UNIQUE_NEEDLE")
+                    assert wait_drain(session, lambda:
+                            b"target.txt" in session.screen.text()
+                            and b">   1: UNIQUE_NEEDLE" in session.screen.text(),
+                            timeout=15), session.screen.text()
+                    assert thread.is_alive() and not stop.is_set()
+                    session.send(b"\x1b")
+                    assert wait_screen(session, b"Search:", present=False)
+                    session.send(b"\x10target.txt")
+                    assert wait_drain(session, lambda:
+                            b"Files: target.txt" in session.screen.text()
+                            and b"> target.txt" in session.screen.text()), session.screen.text()
+                    session.send(b"\x1b\x05")
+                    assert wait_drain(session, lambda:
+                            b"Explorer:" in session.screen.text()
+                            and b"target.txt" in session.screen.text()), session.screen.text()
+                    session.send(b"\x1b")
+                    assert wait_screen(session, b"Explorer:", present=False)
+                finally:
+                    stop.set()
+                    thread.join()
+        finally:
+            session.close()
+    print("Content search, quick open and explorer survive unrelated filesystem churn")
+
+
+def project_content_missing_target(binary, root):
+    """A deleted search row cannot open an unintended new file."""
+    with tempfile.TemporaryDirectory(prefix="xim-search-missing-", dir=root) as temporary:
+        directory = Path(temporary)
+        target = directory / "target.txt"
+        target.write_text("UNIQUE_NEEDLE\n")
+        session = Session(binary, directory, (".",))
+        try:
+            session.send(b"\x1bOPSearch project\r")
+            session.wait(b"Search:")
+            session.send(b"UNIQUE_NEEDLE")
+            assert wait_screen(session, b">   1: UNIQUE_NEEDLE"), session.screen.text()
+            target.unlink()
+            # Activate before the watcher's coalesced deletion reaches input.
+            session.send(b"\r\x1b")
+            session.ex("call writefile([expand('%:p')], 'active-buffer')")
+            actual = (directory / "active-buffer").read_text().strip().rstrip("/")
+            assert actual == str(directory), actual
+        finally:
+            session.close()
+    print("Missing content-search target does not create a new document")
+
+
 def file_operations(binary, root):
     """Plan 6: create, rename, move and permanent delete with safe targets."""
     with tempfile.TemporaryDirectory(prefix="xim-fsops-", dir=root) as temporary:
@@ -2551,6 +2632,8 @@ if __name__ == "__main__":
     find_highlight_window(args.binary.resolve(), args.work.resolve())
     find_replace(args.binary.resolve(), args.work.resolve())
     project_content_search(args.binary.resolve(), args.work.resolve())
+    project_content_busy(args.binary.resolve(), args.work.resolve())
+    project_content_missing_target(args.binary.resolve(), args.work.resolve())
     file_operations(args.binary.resolve(), args.work.resolve())
     file_operation_forms(args.binary.resolve(), args.work.resolve())
     file_operations_retention(args.binary.resolve(), args.work.resolve())

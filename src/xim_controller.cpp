@@ -2513,15 +2513,18 @@ bool open_picker_item(Action current, const std::vector<std::string> &list,
             prompt = current;
             return false;
         }
-        char *resolved = xim_project_resolve(meta.path.c_str());
-        if (resolved != nullptr)
+        std::unique_ptr<char, decltype(&xim_project_free)> resolved(
+                xim_project_resolve(meta.path.c_str()), xim_project_free);
+        const char *path = resolved ? resolved.get() : meta.path.c_str();
+        // Completed search rows are an as-read view during a live refresh.
+        // Do not turn a vanished result into an unintended new document.
+        if (xim_project_file_version(path) == 0)
         {
-            std::unique_ptr<char, decltype(&xim_project_free)> guard(
-                    resolved, xim_project_free);
-            xim_engine_command("hide edit", resolved, 0);
+            prompt = current;
+            set_notice_text("Search target is missing: " + tail_name(meta.path));
+            return false;
         }
-        else
-            xim_engine_command("hide edit", meta.path.c_str(), 0);
+        xim_engine_command("hide edit", path, 0);
         std::string jump = "call cursor(" + std::to_string(meta.lnum) + ", "
             + std::to_string(meta.col + 1) + ")";
         xim_engine_command(jump.c_str(), "", 0);

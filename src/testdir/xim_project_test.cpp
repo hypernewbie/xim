@@ -497,6 +497,15 @@ int main(int argc, char **argv)
             project_watch_events(nullptr, &unrelated, 1, 0);
             require(current_content.load() == revision,
                 "unrelated external file restarted project content search");
+            auto changed_path = (base / "new" / "nested" / "fresh.txt").string();
+            xim_watch_event modified{XIM_WATCH_MODIFY, changed_path.c_str(), nullptr, 0, 1};
+            project_watch_events(nullptr, &modified, 1, 0);
+            require(current_content.load() == revision,
+                "ordinary write cancelled the owned content query");
+            xim_watch_event created{XIM_WATCH_CREATE, changed_path.c_str(), nullptr, 0, 1};
+            project_watch_events(nullptr, &created, 1, 0);
+            require(current_content.load() == revision,
+                "ordinary namespace churn cancelled the owned content query");
             std::filesystem::remove_all(base / "new");
             wait_paths("keep", "");
             wait_paths("fresh", "");

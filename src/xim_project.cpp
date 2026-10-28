@@ -1,5 +1,6 @@
 #include "xim_project.h"
 #include "xim_watch.h"
+#include "xim_file_stat.h"
 
 #include <algorithm>
 #include <atomic>
@@ -584,9 +585,9 @@ unsigned long long explorer_dir_identity(int fd)
     value = value * 1099511628211ull
         ^ static_cast<unsigned long long>(info.st_ino);
     value = value * 1099511628211ull
-        ^ static_cast<unsigned long long>(info.st_mtime) * 1000000007ull;
+        ^ static_cast<unsigned long long>(xim::file_mtime(info).tv_sec) * 1000000007ull;
     value = value * 1099511628211ull
-        ^ static_cast<unsigned long long>(info.st_mtim.tv_nsec);
+        ^ static_cast<unsigned long long>(xim::file_mtime(info).tv_nsec);
     value = value * 1099511628211ull
         ^ static_cast<unsigned long long>(info.st_size);
     return value;
@@ -1036,16 +1037,7 @@ std::string explorer_status_locked()
 
 unsigned long long stat_file_version(const struct stat &info)
 {
-    unsigned long long value = static_cast<unsigned long long>(info.st_dev);
-    value = value * 1099511628211ull
-        ^ static_cast<unsigned long long>(info.st_ino);
-    value = value * 1099511628211ull
-        ^ static_cast<unsigned long long>(info.st_size);
-    value = value * 1099511628211ull
-        ^ static_cast<unsigned long long>(info.st_mtim.tv_sec) * 1000000007ull;
-    value = value * 1099511628211ull
-        ^ static_cast<unsigned long long>(info.st_mtim.tv_nsec);
-    return value;
+    return xim::file_version(info);
 }
 
 unsigned long long path_version(const std::string &path)
@@ -2515,8 +2507,8 @@ void read_loop()
                 struct stat after;
                 if (failed || fstat(fd, &after) != 0
                         || after.st_size != before.st_size
-                        || after.st_mtim.tv_sec != before.st_mtim.tv_sec
-                        || after.st_mtim.tv_nsec != before.st_mtim.tv_nsec
+                        || xim::file_mtime(after).tv_sec != xim::file_mtime(before).tv_sec
+                        || xim::file_mtime(after).tv_nsec != xim::file_mtime(before).tv_nsec
                         || after.st_ino != before.st_ino
                         || after.st_dev != before.st_dev
                         || path_version(request.path) != stat_file_version(after))

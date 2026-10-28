@@ -1,4 +1,5 @@
 #include "xim_watch.h"
+#include "xim_file_stat.h"
 
 #include <algorithm>
 #include <atomic>
@@ -110,16 +111,7 @@ unsigned long long stat_version(const std::string &path, bool *is_directory)
     }
     if (is_directory != nullptr)
         *is_directory = *is_directory || S_ISDIR(info.st_mode);
-    unsigned long long value = static_cast<unsigned long long>(info.st_dev);
-    value = value * 1099511628211ull
-        ^ static_cast<unsigned long long>(info.st_ino);
-    value = value * 1099511628211ull
-        ^ static_cast<unsigned long long>(info.st_size);
-    value = value * 1099511628211ull
-        ^ static_cast<unsigned long long>(info.st_mtim.tv_sec) * 1000000007ull;
-    value = value * 1099511628211ull
-        ^ static_cast<unsigned long long>(info.st_mtim.tv_nsec);
-    return value;
+    return xim::file_version(info);
 }
 
 void set_failure(const std::string &cause)

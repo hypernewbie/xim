@@ -397,6 +397,12 @@ if(NOT XIM_FEATURE_LEVEL STREQUAL "tiny")
         COMMENT "Staging the matching Xim runtime")
     add_dependencies(xim xim_runtime)
 
+    add_executable(xim_file_stat_test testdir/xim_file_stat_test.cpp)
+    xim_apply_default_flags(xim_file_stat_test)
+    xim_apply_cxx_settings(xim_file_stat_test)
+    add_test(NAME xim_file_stat COMMAND xim_file_stat_test)
+    set_tests_properties(xim_file_stat PROPERTIES LABELS "xim_native")
+
     add_executable(xim_commands_test testdir/xim_commands_test.cpp xim_commands.cpp)
     xim_apply_default_flags(xim_commands_test)
     xim_apply_cxx_settings(xim_commands_test)

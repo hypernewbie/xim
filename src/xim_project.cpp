@@ -347,6 +347,11 @@ std::vector<std::string> enumerate(const std::filesystem::path &base,
 	}
 	if (is_dir)
 	{
+	    if (entry->is_symlink(error))
+	    {
+		entry.disable_recursion_pending();
+		continue;
+	    }
 	    // Register the watch before reading the ignore file, so a change in
 	    // this subtree during enumeration is queued rather than lost.
 	    xim_watch_watch_dir(entry->path().c_str());
@@ -464,6 +469,15 @@ std::set<std::string> dirty_dirs;
 bool reconcile_requested = false;
 bool full_reconcile_requested = false;
 unsigned long long index_revision = 1;
+unsigned long long namespace_revision = 1;
+unsigned long long indexed_namespace_revision = 0;
+
+// Guarded by state_lock. A path query cannot claim current results while a
+// watcher-requested namespace change is still being reconciled.
+bool index_current()
+{
+    return !active || indexed_namespace_revision == namespace_revision;
+}
 
 // Staged reads run on their own worker so an event handler never performs a
 // large disk read inside input or redraw dispatch.
@@ -678,12 +692,16 @@ void load_explorer_dir(const std::filesystem::path &base,
         auto rules = explorer_rules(base, relative);
         std::vector<ExplorerEntry> entries;
         bool truncated = false;
-        errno = 0;
+        int read_error = 0;
         for (;;)
         {
+            errno = 0;
             struct dirent *entry = readdir(stream);
             if (entry == nullptr)
+            {
+                read_error = errno;
                 break;
+            }
             std::string_view name(entry->d_name);
             if (name.empty() || name == "." || name == "..")
                 continue;
@@ -739,7 +757,6 @@ void load_explorer_dir(const std::filesystem::path &base,
                 break;
             }
         }
-        int read_error = errno;
         closedir(stream);
         unsigned long long after = explorer_dir_identity(fd);
         close(fd);
@@ -808,21 +825,18 @@ ExplorerDir &ensure_explorer_dir(const std::filesystem::path &base,
     return slot->second;
 }
 
-void evict_explorer_cache(std::map<std::string, ExplorerDir> &cache,
-        const std::set<std::string> &expanded)
+void evict_explorer_cache(std::map<std::string, ExplorerDir> &cache)
 {
     while (explorer_cache_bytes > kExplorerCacheBudget)
     {
         auto victim = cache.end();
         for (auto it = cache.begin(); it != cache.end(); ++it)
         {
-            if (it->first == "." || expanded.contains(it->first))
-                continue;
             if (victim == cache.end() || it->second.used < victim->second.used)
                 victim = it;
         }
         if (victim == cache.end())
-            break;  // every remaining directory is visible
+            break;
         explorer_cache_bytes -= std::min(explorer_cache_bytes,
                 victim->second.bytes);
         cache.erase(victim);
@@ -937,7 +951,9 @@ void build_explorer_view(const std::filesystem::path &base,
                 {}, 's', 0, 0, revision, rows, limited);
         view.status = "Explorer row limit reached";
     }
-    evict_explorer_cache(explorer_dirs, expanded);
+    // Published rows own their identities independently of the directory
+    // cache. Even expanded/root listings can be evicted after flattening.
+    evict_explorer_cache(explorer_dirs);
 }
 
 // Called with state_lock held.
@@ -1504,7 +1520,8 @@ std::vector<std::string> list_directory_files(const std::filesystem::path &base,
 }
 
 std::shared_ptr<Index> patch_index(const std::filesystem::path &base,
-        const std::set<std::string> &dirs, unsigned generation)
+        const std::set<std::string> &dirs, unsigned generation,
+        const std::shared_ptr<const Index> &current)
 {
     std::vector<IndexedPath> additions;
     for (const auto &dir : dirs)
@@ -1516,7 +1533,6 @@ std::shared_ptr<Index> patch_index(const std::filesystem::path &base,
             additions.push_back({std::move(path), std::move(folded)});
         }
     }
-    auto current = snapshot;
     auto index = std::make_shared<Index>();
     index->reserve(current->size() + additions.size());
     for (const auto &entry : *current)
@@ -1531,6 +1547,8 @@ std::shared_ptr<Index> patch_index(const std::filesystem::path &base,
             [](const IndexedPath &left, const IndexedPath &right) {
                 return left.path < right.path;
             });
+    if (index->size() > kMaxIndexedFiles)
+        index->resize(kMaxIndexedFiles);
     return index;
 }
 
@@ -1545,6 +1563,15 @@ void scan_loop()
         });
         if (stopping.load()) return;
         auto retired = std::move(retired_index);
+        if (!active)
+        {
+            scan_requested = false;
+            full_reconcile_requested = false;
+            dirty_dirs.clear();
+            lock.unlock();
+            retired.reset();
+            continue;
+        }
         bool full = scan_requested || full_reconcile_requested || !scan_complete;
         std::vector<std::string> dirs;
         if (!full)
@@ -1560,7 +1587,9 @@ void scan_loop()
             continue;
         }
         auto base = root; // owned root; never read mutable root off-thread
+        auto current = snapshot;
         unsigned generation = current_generation.load();
+        auto namespace_rev = namespace_revision;
         lock.unlock();
         retired.reset(); // large snapshots are freed off-thread, outside the mutex
         std::shared_ptr<Index> index;
@@ -1569,7 +1598,7 @@ void scan_loop()
         else
         {
             std::set<std::string> dirty(dirs.begin(), dirs.end());
-            index = patch_index(base, dirty, generation);
+            index = patch_index(base, dirty, generation, current);
         }
         if (index == nullptr)
             continue;
@@ -1580,6 +1609,7 @@ void scan_loop()
             continue;
         }
         snapshot = std::move(index);
+        indexed_namespace_revision = namespace_rev;
         ++index_revision;
         if (full)
             scan_complete = true;
@@ -1680,6 +1710,7 @@ void start_scan()
     std::lock_guard lock(state_lock);
     if (!active) return;
     current_generation.fetch_add(1);
+    ++namespace_revision;
     retire_snapshot();
     invalidate_explorer("", false);
     results.clear();
@@ -1858,7 +1889,8 @@ extern "C" void xim_project_cancel_query(void)
 extern "C" int xim_project_pending(void)
 {
     std::lock_guard lock(state_lock);
-    return query_active && (result_generation != current_generation.load()
+    return query_active && (!index_current()
+        || result_generation != current_generation.load()
         || result_revision != current_query.load()
         || result_index_revision != index_revision
         || result_query != requested_query
@@ -1986,7 +2018,7 @@ void content_loop()
         std::unique_lock lock(state_lock);
         content_changed.wait(lock, [] {
             return stopping.load()
-                || (content_requested && (scan_complete || !active));
+                || (content_requested && (scan_complete || !active) && index_current());
         });
         if (stopping.load()) return;
         if (!content_requested)
@@ -2027,9 +2059,12 @@ void project_watch_events(void *, const xim_watch_event *events, size_t count,
     if (stopping.load())
         return;
     bool needs_full = (flags & XIM_WATCH_ROOT_LOST) != 0;
+    bool content_dirty = needs_full;
+    bool namespace_dirty = false;
     if (flags & XIM_WATCH_ROOT_LOST)
     {
         root_lost = true;
+        change_overflow = true;  // also re-observe every retained buffer
         explorer_error = "Project unavailable: root deleted or replaced";
     }
     if ((flags & XIM_WATCH_OVERFLOW) != 0)
@@ -2062,14 +2097,18 @@ void project_watch_events(void *, const xim_watch_event *events, size_t count,
                     || (event.kind & (XIM_WATCH_DELETE | XIM_WATCH_MOVE)) != 0);
         if (other_inside)
             invalidate_explorer(relative_other, event.is_directory != 0);
-        if (!active)
+        bool relevant = (inside && !has_ignored_component(relative))
+            || (other_inside && !has_ignored_component(relative_other));
+        if (!active || !relevant)
             continue;
+        content_dirty = true;
         bool is_ignore = inside
             && (base_name_of(relative) == ".gitignore"
                 || relative == ".git/info/exclude");
-        if ((event.kind & (XIM_WATCH_CREATE | XIM_WATCH_DELETE
+        if (!is_ignore && (event.kind & (XIM_WATCH_CREATE | XIM_WATCH_DELETE
                         | XIM_WATCH_MOVE | XIM_WATCH_ATTRIB)) == 0)
             continue;  // content-only writes do not change the path set
+        namespace_dirty = true;
         if (is_ignore || event.is_directory || (flags & XIM_WATCH_OVERFLOW)
                 || (flags & XIM_WATCH_ROOT_LOST))
             needs_full = true;
@@ -2087,17 +2126,23 @@ void project_watch_events(void *, const xim_watch_event *events, size_t count,
             }
         }
     }
-    if (needs_full)
+    if (needs_full && active)
     {
         full_reconcile_requested = true;
         reconcile_requested = true;
+        namespace_dirty = true;
+        content_dirty = true;
     }
-    // Any watcher event can invalidate content results for the active query.
-    current_content.fetch_add(1);
-    if (content_active)
+    if (namespace_dirty)
+        ++namespace_revision;
+    if (content_dirty)
     {
-        content_requested = true;
-        content_changed.notify_one();
+        current_content.fetch_add(1);
+        if (content_active)
+        {
+            content_requested = true;
+            content_changed.notify_one();
+        }
     }
     if (reconcile_requested)
         scan_changed.notify_one();
@@ -2129,7 +2174,7 @@ xim_project_files(const char *query)
         results.clear();
         query_changed.notify_one();
     }
-    if (result_generation != current_generation.load()
+    if (!index_current() || result_generation != current_generation.load()
             || result_revision != current_query.load()
             || result_index_revision != index_revision
             || result_query != text)
@@ -2143,7 +2188,7 @@ xim_project_files(const char *query)
 // header has an empty PATH. Serialization runs outside the state mutex.
 static bool content_ready_locked()
 {
-    return content_active && content_snapshot->complete
+    return index_current() && content_active && content_snapshot->complete
         && content_result_revision == current_content.load()
         && content_snapshot->generation == current_generation.load();
 }

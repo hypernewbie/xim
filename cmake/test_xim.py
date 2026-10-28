@@ -1947,6 +1947,50 @@ def external_changes(binary, root):
     print("Watcher reload, dirty protection and rename checks passed")
 
 
+def external_directory_changes(binary, root):
+    """Moved directory watches and every open descendant follow the new path."""
+    with tempfile.TemporaryDirectory(prefix="xim-watch-tree-", dir=root) as temporary:
+        project = Path(temporary)
+        old = project / "old"
+        (old / "nested").mkdir(parents=True)
+        (old / "nested" / "alpha.txt").write_text("alpha\n")
+        (old / "nested" / "beta.txt").write_text("beta\n")
+        session = Session(binary, project, (".",))
+        try:
+            session.send(b"\x10alpha.txt\r")
+            session.wait(b"alpha")
+            session.send(b"local")
+            session.send(b"\x10beta.txt\r")
+            assert wait_screen(session, b"beta")
+            new = project / "new"
+            old.rename(new)
+            assert wait_screen(session, b"Renamed on disk:")
+            session.send(b"\x1bOPBuffers\ralpha.txt\r")
+            assert wait_screen(session, b"localalpha")
+            session.send(b"\x1b[HY\x13")
+            assert wait_drain(session, lambda: (new / "nested" / "alpha.txt").read_text()
+                              == "Ylocalalpha\n"), \
+                ((new / "nested" / "alpha.txt").read_text(), session.screen.text()[-1000:])
+            assert not old.exists()
+            fresh = new / "nested" / "fresh.txt"
+            fresh.write_text("fresh\n")
+            session.send(b"\x10fresh.txt")
+            assert wait_screen(session, b"new/nested/fresh.txt")
+            session.send(b"\x1b")
+            shutil.rmtree(new)
+            assert wait_screen(session, b"missing on disk")
+            session.ex("call writefile([json_encode(map(filter(getbufinfo(), "
+                       "'v:val.name =~ \"/new/nested/\"'), 'getbufvar(v:val.bufnr, "
+                       "\"&modified\")'))], 'missing-descendants')")
+            assert json.loads((project / "missing-descendants").read_text()) == [1, 1]
+            session.send(b"\x11")
+            assert wait_screen(session, b"Save changes?")
+            assert session.process.poll() is None
+        finally:
+            session.close()
+    print("External directory move/watch and deleted-descendant protection checks passed")
+
+
 def external_reload_formats(binary, root):
     """Staged reload preserves disk format, write stamps and undo boundaries."""
     cases = (
@@ -2363,5 +2407,6 @@ if __name__ == "__main__":
     file_operations_retention(args.binary.resolve(), args.work.resolve())
     project_switch_recents(args.binary.resolve(), args.work.resolve())
     external_changes(args.binary.resolve(), args.work.resolve())
+    external_directory_changes(args.binary.resolve(), args.work.resolve())
     external_reload_formats(args.binary.resolve(), args.work.resolve())
     compatibility_unchanged(args.binary.resolve(), args.work.resolve())

@@ -34,6 +34,8 @@ struct WatchInfo
     std::string path;
     bool project = false;
     std::set<std::string> names;
+    dev_t device = 0;
+    ino_t inode = 0;
 };
 
 struct RawEvent
@@ -43,6 +45,25 @@ struct RawEvent
     std::uint32_t cookie = 0;
     std::string name;
 };
+
+void append_raw_event(std::vector<RawEvent> &batch, RawEvent event,
+        std::size_t &bytes, bool &overflow)
+{
+    if (overflow)
+        return;
+    bytes += sizeof(RawEvent) + event.name.size();
+    if (batch.size() >= kMaxBatchPaths || bytes > kMaxBatchBytes)
+    {
+        overflow = true;
+        batch.clear();
+        RawEvent lost;
+        lost.mask = IN_Q_OVERFLOW;
+        batch.push_back(std::move(lost));
+        bytes = sizeof(RawEvent);
+    }
+    else
+        batch.push_back(std::move(event));
+}
 
 std::mutex lock;
 std::unordered_map<int, WatchInfo> watches;
@@ -58,6 +79,7 @@ std::atomic<bool> stop_requested{false};
 xim_watch_callback callback = nullptr;
 void *callback_context = nullptr;
 bool root_lost_reported = false;
+unsigned long long project_epoch = 0;
 
 std::string parent_path(std::string_view path)
 {
@@ -78,8 +100,6 @@ std::string base_name(std::string_view path)
 unsigned long long stat_version(const std::string &path, bool *is_directory)
 {
     struct stat info;
-    if (is_directory != nullptr)
-        *is_directory = false;
     if (lstat(path.c_str(), &info) != 0)
         return 0;
     if (S_ISLNK(info.st_mode))
@@ -89,7 +109,7 @@ unsigned long long stat_version(const std::string &path, bool *is_directory)
             info = target;
     }
     if (is_directory != nullptr)
-        *is_directory = S_ISDIR(info.st_mode);
+        *is_directory = *is_directory || S_ISDIR(info.st_mode);
     unsigned long long value = static_cast<unsigned long long>(info.st_dev);
     value = value * 1099511628211ull
         ^ static_cast<unsigned long long>(info.st_ino);
@@ -109,18 +129,33 @@ void set_failure(const std::string &cause)
         failure = "Watcher partial: " + cause + "; refresh required";
 }
 
+void remove_watch_locked(int wd);
+
 bool add_watch_locked(const std::string &path, bool project,
         const std::string &name)
 {
     auto found = watch_paths.find(path);
+    struct stat identity;
+    if (stat(path.c_str(), &identity) != 0 || !S_ISDIR(identity.st_mode))
+    {
+        if (found != watch_paths.end())
+            remove_watch_locked(found->second);
+        set_failure("directory unavailable: " + path);
+        return false;
+    }
     if (found != watch_paths.end())
     {
-        auto &info = watches[found->second];
-        if (project)
-            info.project = true;
-        if (!name.empty())
-            info.names.insert(name);
-        return true;
+        auto &info = watches.at(found->second);
+        if (info.device == identity.st_dev && info.inode == identity.st_ino)
+        {
+            if (project)
+                info.project = true;
+            if (!name.empty())
+                info.names.insert(name);
+            return true;
+        }
+        project = project || info.project;
+        remove_watch_locked(found->second);
     }
     int wd = inotify_add_watch(notify_fd, path.c_str(), kProjectMask);
     if (wd < 0)
@@ -128,9 +163,19 @@ bool add_watch_locked(const std::string &path, bool project,
         set_failure(std::string(strerror(errno)) + " for " + path);
         return false;
     }
+    if (watches.contains(wd))
+    {
+        set_failure("directory alias requires manual refresh: " + path);
+        return false;
+    }
     WatchInfo info;
     info.path = path;
     info.project = project;
+    info.device = identity.st_dev;
+    info.inode = identity.st_ino;
+    auto explicit_parent = explicit_names.find(path);
+    if (explicit_parent != explicit_names.end())
+        info.names = explicit_parent->second;
     if (!name.empty())
         info.names.insert(name);
     watches.emplace(wd, std::move(info));
@@ -149,6 +194,19 @@ void remove_watch_locked(int wd)
     watches.erase(found);
 }
 
+void retire_subtree(const std::string &path)
+{
+    std::lock_guard guard(lock);
+    std::vector<int> drop;
+    for (const auto &[wd, info] : watches)
+        if (info.path == path || (info.path.starts_with(path)
+                    && info.path.size() > path.size()
+                    && info.path[path.size()] == '/'))
+            drop.push_back(wd);
+    for (int wd : drop)
+        remove_watch_locked(wd);
+}
+
 void drain_command_pipe()
 {
     char bytes[64];
@@ -164,7 +222,7 @@ std::uint32_t event_kind(std::uint32_t mask)
     if (mask & IN_MOVED_FROM) kind |= XIM_WATCH_MOVE;
     if (mask & IN_MOVED_TO) kind |= XIM_WATCH_MOVE;
     if (mask & IN_ATTRIB) kind |= XIM_WATCH_ATTRIB;
-    if (mask & IN_DELETE_SELF) kind |= XIM_WATCH_DELETE;
+    if (mask & (IN_DELETE_SELF | IN_UNMOUNT)) kind |= XIM_WATCH_DELETE;
     if (mask & IN_MOVE_SELF) kind |= XIM_WATCH_MOVE;
     return kind;
 }
@@ -184,9 +242,11 @@ void dispatch_batch(const std::vector<RawEvent> &raw)
     std::size_t bytes = 0;
     bool lost = false;
     std::string root_copy;
+    unsigned long long epoch;
     {
         std::lock_guard guard(lock);
         root_copy = project_root;
+        epoch = project_epoch;
     }
 
     for (const auto &entry : raw)
@@ -210,28 +270,32 @@ void dispatch_batch(const std::vector<RawEvent> &raw)
             auto found = watches.find(entry.wd);
             if (found != watches.end())
             {
-                bool was_project = found->second.project;
+                bool tracked = found->second.project || !found->second.names.empty();
                 remove_watch_locked(entry.wd);
-                if (was_project && !stop_requested.load())
+                if (tracked && !stop_requested.load())
+                {
                     set_failure("watch lost for " + info.path);
+                    flags |= XIM_WATCH_OVERFLOW;
+                }
             }
             continue;
         }
-        if (!info.project)
+        bool self_lost = (entry.mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT)) != 0;
+        if (!info.project && !self_lost)
         {
-            if (entry.name.empty())
-                continue;
-            if (!info.names.contains(entry.name))
+            if (entry.name.empty() || !info.names.contains(entry.name))
                 continue;
         }
         std::string path = entry.name.empty() ? info.path
             : info.path + "/" + entry.name;
         bool is_dir = (entry.mask & IN_ISDIR) != 0;
-        if (entry.mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT))
+        if (self_lost)
         {
             path = info.path;
+            is_dir = true;
             if (info.project && path == root_copy)
                 lost = true;
+            retire_subtree(path);
         }
         if (entry.mask & IN_MOVED_FROM)
         {
@@ -251,6 +315,11 @@ void dispatch_batch(const std::vector<RawEvent> &raw)
                 slot.kind |= kind;
                 slot.directory = is_dir || paired->second.second;
                 slot.other = paired->second.first;
+                // inotify watches follow directory inodes, not names. Drop
+                // their old-path metadata before the rescan installs watches
+                // at the destination, including every moved descendant.
+                if (slot.directory)
+                    retire_subtree(slot.other);
                 moves_from.erase(paired);
                 continue;
             }
@@ -266,6 +335,8 @@ void dispatch_batch(const std::vector<RawEvent> &raw)
         auto &slot = aggregate[moved.first];
         slot.kind |= XIM_WATCH_DELETE;
         slot.directory = slot.directory || moved.second;
+        if (moved.second)
+            retire_subtree(moved.first);
     }
     for (const auto &entry : aggregate)
     {
@@ -289,15 +360,17 @@ void dispatch_batch(const std::vector<RawEvent> &raw)
                     directory ? 1 : 0, version});
         }
     }
-    if (lost && !root_lost_reported)
-    {
-        root_lost_reported = true;
-        flags |= XIM_WATCH_ROOT_LOST;
-    }
     xim_watch_callback cb = nullptr;
     void *context = nullptr;
     {
         std::lock_guard guard(lock);
+        if (lost && project_epoch == epoch && project_root == root_copy
+                && !root_lost_reported)
+        {
+            root_lost_reported = true;
+            flags |= XIM_WATCH_ROOT_LOST;
+            set_failure("project root unavailable");
+        }
         cb = callback;
         context = callback_context;
     }
@@ -332,8 +405,13 @@ void watcher_loop()
         if (!(fds[0].revents & POLLIN))
             continue;
         std::vector<RawEvent> batch;
+        std::size_t batch_bytes = 0;
+        bool overflow = false;
+        auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::milliseconds(250);
         auto read_events = [&]() {
-            for (;;)
+            std::size_t read_bytes = 0;
+            while (!stop_requested.load() && read_bytes < kMaxBatchBytes)
             {
                 ssize_t count = read(notify_fd, buffer.data(), buffer.size());
                 if (count <= 0)
@@ -342,6 +420,7 @@ void watcher_loop()
                         continue;
                     break;
                 }
+                read_bytes += static_cast<std::size_t>(count);
                 for (std::size_t offset = 0;
                         offset + sizeof(inotify_event) <= static_cast<std::size_t>(count); )
                 {
@@ -354,7 +433,7 @@ void watcher_loop()
                     if (event->len > 0)
                         raw.name.assign(event->name,
                                 strnlen(event->name, event->len));
-                    batch.push_back(std::move(raw));
+                    append_raw_event(batch, std::move(raw), batch_bytes, overflow);
                     offset += sizeof(inotify_event) + event->len;
                 }
             }
@@ -362,10 +441,10 @@ void watcher_loop()
         read_events();
         // Coalesce: 50 ms after the last event, at most 250 ms after the
         // first, then publish one batch.
-        auto deadline = std::chrono::steady_clock::now()
-            + std::chrono::milliseconds(250);
         for (;;)
         {
+            if (stop_requested.load())
+                return;
             auto now = std::chrono::steady_clock::now();
             if (now >= deadline)
                 break;
@@ -388,6 +467,7 @@ void watcher_loop()
 
 bool ensure_thread()
 {
+    std::lock_guard guard(lock);
     if (worker.joinable())
         return true;
     if (notify_fd >= 0)
@@ -451,6 +531,7 @@ xim_watch_start_project(const char *path, xim_watch_callback cb, void *context)
     for (auto &[wd, info] : watches)
         info.project = false;
     project_root = path == nullptr ? "" : path;
+    ++project_epoch;
     failure.clear();
     partial = false;
     root_lost_reported = false;
@@ -472,6 +553,7 @@ xim_watch_stop_project(void)
     for (auto &[wd, info] : watches)
         info.project = false;
     project_root.clear();
+    ++project_epoch;
     failure.clear();
     partial = false;
     root_lost_reported = false;
@@ -485,6 +567,13 @@ xim_watch_watch_dir(const char *absolute_path)
     if (!ensure_thread())
         return 0;
     std::lock_guard guard(lock);
+    std::string_view path(absolute_path);
+    if (project_root.empty() || (path != project_root
+                && !(path.starts_with(project_root)
+                    && (project_root == "/"
+                        || (path.size() > project_root.size()
+                            && path[project_root.size()] == '/')))))
+        return 0;  // an obsolete scanner must not reinstall its old root
     return add_watch_locked(absolute_path, true, {}) ? 1 : 0;
 }
 

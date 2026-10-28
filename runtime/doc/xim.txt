@@ -128,6 +128,8 @@ the cause, and a network filesystem can omit events even when a watch
 succeeds.  Overflow or an uncertain state requests one reconciliation scan.
 Refresh project retries watch setup, rebuilds the index, keeps explorer
 expansion and cancels obsolete work without waiting for the previous walk.
+Changes to an existing .gitignore also update the file set.  Pending
+reconciliation prevents activation of obsolete file or content results.
 
 The explorer shows worker-owned directory pages of at most 200 entries.
 Directories come before files in lexical order, empty directories are listed,
@@ -188,7 +190,10 @@ tracked files without waiting for the watcher.  An external deletion keeps the
 buffer text, marks it modified and shows it as missing.  Save asks "Recreate?".
 Choose [s] Recreate to write the missing file, or Escape to cancel.  Save during
 Close or Quit also requires this choice for missing hidden buffers.  An unambiguous external rename updates the buffer path; an
-ambiguous move only marks the old path missing.  Autocommands from a reload
+ambiguous move only marks the old path missing.  A directory move checks the
+identity of each open descendant before changing its buffer path.  Directory
+deletion also protects open descendants, including hidden buffers.
+Autocommands from a reload
 run on the owning thread.
 
 File operations

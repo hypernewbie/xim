@@ -424,6 +424,14 @@ if(NOT XIM_FEATURE_LEVEL STREQUAL "tiny")
         ${CMAKE_BINARY_DIR}/Testing/fsops-fixture)
     set_tests_properties(xim_fsops PROPERTIES LABELS "xim_native" TIMEOUT 60)
 
+    add_executable(xim_watch_test testdir/xim_watch_test.cpp)
+    xim_apply_default_flags(xim_watch_test)
+    xim_apply_cxx_settings(xim_watch_test)
+    target_link_libraries(xim_watch_test PRIVATE Threads::Threads)
+    add_test(NAME xim_watch COMMAND xim_watch_test
+        ${CMAKE_BINARY_DIR}/Testing/watch-fixture)
+    set_tests_properties(xim_watch PROPERTIES LABELS "xim_native" TIMEOUT 60)
+
     add_executable(xim_project_test testdir/xim_project_test.cpp xim_watch.cpp)
     xim_apply_default_flags(xim_project_test)
     xim_apply_cxx_settings(xim_project_test)

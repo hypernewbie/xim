@@ -107,10 +107,14 @@ accesses Vim globals or buffer pointers. Notifications return through the
 project wake callback, not terminal input or key injection. Project watches
 cover included directories, new subtrees and ignore-file changes; explicit
 file opens watch the parent and filter unrelated names. Events coalesce for 50
-ms with a 250 ms maximum delay, and the dirty set is capped at 4096 paths or
-1 MiB. Ordinary events patch affected index directories and explorer caches
+ms with a 250 ms maximum delay. Raw events and the dirty set are capped at
+4096 paths or 1 MiB before publication. Moved/deleted directory watches lose
+old-path metadata, and the scanner installs destination watches before walking
+their children. Ordinary events patch affected index directories and explorer caches
 off-thread; overflow, root loss, ignore-file changes and an explicit refresh
-request one reconciliation. Watch failure is visible with its cause and
+request one reconciliation. Requested and published namespace revisions keep
+path/content activation pending until that reconciliation is current. Index
+patches borrow an immutable snapshot captured under the state lock. Watch failure is visible with its cause and
 leaves manual Refresh project usable. The backend interface permits another
 platform implementation without changing editor-state ownership.
 

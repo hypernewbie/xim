@@ -666,45 +666,56 @@ void handle_change(int kind, unsigned long long version, bool directory,
     }
     if ((kind & 8) != 0 && !other.empty())
     {
-        std::vector<TrackedBuffer *> sources;
         for (auto &buffer : tracked_buffers)
-            if (buffer.name == other)
-                sources.push_back(&buffer);
-        if (sources.size() == 1)
         {
-            auto *buffer = sources.front();
-            // A rename is unambiguous only when the old name is gone and the
-            // destination preserves the buffer's recorded disk identity. A
-            // writebackup rename leaves the original name in place; it is
-            // not an external rename of the open file.
-            unsigned long long source_now =
-                xim_project_file_version(buffer->name.c_str());
-            if (source_now == 0 && version != 0
-                    && version == buffer->version)
+            std::string destination;
+            if (buffer.name == other)
+                destination = path;
+            else if (directory && buffer.name.starts_with(other + "/"))
+                destination = path + buffer.name.substr(other.size());
+            if (destination.empty())
+                continue;
+            // Prove each file's identity, including descendants of a moved
+            // directory. A directory cookie alone cannot retarget buffers.
+            auto source_now = xim_project_file_version(buffer.name.c_str());
+            auto destination_version = directory
+                ? xim_project_file_version(destination.c_str()) : version;
+            if (source_now == 0 && destination_version != 0
+                    && destination_version == buffer.version)
             {
-                if (xim_engine_rename_buffer(buffer->fnum, path.c_str()))
+                if (xim_engine_rename_buffer(buffer.fnum, destination.c_str()))
                 {
-                    xim_project_unwatch_file(buffer->name.c_str());
-                    buffer->name = path;
-                    buffer->version = version;
-                    buffer->tick = 0;
-                    xim_project_watch_file(path.c_str());
-                    drop_notice(buffer->fnum);
-                    set_notice_text("Renamed on disk: " + tail_name(path));
+                    xim_project_unwatch_file(buffer.name.c_str());
+                    if (buffer.read_pending)
+                        xim_project_read_discard(buffer.read_id);
+                    buffer.read_pending = false;
+                    buffer.name = destination;
+                    buffer.version = destination_version;
+                    buffer.missing = false;
+                    xim_project_watch_file(destination.c_str());
+                    drop_notice(buffer.fnum);
+                    set_notice_text("Renamed on disk: " + tail_name(destination));
                 }
                 else
-                    add_notice(buffer->fnum, buffer->name, 1);
+                    add_notice(buffer.fnum, buffer.name, 1);
             }
             else if (source_now == 0)
-                add_notice(buffer->fnum, buffer->name, 1);
+                add_notice(buffer.fnum, buffer.name, 1);
         }
-        else
-            for (auto *buffer : sources)
-                add_notice(buffer->fnum, buffer->name, 1);
     }
     for (auto &buffer : tracked_buffers)
     {
-        if (buffer.name != path || directory)
+        if (directory)
+        {
+            if (buffer.name.starts_with(path + "/"))
+            {
+                auto current = xim_project_file_version(buffer.name.c_str());
+                if (current == 0) add_notice(buffer.fnum, buffer.name, 1);
+                else if (current != buffer.version) consider_reload(buffer, current);
+            }
+            continue;
+        }
+        if (buffer.name != path)
             continue;
         // Atomic saves can coalesce DELETE and CREATE for the same name.
         // A present final version is a change, not a lost in-memory copy.

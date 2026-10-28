@@ -47,6 +47,22 @@ std::string completed(const std::string &query)
     return text ? text.get() : "";
 }
 
+void wait_paths(const std::string &query, const std::string &expected)
+{
+    auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;)
+    {
+        auto actual = completed(query);
+        if (actual == expected)
+            return;
+        require(std::chrono::steady_clock::now() < until,
+            ("watcher index mismatch: " + actual).c_str());
+        pollfd event{xim_project_wake_fd(), POLLIN, 0};
+        poll(&event, 1, 20);
+        xim_project_poll();
+    }
+}
+
 void seed(std::vector<std::string> paths)
 {
     auto index = std::make_shared<Index>();
@@ -240,6 +256,20 @@ int main(int argc, char **argv)
                 rows.find('\n', meta) - meta - 1);
             require(col_text == "9000", col_text.c_str());
         }
+        // The immutable view owns painted identities. Full directory caches
+        // must remain evictable even when every directory is expanded.
+        {
+            std::map<std::string, ExplorerDir> cache;
+            cache["."].bytes = kExplorerCacheBudget;
+            cache["."].used = 1;
+            cache["expanded"].bytes = kExplorerCacheBudget;
+            cache["expanded"].used = 2;
+            explorer_cache_bytes = 2 * kExplorerCacheBudget;
+            evict_explorer_cache(cache);
+            require(explorer_cache_bytes <= kExplorerCacheBudget,
+                "expanded directory caches exceeded the retained byte budget");
+            explorer_cache_bytes = 0;
+        }
         // Explorer pages: bounded first page, deterministic order, empty
         // directories, row identity separate from display text and a page
         // token that detects a directory change between requests.
@@ -255,6 +285,7 @@ int main(int argc, char **argv)
                 std::ofstream(exp / name.str()) << "x\n";
             }
             std::ofstream(exp / "bad\tname.txt") << "tab\n";
+            std::filesystem::create_symlink("missing-target", exp / "broken-link");
             xim_project_init(exp.c_str());
             wait_scan();
             auto explorer_rows = [&]() {
@@ -420,6 +451,55 @@ int main(int argc, char **argv)
             require(deleted.find("a.txt") != std::string::npos
                     && (std::atoi(deleted.c_str()) & 4) != 0,
                 "delete event missing");
+        }
+        // Directory watches follow inodes. Renaming a subtree must rebuild
+        // its path mapping, and deleting it must remove indexed descendants.
+        {
+            auto base = fixture / "watch-tree";
+            std::filesystem::create_directories(base / "old" / "nested");
+            std::ofstream(base / "old" / "nested" / "keep.txt") << "needle\n";
+            std::ofstream(base / "hidden.tmp") << "needle hidden\n";
+            std::ofstream(base / ".gitignore") << "*.tmp\n";
+            xim_project_init(base.c_str());
+            wait_scan();
+            wait_paths("keep", "old/nested/keep.txt\n");
+            require(completed("hidden").empty(), "initial ignore rule failed");
+            std::filesystem::rename(base / "old", base / "new");
+            wait_paths("keep", "new/nested/keep.txt\n");
+            std::ofstream(base / "new" / "nested" / "fresh.txt") << "fresh\n";
+            wait_paths("fresh", "new/nested/fresh.txt\n");
+            // Modify an existing ignore file: IN_MODIFY, not just creation
+            // or rename, must invalidate the path set.
+            std::ofstream(base / ".gitignore") << "";
+            wait_paths("hidden", "hidden.tmp\n");
+            auto content = completed_content("needle", false);
+            require(content.find("keep.txt") != std::string::npos,
+                "content setup failed");
+            // Model the interval after an event but before its scan publishes.
+            // Already completed path/content results must be unavailable.
+            {
+                std::lock_guard guard(state_lock);
+                ++namespace_revision;
+            }
+            require(xim_project_pending(), "unreconciled paths reported ready");
+            require(xim_project_content_pending(),
+                "unreconciled content reported ready");
+            std::unique_ptr<char, decltype(&xim_project_free)> stale(
+                xim_project_files("hidden"), xim_project_free);
+            require(!stale, "unreconciled paths served a stale completion");
+            {
+                std::lock_guard guard(state_lock);
+                --namespace_revision;
+            }
+            auto revision = current_content.load();
+            auto outside = (fixture / "unrelated-external-file").string();
+            xim_watch_event unrelated{XIM_WATCH_MODIFY, outside.c_str(), nullptr, 0, 1};
+            project_watch_events(nullptr, &unrelated, 1, 0);
+            require(current_content.load() == revision,
+                "unrelated external file restarted project content search");
+            std::filesystem::remove_all(base / "new");
+            wait_paths("keep", "");
+            wait_paths("fresh", "");
         }
         // Explicit-file coverage works without a project root.
         {

@@ -95,6 +95,24 @@ jobs:
             --work "$PWD/build/package-test/work"
           (cd build/packages && sha256sum -c SHA256SUMS)
 
+      - name: Test Ubuntu candidate in a clean container
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package=xim-0.0.0-ubuntu24.04-x86_64
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/build/package-test/$package:/opt/xim:ro" \
+            ubuntu:24.04 bash -ec '
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                libc++1-19 libc++abi1-19 libtinfo6 python3
+              ldd /opt/xim/bin/xim | tee /tmp/dependencies.txt
+              ! grep -q "not found" /tmp/dependencies.txt
+              python3 /src/cmake/test_xim.py --binary /opt/xim/bin/xim --work /tmp/xim-work
+            '
+
       - name: Upload Ubuntu candidate
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4

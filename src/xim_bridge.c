@@ -1372,11 +1372,23 @@ xim_span_in_line(char_u *line, size_t len, size_t col, const char *needle,
 {
     if (fast)
     {
+        if (nlen == 0 || nlen > len || col > len - nlen)
+            return 0;
         size_t i = col;
-        while (i + nlen <= len)
+        size_t last = len - nlen;
+        int first = (unsigned char)needle[0];
+        if (!case_sensitive && first >= 'A' && first <= 'Z')
+            first += 32;
+        // Reject the usual first-byte mismatch without repeatedly folding
+        // the needle or entering the full comparison at every byte.
+        while (i <= last)
         {
-            if (xim_match_at(line + i, (char_u *)needle, nlen,
-                        case_sensitive, TRUE))
+            int candidate = line[i];
+            if (!case_sensitive && candidate >= 'A' && candidate <= 'Z')
+                candidate += 32;
+            if (candidate == first && (nlen == 1
+                        || xim_match_at(line + i + 1, (char_u *)needle + 1,
+                            nlen - 1, case_sensitive, TRUE)))
             {
                 *start = i;
                 return nlen;

@@ -1570,6 +1570,42 @@ def find_unicode(binary, root):
     print("Unicode find checks passed")
 
 
+def find_ascii_edges(binary, root):
+    """The byte fast path agrees with Unicode fallback and replace/undo."""
+    with tempfile.TemporaryDirectory(prefix="xim-find-edges-", dir=root) as temporary:
+        directory = Path(temporary)
+        original = "Needle needle nee need n NeEdLe x{y [{a needle\nK ſ ẞ\n"
+        (directory / "edges.txt").write_text(original)
+        session = Session(binary, directory, ("edges.txt",))
+        try:
+            for query, count in (("n", 7), ("needle", 4), ("Needle", 1),
+                                 ("{", 2), ("!", 0),
+                                 ("longer than any line in this fixture by many bytes", 0),
+                                 ("k", 1), ("K", 1)):
+                session.send(b"\x06" + query.encode())
+                marker = f" {count} {'match' if count == 1 else 'matches'}  [Smart]".encode()
+                assert wait_drain(session, lambda:
+                        b"Find: " + query.encode() in session.screen.text()
+                        and marker in session.screen.text()), session.screen.text()
+                session.send(b"\x1b")
+                assert wait_screen(session, b"Find:", present=False)
+            for query, count, replacement in (("needle", 4, "X"), ("Needle", 1, "N")):
+                session.send(b"\x08" + query.encode())
+                marker = f"{count} {'match' if count == 1 else 'matches'}  [Smart]".encode()
+                assert wait_screen(session, marker), session.screen.text()
+                session.send(b"\t" + replacement.encode() + b"\r")
+                assert wait_screen(session, b" 0 matches  ["), session.screen.text()
+                session.send(b"\x1b")
+                expected = original.replace("Needle", "N") if query == "Needle" else \
+                    "X X nee need n X x{y [{a X\nK ſ ẞ\n"
+                assert session.snapshot() == expected, session.snapshot()
+                session.send(b"\x1a")
+                assert session.snapshot() == original, session.snapshot()
+        finally:
+            session.close()
+    print("ASCII/Unicode find boundaries, replacement and undo checks passed")
+
+
 def find_highlight_window(binary, root):
     """The highlight is deleted from its own window after a window switch."""
     with tempfile.TemporaryDirectory(prefix="xim-findwin-", dir=root) as temporary:
@@ -2511,6 +2547,7 @@ if __name__ == "__main__":
     undo_redo_availability(args.binary.resolve(), args.work.resolve())
     find_highlight(args.binary.resolve(), args.work.resolve())
     find_unicode(args.binary.resolve(), args.work.resolve())
+    find_ascii_edges(args.binary.resolve(), args.work.resolve())
     find_highlight_window(args.binary.resolve(), args.work.resolve())
     find_replace(args.binary.resolve(), args.work.resolve())
     project_content_search(args.binary.resolve(), args.work.resolve())

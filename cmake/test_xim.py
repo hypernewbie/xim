@@ -544,6 +544,30 @@ def project_run(binary, root):
         print("Project root, quick open, explorer and buffer checks passed")
 
 
+def project_scratch_save(binary, root):
+    """A directory argument is a project root, never a writable document."""
+    for arguments in ((".",), ()):
+        with tempfile.TemporaryDirectory(prefix="xim-project-scratch-", dir=root) as temporary:
+            project = Path(temporary)
+            session = Session(binary, project, arguments)
+            try:
+                session.send(b"scratch\x13")
+                assert wait_screen(session, b"Save as:"), session.screen.text()[-600:]
+                session.send(b"scratch.txt\r")
+                path = project / "scratch.txt"
+                assert wait_drain(session, lambda: path.exists()
+                                  and path.read_text() == "scratch\n")
+                session.send(b"X\x13")
+                assert wait_drain(session, lambda: path.read_text() == "scratchX\n")
+                state = session.temp_home / ".state" / "xim" / "recent.json"
+                assert wait_drain(session, lambda: state.exists()
+                                  and str(path) in json.loads(state.read_text())["files"])
+                assert str(project) not in json.loads(state.read_text())["files"]
+            finally:
+                session.close()
+    print("Project scratch Save-as and directory/recents separation checks passed")
+
+
 def project_gitignore(binary, root):
     """Plan 2 closeout: .gitignore patterns, negation and inner overrides."""
     with tempfile.TemporaryDirectory(prefix="xim-gitignore-", dir=root) as temporary:
@@ -2380,6 +2404,7 @@ if __name__ == "__main__":
     args.work.mkdir(parents=True, exist_ok=True)
     run(args.binary.resolve(), args.work.resolve(), args.theme)
     project_run(args.binary.resolve(), args.work.resolve())
+    project_scratch_save(args.binary.resolve(), args.work.resolve())
     project_gitignore(args.binary.resolve(), args.work.resolve())
     project_symlinks(args.binary.resolve(), args.work.resolve())
     project_explicit_path(args.binary.resolve(), args.work.resolve())

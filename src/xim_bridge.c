@@ -58,7 +58,15 @@ xim_engine_unsaved(int all_buffers)
     int
 xim_engine_named(void)
 {
-    return curbuf->b_ffname != NULL;
+    if (curbuf->b_ffname == NULL)
+	return FALSE;
+#ifdef UNIX
+    // A directory argument names the project, not a writable document.
+    // Keep a genuinely new filename eligible for its ordinary first write.
+    if (!S_ISREG(curbuf->b_orig_mode) && !(curbuf->b_flags & BF_NEW))
+	return FALSE;
+#endif
+    return TRUE;
 }
 
 /*
@@ -98,8 +106,15 @@ xim_engine_buffer_info(int index, int *fnum, unsigned long long *tick,
 xim_engine_buffer_name(int fnum)
 {
     buf_T *buf = buflist_findnr(fnum);
-    if (buf == NULL || buf->b_ffname == NULL || !bt_normal(buf))
+    if (buf == NULL || buf->b_ffname == NULL || !bt_normal(buf)
+	    || buf->b_ml.ml_mfp == NULL)
 	return NULL;
+#ifdef UNIX
+    // Use cached read/write metadata, not a stat per buffer on every input
+    // iteration. Directory/special arguments are not recent disk files.
+    if (!S_ISREG(buf->b_orig_mode))
+	return NULL;
+#endif
     return (char *)vim_strsave(buf->b_ffname);
 }
 

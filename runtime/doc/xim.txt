@@ -104,7 +104,9 @@ Version-control internals, 'build' directories and 'node_modules' are
 excluded.  Results show project-relative paths, so duplicate basenames stay
 distinct.  Matching is case-insensitive; an exact basename match ranks first,
 then a basename prefix, then a path substring.  Only paths are indexed, never
-file contents.
+file contents.  The initial project buffer is scratch text, not a writable
+directory.  Its first Save opens Save as.  The project directory belongs in
+Recent folders, not Recent files.
 
 A query containing a slash is treated as a path: the picker checks the
 filesystem directly and offers the file even before the index arrives, and

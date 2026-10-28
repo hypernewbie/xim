@@ -30,7 +30,8 @@ Local notes are in `temp/XIM_DESIGN.md`, `temp/XIM_PLAN0.md`,
 `temp/XIM_PLAN0_REVIEW.md`, `temp/XIM_PLAN1.md`, `temp/XIM_PLAN1_REVIEW.md`,
 `temp/XIM_PLAN1_FULL_INITIAL_FAILURE.md`, `temp/XIM_PLAN2.md`,
 `temp/XIM_PLAN2_REVIEW.md`, `temp/XIM_PLAN3.md`, `temp/XIM_PLAN4.md`,
-`temp/XIM_ROADMAP.md`, `temp/XIM_PLAN5.md` and `temp/XIM_PLAN5_REVIEW.md`.
+`temp/XIM_ROADMAP.md`, `temp/XIM_PLAN5.md`, `temp/XIM_PLAN5_REVIEW.md`,
+`temp/XIM_PLAN6.md` and `temp/XIM_PLAN6_REVIEW.md`.
 Read them when present. `temp/` is gitignored, so these files can be absent
 in other checkouts. The requirements in this file do not depend on those notes.
 
@@ -104,7 +105,14 @@ behavior is documented in `runtime/doc/xim.txt` and the boundary contract in
 `cmake/XIM_INPUT.md`. Editor buffers and rendering stay on the owning thread;
 watcher, operation and recents workers use published owned results. The slice
 excludes trash, filesystem undo, recursive copy, cross-filesystem move emulation,
-multi-root workspaces and the Windows backend.
+multi-root workspaces and the Windows backend. The implementation review fixes
+are validated in `cmake/PLAN6_VALIDATION.md` (2026-10-27). They protect deleted
+copies, preserve reload formats and undo, reconcile moved watches, merge recent
+history as deltas, retain failed forms and cancel superseded continuations.
+Content search completes during unrelated filesystem churn; live results remain
+an as-read view while a coalesced follow-up runs. Missing search targets do not
+open unintended new documents. The local review record is
+`temp/XIM_PLAN6_REVIEW.md`.
 
 Keep these gates in effect for subsequent changes:
 

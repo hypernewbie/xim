@@ -1,13 +1,14 @@
 # Plan 6 local validation — 2026-10-27
 
-Source: Plan 6 stage commits `c9176daef` (explorer pages), `aaa3731e8`
-(watcher and external changes), `ee6aa2195` (file operations) and `c63242219`
-(recents, project switching and closeout fixes).  This validation record and
-the user documentation are added by the documentation commit.  Plan 5 baseline
-commit: `d8c2f80da`.  Linux UTF-8, Clang/Clang++
-22.1.8, libc++, C++26, CMake 4.3.4, Ninja 1.13.2.  Acceptance build:
-`build/dev`, Huge, RelWithDebInfo (`-O2`).  Builds, tests and timing runs were
-serial unless a parallel sanitizer gate is named.
+Source: implementation through `d86f0673d`, followed by eleven review commits
+from `731420737` through `e23f49740`. Plan 5 comparison baseline: `d8c2f80da`.
+The final gates below ran again after the last code fix. Review details are in
+`temp/XIM_PLAN6_REVIEW.md` when that local file is present.
+
+Linux UTF-8, Clang/Clang++ 22.1.8, libc++, C++26, CMake 4.3.4, Ninja 1.13.2.
+Acceptance build: `build/dev`, Huge, RelWithDebInfo (`-O2`). Builds, test runs
+and timing workloads did not overlap. Each build used up to eight compiler
+jobs.
 
 The operator authorized the live-project slice on 2026-10-27.  The work stays
 in native mode on the Linux terminal.  It does not add an integrated terminal,
@@ -42,7 +43,7 @@ cross-filesystem move emulation or multi-root workspaces.
   Reload from disk on a dirty buffer requires explicit `[r]` consent.  External
   deletion keeps the text with a missing notice.  An external rename is
   accepted only when the old name is gone and the destination version equals
-  the buffer's last accepted disk version, which avoids treating Vim
+  the buffer's last accepted disk version. This avoids treating Vim
   `writebackup` renames as external moves.
 - Native create, rename and move are buffered as a preflight/commit pair with a
   serialized worker in `xim_fsops.cpp`.  Traversal is anchored to directory
@@ -56,41 +57,65 @@ cross-filesystem move emulation or multi-root workspaces.
   `$XDG_STATE_HOME/xim` or `$HOME/.local/state/xim`.  The worker merges under
   `flock`, writes a private temporary file and renames it atomically, with
   directory mode 0700 and file mode 0600.  Missing entries remain selectable
-  only for removal.  Open folder validates its root on the operation worker
-  before the project changes; Close project stops indexing, content search and
+  only for removal. Open folder checks its root on the operation worker
+  before the project changes. Close project stops indexing, content search and
   project watching while retaining buffers, explicit-file watches and recents.
 - The menu bar is repainted as part of every overlay frame, so the active
   heading no longer depends on an unrelated tabline redraw.  Menu dumps anchor
   the terminal cursor to the last visible drop-down cell for deterministic
   screen output.
 
+## Review closeout
+
+The review reproduced and fixed idle preflight stalls, cancelled-plan ownership,
+reload format/stamp/undo errors, and loss of deleted buffer copies. Save now
+requires Recreate consent for missing paths, including hidden buffers during
+Quit. Directory watches follow moved identities, and namespace revisions prevent
+activation before reconciliation. Project directories no longer masquerade as
+writable documents or recent files.
+
+Other fixes preserve insertion columns, apply recent-state deltas without
+resurrecting removals, and retain failed forms with inline errors. Superseded
+confirmations cannot retain an invisible Busy reservation or an old Quit
+continuation. A content scan now completes during unrelated overwrites and
+create/delete activity. Its coalesced follow-up reads the latest index, and
+activation rejects a vanished target.
+
+Two serial runs exposed replace-all above its 50 ms budget. Profiling located
+repeated byte-comparison work, which `c8a435e56` removes without changing Unicode
+fallback. Benchmark waits now fail on timeout. First-page setup checks index
+publication, and the cold clock starts before process creation.
+
 ## Validation
 
-- Full `build/dev` CTest suite: 21/21 registrations pass, including eight
-  inherited Vim-script batches, inherited unit tests, the C++ link smoke test,
-  native unit tests, PTY workflows and executed screen functions.
-- Native suites pass in `build/default` (7/7) and `build/dev` (7/7).  Screen
-  functions run in `build/dev`; `build/default` skips terminal/job-dependent
-  screen coverage by design.
-- ASan/UBSan native suites: 6/6 (commands, menu, recent, fsops, project, PTY).
-  TSan native suites: 6/6 with `halt_on_error=1`.  TSan found two worker
-  synchronization defects, both fixed: explorer invalidations were applied
-  outside the state lock, and the recents worker read `stopping` and its queue
-  without the lock during shutdown.  A project test helper also required a
-  stable publish serial around each row copy to avoid accepting an older view
-  after a newer serial.
-- New screen dumps cover the explorer page after expansion, operation error,
-  permanent-delete consent, changed-on-disk and missing-on-disk status and the
-  recent-files picker.  Menu dumps now show the active heading and a
-  deterministic cursor cell.
-- Installed candidate under `build/plan6-install`: the full
-  `cmake/test_xim.py` workflow passes from `/tmp/opencode/plan6-install-work`
-  without a runtime or configuration override, including create, rename, move,
-  permanent delete, watcher reload, dirty protection, project switching,
-  recents and `xim --vim` compatibility.
-- Fresh tracked-source export (`build/plan6-clean`): build, tests and
-  generated-header routing pass.  See the gate result below.
-- No compiler warnings in successful final builds.  `git diff --check` passes.
+- Full `build/dev` test set: all 22 registrations pass, including all eight
+  inherited Vim-script batches. The final run uses two groups: 21/21 with a
+  canonical checkout-local `TMPDIR`, then `vim_scripts_i_m` 1/1 with a short
+  descriptor alias to the checkout. Native coverage is 8/8, including the new
+  watcher unit test and executed screen functions.
+- The temporary-path split addresses two environment-only failures. A long
+  `TMPDIR` wraps the command in `Test_echo_verbose_system`. An all-alias run
+  instead fails `Test_terminal_sync_shell_dir`, which expects the physical
+  shell directory. The final split satisfies both assumptions. It keeps files
+  inside the checkout and changes no inherited assertions or expected dumps.
+- ASan/UBSan native tests: 7/7 with leak detection and
+  `UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1`. TSan native tests: 7/7
+  with `TSAN_OPTIONS=halt_on_error=1`. No sanitizer reports. These builds omit
+  the terminal/job-dependent screen registration; `build/dev` runs it.
+- Screen dumps cover explorer expansion, retained operation errors, Delete and
+  Recreate consent, external-change notices, recents and active menu headings.
+  PTY regressions also cover file formats, read hooks, missing hidden buffers,
+  failed-form retry, cancelled continuations and multi-instance recent state.
+- A 60 MB PTY fixture checks content search, quick open and explorer progress
+  during sustained overwrites and create/delete activity in another subtree.
+  A separate regression checks a result deleted before watcher notification.
+- Installed candidate: `build/plan6-review/install`. The full
+  `cmake/test_xim.py` workflow passes from
+  `build/plan6-review/closeout-install-work`, without a runtime override. It
+  checks installed themes, the new regressions and `xim --vim` compatibility.
+- Tracked-source export: `build/plan6-review/closeout-clean`. Build, all 13
+  registered tests and generated-header routing pass.
+- No compiler warnings in final builds. `git diff --check` passes.
 
 ## Completed performance
 
@@ -102,37 +127,61 @@ operation samples.
 
 | Completed operation | Samples | Median ms | p90 ms | Budget ms |
 | --- | ---: | ---: | ---: | ---: |
-| Explorer movement with cached rows | 60 | 0.766 | 0.843 | 5 |
-| First explorer page, 100000-child directory | 10 | 65.244 | 68.953 | 250 |
-| External create visible, 10000-file tree | 30 | 56.646 | 56.929 | 500 |
-| New file to disk, engine and visible completion | 30 | 5.464 | 6.016 | 100 |
+| Explorer movement with cached rows | 60 | 0.672 | 0.750 | 5 |
+| First explorer page, 100000-child directory | 10 | 62.213 | 63.239 | 250 |
+| External create visible, 10000-file tree | 30 | 56.367 | 56.600 | 500 |
+| New file to disk, engine and visible completion | 30 | 2.904 | 3.172 | 100 |
 
 The external-change figure includes the watcher's 50 ms coalescing window.  It
 measures one external create, explorer refresh and rendered row; the matching
 removal is drained between samples and is not timed.  The first-page timer
 starts in a ready process immediately before Ctrl-E, so it excludes process
-launch and the initial index scan.  The file-operation timer starts at the
-final New-file Enter and ends when the opened buffer name or the Created notice
-is visible; the disk entry is checked afterwards.
+launch and the initial index scan. The file-operation timer starts before
+sending the filename plus Enter. It ends at the visible opened-buffer name or
+Created notice. The disk entry is checked afterwards.
 
 Startup and warm quick-open comparison, two serial rounds of 60 samples each,
 same 100000-path fixture and terminal:
 
 | Measurement | Plan 5 baseline p90 | Plan 6 p90 |
 | --- | ---: | ---: |
-| Warm quick-open query | 5.411 / 5.216 ms | 5.330 / 5.328 ms |
-| First accepted edit during scan | 21.402 / 21.415 ms | 21.564 / 21.459 ms |
+| Warm quick-open query | 5.155 / 5.152 ms | 5.329 / 5.287 ms |
+| First accepted edit during scan | 20.466 / 20.337 ms | 20.621 / 21.019 ms |
 
-The two rounds overlap within observed run-to-run variance; no reproducible
-regression appeared.  RSS after a completed quick-open run rose from 28924 kB
-to 29524 kB, which is consistent with the watcher, operation and recents
-workers.
+Find/replace/content comparison, two serial rounds of 30 samples each:
 
-A separate repeated-root-switch probe alternated two 200-file projects ten
-times.  RSS stayed at 15104–15360 kB, file descriptors at 8, and inotify
-watches at 2 after every switch.  The completed quick-open run also recorded 0
-idle output bytes and 0 process CPU ticks in one second and reported no
-periodic scan activity.
+| Completed operation | Baseline p90 ms | Candidate p90 ms | Budget ms |
+| --- | ---: | ---: | ---: |
+| Find, six keystrokes over 100000 lines | 41.725 / 41.588 | 33.193 / 33.394 | 60 |
+| Replace-all, 1000 matches | 48.365 / 48.988 | 38.929 / 39.033 | 50 |
+| Warm content search, 10000 files | 84.445 / 85.284 | 87.675 / 90.408 | 150 |
+
+Single first-fixture content-search samples were 120.618/121.966 ms for the
+baseline and 134.382/133.272 ms for the candidate. These are one launch per
+round, not p90 figures. They motivated two further comparisons with 30 fresh
+processes per binary and alternating launch order. Each round reuses one
+10000-file fixture with warm filesystem caches:
+
+| Process-cold content search | Baseline ms | Candidate ms |
+| --- | ---: | ---: |
+| Median, two rounds | 99.718 / 98.536 | 103.487 / 102.901 |
+| p90, two rounds | 103.225 / 103.790 | 107.884 / 105.045 |
+
+The process-cold figures include launch but do not claim cold filesystem
+caches. Old cold figures with a post-launch timer are not comparable. Raw
+samples include initial outliers as high as 557 ms and remain in the JSON.
+
+Warm content-search medians rose about 4.9%. Process-cold medians rose
+3.8–4.4%. These comparisons remain below the documented regression threshold:
+more than 10% and at least 0.25 ms in two independent median comparisons.
+All defined budgets pass. This is not a claim that the new services cost zero.
+RSS after quick open was 28924–29180 kB for the baseline and 29788 kB for the
+candidate.
+
+A final root-switch probe alternated two 200-file projects ten times. RSS
+stayed at 15104 kB, file descriptors at 8 and inotify watches at 1. Completed
+query and content-search runs recorded 0 idle output bytes and 0 process CPU
+ticks in one second. No periodic idle scan appeared.
 
 ## Boundaries
 
@@ -160,11 +209,24 @@ periodic scan activity.
   the destination version marks the old path missing instead of guessing.
 - File-operation timing covers the create path.  Rename and move share the same
   preflight, commit and engine-update path but have no separate timing gate.
-- The first-page timing excludes process startup.  Launch-to-first-edit remains
+- The first-page timing excludes process startup. Launch-to-first-edit remains
   covered by the separate startup comparison above.
+- Live content results are an as-read view, not an atomic filesystem snapshot.
+  Ordinary activity queues a follow-up while the owned scan finishes. Root or
+  ignore-scope uncertainty can still cancel work. A blocking filesystem call
+  can delay worker shutdown.
 
 ## Gate result
 
-Fresh tracked-source export (`build/plan6-clean`): passed.  The export built
-with CMake/Ninja and Clang, its registered tests passed, and generated headers
-from the export's `src/auto` were used rather than source-tree artifacts.
+Final tracked-source export (`build/plan6-review/closeout-clean`): passed.
+CMake/Ninja and Clang built the tracked sources. All 13 registered tests passed.
+Dependency checks routed generated headers through the selected candidate
+build, not stale source-tree artifacts.
+
+Local evidence is under `build/plan6-review/`: `closeout-dev-{canonical,short}.log`,
+`closeout-{asan,tsan}-native.log`, `closeout-clean.log`,
+`closeout-install-pty.log`, `closeout-live-perf.json`,
+`closeout-{project,search}-{baseline,current}-{1,2}.json`,
+`cold-comparison{,-2}.json` and `closeout-root-switch.json`.
+`closeout-perf-binaries.sha256` identifies the compared installed binaries.
+These artifacts are local evidence, not tracked product files.

@@ -340,6 +340,23 @@ std::string wire_text_decode(std::string_view text)
     return out;
 }
 
+std::string display_path(std::string_view path)
+{
+    constexpr char hex[] = "0123456789ABCDEF";
+    std::string out;
+    for (unsigned char c : path)
+    {
+        if (c < 0x20 || c == 0x7f)
+        {
+            out += "\\x";
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+        else out += static_cast<char>(c);
+    }
+    return out;
+}
+
 std::string tail_name(const std::string &path)
 {
     auto slash = path.find_last_of('/');
@@ -348,7 +365,7 @@ std::string tail_name(const std::string &path)
 
 void set_notice_text(const std::string &text)
 {
-    notice_text = text;
+    notice_text = display_path(text);
     notice_show_pending = true;
 }
 
@@ -841,7 +858,7 @@ std::vector<std::string> notice_items()
     {
         rows.push_back(std::to_string(notice.fnum) + ": "
                 + (notice.kind == 1 ? "[missing] " : "[changed] ")
-                + notice.name);
+                + display_path(notice.name));
     }
     return rows;
 }
@@ -1206,7 +1223,7 @@ bool fs_tick()
             set_notice_text(message);
             return true;
         }
-        fs_summary = summary ? summary.get() : fs_source;
+        fs_summary = display_path(summary ? summary.get() : fs_source);
         if (fs_kind == XIM_FS_DELETE)
         {
             int dirty = affected_dirty_buffers(fs_root, fs_source);
@@ -1355,12 +1372,15 @@ std::vector<std::string> recent_items(bool folders)
         std::string display = row.display;
         if (!root.empty())
         {
+            std::string relative;
             if (row.path == root)
-                display = tail_name(root);
+                relative = display_path(tail_name(root));
             else if (row.path.size() > root.size()
                     && row.path.compare(0, root.size(), root) == 0
                     && row.path[root.size()] == '/')
-                display = row.path.substr(root.size() + 1);
+                relative = display_path(row.path.substr(root.size() + 1));
+            if (!relative.empty() && relative.size() <= 64)
+                display = std::move(relative);
         }
         if (!needle.empty()
                 && lower_text(display).find(needle) == std::string::npos
@@ -1376,6 +1396,8 @@ std::string recent_status(bool folders)
 {
     if (!xim_recent_ready())
         return folders ? "Loading recent folders" : "Loading recent files";
+    const char *error = xim_recent_status();
+    if (error && *error) return error;
     const auto &rows = folders ? recent_folder_rows : recent_file_rows;
     return rows.empty()
         ? (folders ? "No recent folders" : "No recent files") : "";
@@ -1896,7 +1918,7 @@ std::string prompt_info()
     if (prompt == Action::rename_file || prompt == Action::move_file)
         return fs_source;
     if (prompt == Action::recent_files || prompt == Action::recent_folders)
-        return recent_message;
+        return recent_message.empty() ? xim_recent_status() : recent_message;
     if (prompt == Action::search_project)
         return std::string("[") + case_label() + "]";
     if (!prompt_is_find_like())
@@ -2469,9 +2491,15 @@ bool open_picker_item(Action current, const std::vector<std::string> &list,
             : std::filesystem::is_regular_file(path, error);
         if (!usable)
         {
-            recent_message = "Missing: " + path;
+            recent_message = "Missing: " + display_path(path);
             if (recent_message.size() > 72)
-                recent_message.resize(72);
+            {
+                std::size_t end = 72;
+                while (end > 0
+                        && (static_cast<unsigned char>(recent_message[end]) & 0xc0) == 0x80)
+                    --end;
+                recent_message.resize(end);
+            }
             prompt = current;
             return false;
         }
@@ -3194,7 +3222,7 @@ void render_prompt_overlay(int menu_rows)
         std::string items = recreate_error;
         if (items.empty())
             for (const auto &target : recreate_targets)
-                items += tail_name(target.name) + "\n";
+                items += display_path(tail_name(target.name)) + "\n";
         xim_engine_overlay(rendered_prompt_text.c_str(), items.c_str(), "",
                 !recreate_error.empty());
         return;

@@ -142,10 +142,14 @@ text. There is no trash, filesystem undo or cross-filesystem copy-and-delete
 move.
 
 Recent files and folders persist as JSON under `$XDG_STATE_HOME/xim` or
-`$HOME/.local/state/xim`. A dedicated worker reads and writes the file, merges
-under `flock`, writes a private temporary file and renames it atomically, with
-directory mode 0700 and file mode 0600. The owning thread consumes a published
-serial and never blocks on recents I/O. Open folder validates a root through
+`$HOME/.local/state/xim`. A dedicated worker applies queued deltas to the
+latest disk state under `flock`, writes a private temporary file and renames it
+atomically, with directory mode 0700 and file mode 0600. Read and queue byte
+budgets apply before allocation/publication. JSON strings reject malformed UTF-8,
+invalid surrogate pairs and embedded NUL paths. Unsupported schemas are not
+overwritten. Lock acquisition is bounded and shutdown-cancellable; unsaved deltas
+stay bounded for a later retry, and failures publish a picker status. The owning
+thread consumes a published serial and never blocks on recents I/O. Open folder validates a root through
 the operation worker before the current project changes. Close project stops
 the index, content search and project watches while retaining buffers,
 explicit-file watches and recents. Old picker continuations are cleared before

@@ -241,8 +241,14 @@ $XDG_STATE_HOME/xim/recent.json, or $HOME/.local/state/xim/recent.json when
 XDG_STATE_HOME is unset, empty or relative.  The state file is data, not
 Vimscript.  Reads and writes run off-thread; writes are atomic, the state
 directory is mode 0700 and the file mode 0600, and instances merge under a
-file lock.  A missing entry reports its path and can be removed from the list.
-File > Clear recent history deletes the lists.
+file lock.  Each writer applies its new actions to the latest disk state, so
+another instance's removals or Clear do not reappear from an old cached list.
+The lists hold at most 100 files, 20 folders and 256 KiB of state data.
+A missing entry reports its path and can be removed from the list.
+File > Clear recent history deletes the lists.  Malformed paths and JSON are
+not opened as filenames.  An unsupported state version is left unchanged.
+Persistence errors appear in the recent picker; a later history action retries
+pending changes.  A held file lock cannot indefinitely delay Quit.
 
 File > Open folder validates a directory off-thread and keeps the current
 project unchanged if validation fails.  File > Close project stops indexing,

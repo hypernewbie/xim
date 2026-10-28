@@ -12,6 +12,8 @@ int xim_recent_init(void);
 void xim_recent_shutdown(void);
 int xim_recent_ready(void);
 unsigned long long xim_recent_serial(void);
+/* Borrowed status for pending/failed persistence; valid until the next call. */
+const char *xim_recent_status(void);
 char *xim_recent_files(void);
 char *xim_recent_folders(void);
 void xim_recent_add_file(const char *absolute_path);

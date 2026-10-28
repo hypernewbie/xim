@@ -2278,6 +2278,26 @@ def file_operations_retention(binary, root):
     print("Deleted-buffer retention, recreate consent and dirty New-file checks passed")
 
 
+def recent_path_display(binary, root):
+    """Project-relative recent labels retain escaping and UTF-8 identity."""
+    with tempfile.TemporaryDirectory(prefix="xim-recent-path-", dir=root) as temporary:
+        project = Path(temporary)
+        path = project / "odd\t界.txt"
+        path.write_text("payload\n")
+        command = "execute 'edit ' . fnameescape('" + str(path).replace("'", "''") + "')"
+        session = Session(binary, project, (".", "-c", command), ready=b"payload")
+        try:
+            assert wait_screen(session, b"payload")
+            session.send(b"\x1bOPRecent files\r")
+            assert wait_screen(session, "odd\\x09界.txt".encode()), session.screen.text()[-800:]
+            session.send(b"odd\r")
+            session.drain(.2)
+            assert session.snapshot() == "payload\n"
+        finally:
+            session.close()
+    print("Recent path escaping and UTF-8 activation checks passed")
+
+
 def project_switch_recents(binary, root):
     """Plan 6: recents persist, projects switch and buffers survive."""
     with tempfile.TemporaryDirectory(prefix="xim-switch-", dir=root) as temporary:
@@ -2367,6 +2387,9 @@ def project_switch_recents(binary, root):
             session.send(b"\x1b[3~")
             assert wait_screen(session, b"gone.txt", present=False, timeout=5), \
                 session.screen.text()[-800:]
+            assert wait_drain(session, lambda: str(project_a / "gone.txt")
+                              not in json.loads(state_file.read_text())["files"]), \
+                "removed recent entry was merged back into disk state"
             session.send(b"\x1b")
             session.send(b"\x1bOPClear recent history\r")
             assert wait_screen(session, b"Recent history cleared", timeout=5), \
@@ -2437,6 +2460,7 @@ if __name__ == "__main__":
     file_operations(args.binary.resolve(), args.work.resolve())
     file_operations_retention(args.binary.resolve(), args.work.resolve())
     project_switch_recents(args.binary.resolve(), args.work.resolve())
+    recent_path_display(args.binary.resolve(), args.work.resolve())
     external_changes(args.binary.resolve(), args.work.resolve())
     external_directory_changes(args.binary.resolve(), args.work.resolve())
     external_reload_formats(args.binary.resolve(), args.work.resolve())

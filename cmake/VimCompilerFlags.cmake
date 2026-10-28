@@ -15,13 +15,11 @@
 # - `-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=1` is the reference's choice —
 #   `_FORTIFY_SOURCE=2` interacts badly with some legacy macros in Vim's
 #   older headers, so the build deliberately downgrades to level 1.
-set(XIM_COMPILE_FLAGS
-    -Wall
-    -Wno-deprecated-declarations
-    -D_REENTRANT
-    -U_FORTIFY_SOURCE
-    -D_FORTIFY_SOURCE=1
-)
+set(XIM_COMPILE_FLAGS -Wall -Wno-deprecated-declarations)
+if(NOT WIN32)
+    list(APPEND XIM_COMPILE_FLAGS
+        -D_REENTRANT -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=1)
+endif()
 
 # The inherited source uses MACOS_X to select Darwin-specific behavior.
 if(APPLE)
@@ -37,7 +35,7 @@ target_compile_options(xim_compile_policy INTERFACE ${XIM_COMPILE_FLAGS})
 # branch, which calls the linker directly. Skipping link.sh is intentional:
 # its only job was iterative library pruning that `--as-needed` already does.
 set(XIM_LINK_FLAGS)
-if(NOT APPLE)
+if(NOT APPLE AND NOT WIN32)
     list(APPEND XIM_LINK_FLAGS -Wl,--as-needed)
 endif()
 target_link_options(xim_compile_policy INTERFACE ${XIM_LINK_FLAGS})

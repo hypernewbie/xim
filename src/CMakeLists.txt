@@ -14,7 +14,9 @@ file(MAKE_DIRECTORY ${XIM_AUTO_DIR}/wayland)
 
 vim_generate_config_header(${XIM_AUTO_DIR} ${CMAKE_SOURCE_DIR}/src)
 
-vim_generate_osdef(${XIM_AUTO_DIR} ${CMAKE_SOURCE_DIR}/src)
+if(NOT WIN32)
+    vim_generate_osdef(${XIM_AUTO_DIR} ${CMAKE_SOURCE_DIR}/src)
+endif()
 if(XIM_WITH_WAYLAND)
     vim_generate_wayland(${XIM_AUTO_DIR}/wayland ${CMAKE_SOURCE_DIR}/src/auto/wayland)
 endif()
@@ -110,7 +112,6 @@ set(VIM_BASIC_SRC
     ops.c
     option.c
     optionstr.c
-    os_unix.c
     popupmenu.c
     popupwin.c
     profiler.c
@@ -157,6 +158,13 @@ set(VIM_BASIC_SRC
     vim9type.c
     viminfo.c
     window.c)
+
+if(WIN32)
+    list(REMOVE_ITEM VIM_BASIC_SRC pty.c)
+    list(APPEND VIM_BASIC_SRC os_win32.c os_mswin.c iscygpty.c winclip.c)
+else()
+    list(APPEND VIM_BASIC_SRC os_unix.c)
+endif()
 
 if(XIM_WITH_CHANNEL)
     list(APPEND VIM_BASIC_SRC channel.c job.c)
@@ -224,14 +232,19 @@ endif()
 
 set(VIM_FEATURE_SRC)
 set(VIM_FEATURE_INCLUDE_DIRS)
-set(XIM_SYSTEM_LIBRARIES m)
-if(NOT APPLE)
-    list(APPEND XIM_SYSTEM_LIBRARIES nsl)
+if(WIN32)
+    set(XIM_SYSTEM_LIBRARIES oldnames kernel32 advapi32 shell32 gdi32
+        comdlg32 ole32 netapi32 uuid user32 ws2_32)
+else()
+    set(XIM_SYSTEM_LIBRARIES m)
+    if(NOT APPLE)
+        list(APPEND XIM_SYSTEM_LIBRARIES nsl)
+    endif()
+    if(NOT XIM_TERMINFO_LIBRARY)
+        message(FATAL_ERROR "A terminfo library (tinfo or ncurses) is required.")
+    endif()
+    list(APPEND XIM_SYSTEM_LIBRARIES ${XIM_TERMINFO_LIBRARY})
 endif()
-if(NOT XIM_TERMINFO_LIBRARY)
-    message(FATAL_ERROR "A terminfo library (tinfo or ncurses) is required.")
-endif()
-list(APPEND XIM_SYSTEM_LIBRARIES ${XIM_TERMINFO_LIBRARY})
 if(XIM_HAVE_SELINUX)
     list(APPEND XIM_SYSTEM_LIBRARIES ${XIM_SELINUX_LIBRARY})
     list(APPEND VIM_FEATURE_INCLUDE_DIRS ${XIM_SELINUX_INCLUDE_DIR})
@@ -360,16 +373,25 @@ if(XIM_WITH_TERMINAL)
     target_include_directories(vim_core PUBLIC ${CMAKE_SOURCE_DIR}/src/libvterm/include)
 endif()
 
-target_compile_definitions(vim_core PUBLIC
-    HAVE_CONFIG_H
-    XIM_CMAKE_CONFIG)
+if(WIN32)
+    string(TOUPPER "${XIM_FEATURE_LEVEL}" XIM_FEATURE_DEFINE)
+    target_compile_definitions(vim_core PUBLIC
+        HAVE_PATHDEF HAVE_STDINT_H FEAT_${XIM_FEATURE_DEFINE}
+        $<$<BOOL:${XIM_WITH_CHANNEL}>:FEAT_JOB_CHANNEL>
+        $<$<BOOL:${XIM_WITH_TERMINAL}>:FEAT_TERMINAL>
+        $<$<BOOL:${XIM_WITH_IPV6}>:FEAT_IPV6>)
+else()
+    target_compile_definitions(vim_core PUBLIC HAVE_CONFIG_H XIM_CMAKE_CONFIG)
+endif()
 
 target_link_libraries(vim_core PUBLIC xim_compile_policy ${XIM_SYSTEM_LIBRARIES})
 
 # osdef.h is generated but not a compile input — it provides system header
 # declarations the rest of vim #includes via vim.h. Force its generation
 # before vim_core compiles.
-add_dependencies(vim_core generate_xim_osdef)
+if(NOT WIN32)
+    add_dependencies(vim_core generate_xim_osdef)
+endif()
 if(XIM_WITH_WAYLAND)
     add_dependencies(vim_core generate_xim_wayland)
 endif()

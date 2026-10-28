@@ -82,6 +82,10 @@ xim_resolve_option(WITH_WAYLAND XIM_WITH_WAYLAND_AVAILABLE
     XIM_WITH_WAYLAND)
 
 set(XIM_CHANNEL_AVAILABLE ${XIM_HAVE_POSIX_CHANNELS})
+if(WIN32)
+    # Vim's Windows channel implementation uses Winsock, not POSIX sockets.
+    set(XIM_CHANNEL_AVAILABLE TRUE)
+endif()
 if(FEAT_TINY)
     set(XIM_CHANNEL_AVAILABLE FALSE)
 endif()
@@ -90,6 +94,9 @@ xim_resolve_option(WITH_CHANNEL XIM_CHANNEL_AVAILABLE
     XIM_WITH_CHANNEL)
 
 set(XIM_IPV6_AVAILABLE ${XIM_HAVE_IPV6})
+if(WIN32)
+    set(XIM_IPV6_AVAILABLE TRUE)
+endif()
 if(NOT XIM_WITH_CHANNEL)
     set(XIM_IPV6_AVAILABLE FALSE)
 endif()

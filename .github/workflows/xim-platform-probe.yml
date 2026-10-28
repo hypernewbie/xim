@@ -73,14 +73,14 @@ jobs:
           cmake --build build/platform-probe --target xim_fsops_test xim_file_stat_test --parallel 4
           ctest --test-dir build/platform-probe -R '^xim_(fsops|file_stat)$' --output-on-failure
 
-      # Collect independent compile failures in one Darwin bring-up run.
+      # Collect independent compile failures in one platform bring-up run.
       # This remains a failing build when any target fails.
-      - name: Build macOS (report all compile failures)
-        if: runner.os == 'macOS'
+      - name: Build macOS and Windows (report all compile failures)
+        if: runner.os != 'Linux'
         run: cmake --build build/platform-probe --parallel 4 -- -k 0
 
       - name: Build
-        if: runner.os != 'macOS'
+        if: runner.os == 'Linux'
         run: cmake --build build/platform-probe --parallel 4
 
       - name: Test native editor

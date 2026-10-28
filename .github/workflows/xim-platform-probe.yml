@@ -4,6 +4,9 @@ name: Xim native platform probe
 # and pass native tests before it can produce a release artifact.
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - release/platform-bringup
 
 permissions:
   contents: read

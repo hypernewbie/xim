@@ -7036,7 +7036,7 @@ select_eintr:
 # endif // HAVE_SELECT
 
         if (xim_woke)
-            break; // completion belongs to the top-level native controller
+            return result; // completion belongs to the top-level native controller
 
 # ifdef MAY_LOOP
 	if (finished || msec == 0)

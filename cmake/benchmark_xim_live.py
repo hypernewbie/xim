@@ -75,10 +75,11 @@ def build_wide_directory(directory, files=100000):
 
 def open_explorer(session, expected):
     session.send(b"\x05")  # Ctrl-E
-    wait_fast(session, lambda: b"Explorer:" in session.screen.text()
+    assert wait_fast(session, lambda: b"Explorer:" in session.screen.text()
               and expected in session.screen.text()
-              and marker_line(session.screen.text()) is not None)
-    wait_fast(session, lambda: b"Refreshing explorer" not in session.screen.text())
+              and marker_line(session.screen.text()) is not None), session.screen.text()
+    assert wait_fast(session,
+              lambda: b"Refreshing explorer" not in session.screen.text()), session.screen.text()
 
 
 def measure_movement(session, runs):
@@ -88,7 +89,8 @@ def measure_movement(session, runs):
     for _ in range(runs):
         started = time.perf_counter_ns()
         session.send(b"\x1b[B")  # Down
-        wait_fast(session, lambda: marker_line(session.screen.text()) != previous)
+        assert wait_fast(session, lambda: marker_line(session.screen.text())
+                not in (None, previous)), session.screen.text()
         samples.append((time.perf_counter_ns() - started) / 1e6)
         current = marker_line(session.screen.text())
         assert current is not None and current != previous, \
@@ -102,13 +104,22 @@ def measure_first_page(binary, wide, runs):
     for _ in range(runs):
         session = Session(binary, wide, (".",))
         try:
-            # Wait for the initial project scan label to settle; the timer
-            # still covers only opening and rendering the first page.
-            wait_fast(session, lambda: b"Xim" in session.screen.text(), timeout=10)
+            # A current quick-open result proves index publication. This
+            # does not populate the independent explorer directory cache.
+            session.send(b"\x10file_000000.txt")
+            assert wait_fast(session,
+                    lambda: b"Files: file_000000.txt" in session.screen.text()
+                    and b"> file_000000.txt" in session.screen.text(),
+                    timeout=30), session.screen.text()
+            session.send(b"\x1b")
+            assert wait_fast(session,
+                    lambda: b"Files:" not in session.screen.text()), session.screen.text()
+            assert b"file_000000.txt" not in session.screen.text()
             started = time.perf_counter_ns()
             session.send(b"\x05")
-            wait_fast(session, lambda: b"Explorer:" in session.screen.text()
-                      and b"file_000000.txt" in session.screen.text(), timeout=10)
+            assert wait_fast(session, lambda: b"Explorer:" in session.screen.text()
+                      and b"file_000000.txt" in session.screen.text(),
+                      timeout=10), session.screen.text()
             samples.append((time.perf_counter_ns() - started) / 1e6)
         finally:
             session.close()
@@ -121,15 +132,16 @@ def measure_external_change(session, project, runs, token):
         name = f"000_external_{token}_{index:02}.txt"
         started = time.perf_counter_ns()
         (project / name).write_text("external\n")
-        wait_fast(session, lambda: name.encode() in session.screen.text()
-                  and b"Refreshing explorer" not in session.screen.text())
+        assert wait_fast(session, lambda: name.encode() in session.screen.text()
+                  and b"Refreshing explorer" not in session.screen.text()), session.screen.text()
         assert name.encode() in session.screen.text(), \
             "external create did not reach the visible explorer"
         samples.append((time.perf_counter_ns() - started) / 1e6)
         # Remove the entry before the next sample so the first page and the
         # selection stay at the top; the removal itself is not timed.
         (project / name).unlink()
-        wait_fast(session, lambda: name.encode() not in session.screen.text())
+        assert wait_fast(session,
+                lambda: name.encode() not in session.screen.text()), session.screen.text()
     return samples
 
 
@@ -141,8 +153,8 @@ def create_once(session, project, name, timed):
     session.wait(b"New file:")
     started = time.perf_counter_ns()
     session.send(name.encode() + b"\r")
-    wait_fast(session, lambda: (b"Xim " + name.encode()) in session.screen.text()
-              or (b"Created " + name.encode()) in session.screen.text())
+    assert wait_fast(session, lambda: (b"Xim " + name.encode()) in session.screen.text()
+              or (b"Created " + name.encode()) in session.screen.text()), session.screen.text()
     assert (project / name).exists(), "created file missing on disk"
     assert (b"Xim " + name.encode()) in session.screen.text() \
         or (b"Created " + name.encode()) in session.screen.text(), \
@@ -154,7 +166,8 @@ def measure_create(session, project, runs, token):
     samples = []
     # The picker owns keys while it is open; return to the document first.
     session.send(b"\x1b")
-    wait_fast(session, lambda: b"Explorer:" not in session.screen.text())
+    assert wait_fast(session,
+            lambda: b"Explorer:" not in session.screen.text()), session.screen.text()
     # One untimed operation absorbs first-use allocation and filesystem
     # writeback from fixture creation; the plan requires no overlapping work.
     create_once(session, project, f"op_{token}_warm.txt", False)

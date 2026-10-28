@@ -127,8 +127,8 @@ python3 cmake/benchmark_xim_search.py --binary build/dev/src/xim \
 
 It builds a 100000-line file and a 10000-file project, then measures the
 find keystrokes-to-highlight, replace-all, cold and warm project-search
-completion, and a one-second idle sample. `--self-test` runs one sample of
-each. Run it serially.
+completion, and a one-second idle sample. The cold timer starts before process
+creation. `--self-test` runs one sample of each. Run it serially.
 
 For Plan 6 explorer, external-change and file-operation completion:
 
@@ -140,7 +140,9 @@ python3 cmake/benchmark_xim_live.py --binary build/dev/src/xim \
 It creates a 10000-file project and a 100000-child directory once, then
 measures cached explorer movement, the first explorer page, an external create
 becoming visible and a New-file completion. The first-page samples start a
-fresh process per sample; the other samples use one warm process. Fixture
+fresh process per sample and wait for a published quick-open result before
+timing Ctrl-E. The explorer directory cache remains empty. All completion
+waits must succeed. The other samples use one warm process. Fixture
 writeback is flushed and one untimed create warms the operation path, so no
 benchmark overlaps fixture creation. Run it serially.
 

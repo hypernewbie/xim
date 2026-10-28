@@ -122,11 +122,11 @@ def measure_replace(binary, directory, query, replacement, runs):
 def measure_project(binary, directory, query, runs):
     # The cold sample includes process start and argument-file load, so the
     # timer begins before the session exists.
+    start = time.monotonic()
     session = Session(binary, directory)
     samples = []
     cold = None
     try:
-        start = time.monotonic()
         session.send(b"\x1bOP")
         session.send("Search project")
         session.send(b"\r")

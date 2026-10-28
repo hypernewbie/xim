@@ -76,8 +76,10 @@ reachable by keyboard.
 
 Native defaults precede explicit configuration. No implicit native config
 path exists yet; use `-u`. Runtime lookup uses the executable's sibling build
-runtime or prefix-relative installed runtime, with VIMRUNTIME overrides.
-The current executable-location implementation targets Linux (`/proc/self/exe`).
+runtime or prefix-relative installed runtime, with VIMRUNTIME overrides. Before
+initializing runtimepath, the main thread uses Vim's executable-path and
+`mch_can_exe()` logic, including PATH lookup. The native controller resolves symlinks
+and selects the runtime directory; Vim sets the environment variable.
 
 Engine adapters remain synchronous and main-thread-only. The project module
 has a scanner with an owned root and a path matcher with an immutable shared

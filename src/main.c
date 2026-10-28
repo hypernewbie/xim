@@ -155,6 +155,34 @@ main
      */
     common_init_1();
 
+#  ifdef XIM_NATIVE_ENTRY
+    // Reuse Vim's platform executable lookup, including PATH resolution,
+    // before the initial runtimepath is constructed.
+    {
+	char_u *configured_runtime = mch_getenv((char_u *)"VIMRUNTIME");
+	char_u *executable = NULL;
+
+	if (configured_runtime == NULL || *configured_runtime == NUL)
+	{
+	    // Prefer Vim's actual executable path where the OS provides one.
+	    char_u *progpath;
+
+	    set_progpath((char_u *)argv[0]);
+	    progpath = get_vim_var_str(VV_PROGPATH);
+	    if (progpath != NULL && *progpath != NUL
+		    && mch_can_exe(progpath, &executable, TRUE) > 0
+		    && executable != NULL)
+	    {
+		const char *runtime = xim_runtime_for_executable((char *)executable);
+
+		if (runtime != NULL)
+		    vim_setenv((char_u *)"VIMRUNTIME", (char_u *)runtime);
+	    }
+	}
+	vim_free(executable);
+    }
+#  endif
+
 #  if defined(STARTUPTIME) || defined(FEAT_JOB_CHANNEL)
     // Need to find "--startuptime" and "--log" before actually parsing
     // arguments.

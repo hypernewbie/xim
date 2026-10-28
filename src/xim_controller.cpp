@@ -2718,18 +2718,6 @@ extern "C" void xim_prepare_args(int *argc, char ***argv)
         if (options && arg == "--vim") compat = true;
     }
     xim_native_mode = !compat;
-    auto configured_runtime = std::getenv("VIMRUNTIME");
-    if (!configured_runtime || !*configured_runtime)
-    {
-        std::error_code error;
-        auto executable = std::filesystem::canonical("/proc/self/exe", error);
-        if (error) executable = std::filesystem::absolute((*argv)[0], error);
-        auto runtime = executable.parent_path().parent_path() / "runtime";
-        if (!std::filesystem::is_directory(runtime, error))
-            runtime = executable.parent_path().parent_path() / "share/xim/runtime";
-        if (std::filesystem::is_directory(runtime, error))
-            setenv("VIMRUNTIME", runtime.c_str(), 1);
-    }
     args.push_back((*argv)[0]);
     if (!compat)
     {
@@ -2746,6 +2734,21 @@ extern "C" void xim_prepare_args(int *argc, char ***argv)
     *argc = static_cast<int>(args.size());
     args.push_back(nullptr);
     *argv = args.data();
+}
+
+extern "C" const char *xim_runtime_for_executable(const char *path)
+{
+    if (path == nullptr || *path == '\0') return nullptr;
+    std::error_code error;
+    auto executable = std::filesystem::canonical(path, error);
+    if (error) return nullptr;
+    auto runtime = executable.parent_path().parent_path() / "runtime";
+    if (!std::filesystem::is_directory(runtime, error))
+        runtime = executable.parent_path().parent_path() / "share/xim/runtime";
+    if (!std::filesystem::is_directory(runtime, error)) return nullptr;
+    static std::string result;
+    result = runtime.string();
+    return result.c_str();
 }
 
 extern "C" unsigned xim_menu_capabilities() { return capabilities_now(); }

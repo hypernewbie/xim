@@ -2592,6 +2592,39 @@ def project_switch_recents(binary, root):
     print("Recent-state, project switch and buffer retention checks passed")
 
 
+def runtime_lookup(binary, work):
+    """Installed/build runtime lookup resolves PATH and executable symlinks."""
+    build_runtime = binary.parent.parent / "runtime"
+    expected = build_runtime if build_runtime.is_dir() else binary.parent.parent / "share/xim/runtime"
+    assert expected.is_dir(), f"missing runtime for {binary}"
+    with tempfile.TemporaryDirectory(prefix="runtime-lookup-", dir=work) as temporary:
+        root = Path(temporary)
+        bindir = root / "bin"
+        bindir.mkdir()
+        (bindir / "xim-portable-test").symlink_to(binary)
+        env = os.environ.copy()
+        for name in ("VIM", "VIMRUNTIME", "VIMINIT", "EXINIT"):
+            env.pop(name, None)
+        env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+        command = ["xim-portable-test", "--vim", "-u", "NONE", "-i", "NONE",
+                   "-n", "-X", "-es", "-c",
+                   "call writefile([$VIMRUNTIME], 'resolved')", "-c", "qall!"]
+        subprocess.run(command, cwd=root, env=env, check=True, timeout=20)
+        assert Path((root / "resolved").read_text().strip()).resolve() == expected.resolve()
+        if Path("/proc/self/exe").exists():
+            # Linux resolves the real process path even with a custom argv[0].
+            custom_argv = ["not-an-executable", *command[1:]]
+            subprocess.run(custom_argv, executable=str(binary), cwd=root, env=env,
+                           check=True, timeout=20)
+            assert Path((root / "resolved").read_text().strip()).resolve() == expected.resolve()
+        override = root / "override"
+        override.mkdir()
+        env["VIMRUNTIME"] = str(override)
+        subprocess.run(command, cwd=root, env=env, check=True, timeout=20)
+        assert (root / "resolved").read_text().strip() == str(override)
+    print("PATH, symlink and VIMRUNTIME override checks passed")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -2599,6 +2632,7 @@ if __name__ == "__main__":
     parser.add_argument("--theme", type=Path, action="append", default=[])
     args = parser.parse_args()
     args.work.mkdir(parents=True, exist_ok=True)
+    runtime_lookup(args.binary.resolve(), args.work.resolve())
     run(args.binary.resolve(), args.work.resolve(), args.theme)
     project_run(args.binary.resolve(), args.work.resolve())
     project_scratch_save(args.binary.resolve(), args.work.resolve())

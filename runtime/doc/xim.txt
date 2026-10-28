@@ -1,5 +1,5 @@
 *xim.txt*	Native non-modal terminal editing
-					Last change: 2026 Oct 27
+					Last change: 2026 Oct 28
 
 Xim's native input layer uses the existing Vim text engine.  This document
 describes the native editing and project workflow.
@@ -16,7 +16,8 @@ implicit Xim configuration file in this milestone.  Native defaults are set
 before explicit configuration and --cmd arguments.
 
 The build stages its matching runtime alongside the executable.  An installed
-build uses share/xim/runtime relative to its installation prefix.  A nonempty
+build uses share/xim/runtime relative to its installation prefix.  Runtime
+discovery resolves executable symlinks and searches PATH.  A nonempty
 VIMRUNTIME environment variable overrides runtime discovery.
 
 Use `xim --vim` or the `vim` executable for the inherited modal interface.

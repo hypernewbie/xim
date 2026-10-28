@@ -16,6 +16,7 @@ enum xim_modifier { XIM_SHIFT = 1, XIM_CTRL = 2, XIM_ALT = 4 };
 extern "C" {
 #endif
 void xim_prepare_args(int *argc, char ***argv);
+const char *xim_runtime_for_executable(const char *path);
 void xim_initialize(void);
 void xim_step(void);
 void xim_dispatch(int key, int modifiers);

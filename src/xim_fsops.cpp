@@ -19,11 +19,15 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <stdio.h>  // renameatx_np and RENAME_EXCL
+#else
+#include <sys/syscall.h>
 #ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE (1 << 0)
+#endif
 #endif
 
 namespace
@@ -765,8 +769,13 @@ bool perform_commit(Plan &plan, Result &result)
         return false;
     }
     const std::string &destination_leaf = plan.destination_parts.back();
+#ifdef __APPLE__
+    int status = renameatx_np(source_fd, source_leaf.c_str(),
+            destination_fd, destination_leaf.c_str(), RENAME_EXCL);
+#else
     long status = syscall(SYS_renameat2, source_fd, source_leaf.c_str(),
             destination_fd, destination_leaf.c_str(), RENAME_NOREPLACE);
+#endif
     int saved = errno;
     close(source_fd);
     close(destination_fd);

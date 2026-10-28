@@ -164,6 +164,21 @@ int main(int argc, char **argv)
                 && std::filesystem::exists(root + "/c.txt"),
             "rename failure damaged a file");
         xim_fsops_ack(id);
+
+        // The destination can appear after preflight. Commit must not replace
+        // it or remove the source, even when the initial check succeeded.
+        id = submit(XIM_FS_RENAME, root, "b.txt", "race.txt");
+        require(xim_fsops_success(id), error(id).c_str());
+        std::ofstream(root + "/race.txt") << "other\n";
+        commit_and_wait(id);
+        require(!xim_fsops_success(id), "commit replaced a racing destination");
+        std::string source_text, destination_text;
+        std::getline(std::ifstream(root + "/b.txt"), source_text);
+        std::getline(std::ifstream(root + "/race.txt"), destination_text);
+        require(source_text == "alpha" && destination_text == "other",
+            "collision damaged source or destination contents");
+        xim_fsops_ack(id);
+
         id = submit(XIM_FS_RENAME, root, "b.txt", "b.txt");
         require(!xim_fsops_success(id), "self rename accepted");
         xim_fsops_ack(id);

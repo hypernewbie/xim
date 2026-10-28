@@ -67,6 +67,12 @@ jobs:
       - name: Configure
         run: cmake -S . -B build/platform-probe -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 
+      - name: Test Darwin filesystem operations
+        if: runner.os == 'macOS'
+        run: |
+          cmake --build build/platform-probe --target xim_fsops_test --parallel 4
+          ctest --test-dir build/platform-probe -R '^xim_fsops$' --output-on-failure
+
       - name: Build
         run: cmake --build build/platform-probe --parallel 4
 

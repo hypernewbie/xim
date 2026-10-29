@@ -1,8 +1,9 @@
 # Native project portability audit
 
-Status: partial bring-up. This audit covers the native project services and
-runtime lookup, not every Xim feature. It does not claim macOS or Windows
-support. The full native build and installed workflow must pass on each target.
+Status: Linux and macOS release candidates pass native builds, tests and
+installed workflows. This audit covers the native project services and runtime
+lookup, not every Xim feature. It does not claim Windows support. The tested
+targets are Ubuntu 24.04 x86-64 and Intel macOS 15.
 
 ## Reuse of Vim facilities
 
@@ -16,7 +17,8 @@ initial runtimepath setup. The controller resolves symlinks and selects the
 build or installed runtime. Vim's `vim_setenv()` sets the environment. The
 native controller no longer reads `/proc/self/exe` directly. The Linux PTY
 suite tests a PATH symlink, custom `argv[0]` and an explicit override.
-Windows and macOS runtime discovery still need native installed-build tests.
+Linux and macOS runtime discovery passed native installed-build tests. Windows
+still needs an installed-build test.
 
 Vim provides file-change checks through `check_timestamps()` and
 `FileChangedShell`. These run as editor operations. Xim's watcher adds
@@ -35,9 +37,10 @@ worker ownership boundary.
 
 ## Changes and remaining work
 
-- Linux uses an inotify watcher. A Darwin watcher and a Windows watcher are
-  not implemented. They must report event loss and allow reconciliation.
-  Silent polling or disabling the watcher is not an equivalent release.
+- Linux uses inotify. macOS uses FSEvents. Both backends report event loss and
+  allow project reconciliation. Darwin path updates complete before the watch
+  API returns, so edits made just after watch startup are not missed. Windows
+  still needs a watcher.
 - Atomic move uses Linux `renameat2(RENAME_NOREPLACE)` and Darwin
   `renameatx_np(RENAME_EXCL)`. Both use anchored directory descriptors.
   The tests create a destination after preflight and check both file contents.
@@ -51,31 +54,38 @@ worker ownership boundary.
   the Windows ABI. The native Xim target still needs Windows implementations
   for its watcher, filesystem operations, project scanner, recents and input
   wake. Its PTY test harness also needs a Windows equivalent.
-- The existing macOS and Windows CI workflows build inherited Vim, not the
-  native Xim target. The separate `xim-platform-probe.yml` runs Xim checks.
-  Its macOS and Windows jobs remain red until native builds and tests pass.
+- The inherited macOS and Windows CI workflows build Vim, not native Xim. The
+  separate `xim-platform-probe.yml` tests Ubuntu and macOS Xim builds and
+  packages. Windows remains deferred.
 
 ## Evidence and limits
 
-GitHub Actions run `40794692110` passed the Ubuntu native and extracted
-archive tests, including a clean Ubuntu container. On macOS it passed the
-independent file-operation and file-identity tests. A keep-going build found
-no other compile failure beyond the inotify source. Linking and runtime tests
-still need the watcher. On Windows the inherited engine built and its focused
-unit tests passed. Windows file identity, native command and menu tests also
-passed. The full Windows native build still failed on the services above.
-The Linux development run passed all 23 registered tests across the two
-temporary-path groups before the Windows changes. A later clean tracked-source
-export passed 14/14. The native ASan/UBSan and TSan suites each passed 8/8.
-The selected builds produced no new warnings.
+GitHub Actions run `40825896789` passed for Ubuntu and macOS. Ubuntu 24.04
+x86-64 passed all 8 native tests. The extracted package passed its PTY checks
+on the runner and in a clean Ubuntu 24.04 container. The container installed
+the listed runtime libraries and Python. The test confirmed `xim --version`,
+runtime lookup, editing, project operations and Vim compatibility. The
+SHA-256 check passed.
+
+Intel macOS 15 passed all 8 native tests and both isolated file-stat and
+filesystem-operation tests. The extracted package passed the same PTY workflow
+and checksum check. `otool -L` found only macOS system libraries and the
+bundled Pixman library; neither binary links to Homebrew. Apple has not
+notarized this package.
+
+The candidate artifacts are available from this Actions run:
+
+- [Ubuntu 24.04 x86-64](https://github.com/hypernewbie/xim/actions/runs/40825896789/artifacts/12877036603)
+- [Intel macOS 15](https://github.com/hypernewbie/xim/actions/runs/40825896789/artifacts/12876878225)
+
+These are Actions artifacts, not a published GitHub Release. They do not
+include a Windows build. Windows file identity, native commands and menus have
+isolated passing tests, but its full native build still fails on POSIX-only
+project, filesystem, recents, watcher and input-wake code.
 
 Two serial 30-sample Linux comparisons measured completed quick-open and first
 accepted edit on a 100000-path fixture. Baseline quick-open medians were 5.012
 and 4.862 ms. Candidate medians were 4.951 and 4.939 ms. Baseline first-edit
 medians were 20.727 and 20.631 ms. Candidate medians were 20.387 and 20.324 ms.
-These measurements precede the final null guard. They do not establish macOS
-or Windows performance, or the project's 20x target.
-
-The macOS and Windows ports require native regression tests, clean tracked
-builds, installed workflows and performance checks before release. The Ubuntu
-archive in Actions is a candidate, not a published release.
+These measurements predate the final null guard. They do not establish macOS
+performance or the project's 20x target.

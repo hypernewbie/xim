@@ -136,10 +136,8 @@ jobs:
             "$PWD/build/packages/$package/bin/xim"
           install_name_tool -id '@rpath/libpixman-1.0.dylib' \
             "$PWD/build/packages/$package/lib/libpixman-1.0.dylib"
-          pixman_license="$(find "$pixman_prefix/share/doc" -maxdepth 3 \
-            -type f \( -iname COPYING -o -iname LICENSE \) -print -quit)"
-          test -n "$pixman_license"
-          cp "$pixman_license" "$PWD/build/packages/$package/lib/PIXMAN-LICENSE.txt"
+          cp cmake/PIXMAN_LICENSE.txt \
+            "$PWD/build/packages/$package/lib/PIXMAN-LICENSE.txt"
           tar -C build/packages -czf "build/packages/$package.tar.gz" "$package"
           (cd build/packages && shasum -a 256 "$package.tar.gz" > SHA256SUMS)
           mkdir -p build/package-test

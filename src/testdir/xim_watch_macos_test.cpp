@@ -17,6 +17,7 @@ struct Event
     int kind;
     bool directory;
     std::string path;
+    std::string other;
 };
 
 std::mutex lock;
@@ -36,7 +37,8 @@ void capture(void *, const xim_watch_event *batch, std::size_t count, int flags)
     event_flags |= flags;
     for (std::size_t i = 0; i < count; ++i)
         events.push_back({batch[i].kind, batch[i].is_directory != 0,
-                batch[i].path == nullptr ? "" : batch[i].path});
+                batch[i].path == nullptr ? "" : batch[i].path,
+                batch[i].other == nullptr ? "" : batch[i].other});
     changed.notify_all();
 }
 
@@ -99,8 +101,28 @@ int main(int argc, char **argv)
         require(wait_for(outside_text, XIM_WATCH_MODIFY),
                 "explicit open-file modify event was not delivered");
 
-        std::filesystem::remove(project_file);
-        require(wait_for(project_file_text, XIM_WATCH_DELETE),
+        require(xim_watch_watch_file(project_file_text.c_str()),
+                "project file identity watch failed");
+        auto renamed_file = project / "renamed.txt";
+        std::filesystem::rename(project_file, renamed_file);
+        auto renamed_text = renamed_file.string();
+        auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        bool paired_move = false;
+        {
+            std::unique_lock guard(lock);
+            paired_move = changed.wait_until(guard, until, [&] {
+                for (const auto &event : events)
+                    if (event.path == renamed_text
+                            && event.other == project_file_text
+                            && (event.kind & XIM_WATCH_MOVE) != 0)
+                        return true;
+                return false;
+            });
+        }
+        require(paired_move, "project rename did not pair its source and destination");
+
+        std::filesystem::remove(renamed_file);
+        require(wait_for(renamed_text, XIM_WATCH_DELETE),
                 "project delete event was not delivered");
         {
             std::lock_guard guard(lock);

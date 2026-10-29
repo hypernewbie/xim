@@ -36,6 +36,15 @@ constexpr unsigned kProjectMask = IN_CREATE | IN_DELETE | IN_MODIFY | IN_ATTRIB
     | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR;
 #endif
 
+#ifdef __APPLE__
+struct PathIdentity
+{
+    dev_t device;
+    ino_t inode;
+    bool directory;
+};
+#endif
+
 struct WatchInfo
 {
     std::string path;
@@ -79,6 +88,10 @@ std::unordered_map<int, WatchInfo> watches;
 std::map<std::string, int> watch_paths;
 std::map<std::string, std::set<std::string>> explicit_names;
 std::string project_root;
+#ifdef __APPLE__
+std::map<std::string, PathIdentity> known_identities;
+std::vector<std::string> configured_fsevent_roots;
+#endif
 std::string failure;
 bool partial = false;
 #ifndef __APPLE__
@@ -110,6 +123,24 @@ std::string base_name(std::string_view path)
         return std::string(path);
     return std::string(path.substr(slash + 1));
 }
+
+#ifdef __APPLE__
+bool path_identity(const std::string &path, PathIdentity &result)
+{
+    struct stat info;
+    if (lstat(path.c_str(), &info) != 0)
+        return false;
+    if (S_ISLNK(info.st_mode))
+    {
+        struct stat target;
+        if (stat(path.c_str(), &target) != 0)
+            return false;
+        info = target;
+    }
+    result = {info.st_dev, info.st_ino, S_ISDIR(info.st_mode)};
+    return true;
+}
+#endif
 
 unsigned long long stat_version(const std::string &path, bool *is_directory)
 {
@@ -153,6 +184,9 @@ bool add_watch_locked(const std::string &path, bool project,
         auto &info = watches.at(found->second);
         if (info.device == identity.st_dev && info.inode == identity.st_ino)
         {
+#ifdef __APPLE__
+            known_identities[path] = {identity.st_dev, identity.st_ino, true};
+#endif
             if (project)
                 info.project = true;
             if (!name.empty())
@@ -190,6 +224,9 @@ bool add_watch_locked(const std::string &path, bool project,
         info.names.insert(name);
     watches.emplace(wd, std::move(info));
     watch_paths.emplace(path, wd);
+#ifdef __APPLE__
+    known_identities[path] = {identity.st_dev, identity.st_ino, true};
+#endif
     return true;
 }
 
@@ -201,6 +238,9 @@ void remove_watch_locked(int wd)
 #ifndef __APPLE__
     if (notify_fd >= 0)
         inotify_rm_watch(notify_fd, wd);
+#endif
+#ifdef __APPLE__
+    known_identities.erase(found->second.path);
 #endif
     watch_paths.erase(found->second.path);
     watches.erase(found);
@@ -481,7 +521,7 @@ void watcher_loop()
 #endif
 
 #ifdef __APPLE__
-void update_fsevents_locked()
+void update_fsevents_locked(bool force = false)
 {
     std::vector<std::string> roots;
     if (!project_root.empty())
@@ -498,22 +538,34 @@ void update_fsevents_locked()
     }
     std::sort(roots.begin(), roots.end());
     roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+    if (!force && roots == configured_fsevent_roots)
+        return;
     std::vector<const char *> paths;
     paths.reserve(roots.size());
     for (const auto &root : roots)
         paths.push_back(root.c_str());
     if (!xim_darwin_fsevents_set_paths(paths.data(), paths.size()))
         set_failure("event stream update failed");
+    else
+        configured_fsevent_roots = std::move(roots);
 }
 
 extern "C" void
 xim_darwin_fsevents_events(std::size_t count, const char *const paths[],
         const std::uint32_t event_flags[], std::uint32_t stream_flags)
 {
-    std::vector<std::string> owned_paths;
-    std::vector<xim_watch_event> events;
-    owned_paths.reserve(std::min(count, kMaxBatchPaths));
-    events.reserve(std::min(count, kMaxBatchPaths));
+    struct EventRecord
+    {
+        std::string path;
+        PathIdentity prior{};
+        PathIdentity current{};
+        int kind = 0;
+        bool directory = false;
+        bool exists = false;
+        bool prior_valid = false;
+    };
+    std::vector<EventRecord> records;
+    records.reserve(std::min(count, kMaxBatchPaths));
     std::size_t bytes = 0;
     int flags = (stream_flags & XIM_DARWIN_STREAM_DROPPED)
         ? XIM_WATCH_OVERFLOW : 0;
@@ -528,53 +580,124 @@ xim_darwin_fsevents_events(std::size_t count, const char *const paths[],
         std::uint32_t current = event_flags[i];
         if (paths[i] == nullptr)
             continue;
-        std::string path(paths[i]);
-        if (!root.empty() && path == root
+        EventRecord record;
+        record.path = paths[i];
+        if (!root.empty() && record.path == root
                 && (current & XIM_DARWIN_ROOT_CHANGED))
             flags |= XIM_WATCH_ROOT_LOST;
-        bool inside_project = !root.empty() && (path == root
-            || (path.starts_with(root)
-                && (root == "/" || (path.size() > root.size()
-                    && path[root.size()] == '/'))));
+        bool inside_project = !root.empty() && (record.path == root
+            || (record.path.starts_with(root)
+                && (root == "/" || (record.path.size() > root.size()
+                    && record.path[root.size()] == '/'))));
         bool explicitly_watched = false;
         {
             std::lock_guard guard(lock);
-            auto parent_names = explicit_names.find(parent_path(path));
+            auto parent_names = explicit_names.find(parent_path(record.path));
             explicitly_watched = parent_names != explicit_names.end()
-                && parent_names->second.contains(base_name(path));
-            if (explicit_names.contains(path))
+                && parent_names->second.contains(base_name(record.path));
+            if (explicit_names.contains(record.path))
                 explicitly_watched = true;
+            auto known = known_identities.find(record.path);
+            if (known != known_identities.end())
+            {
+                record.prior = known->second;
+                record.prior_valid = true;
+            }
         }
         if (!inside_project && !explicitly_watched)
             continue;
 
-        int kind = 0;
-        if (current & XIM_DARWIN_ITEM_CREATED) kind |= XIM_WATCH_CREATE;
-        if (current & XIM_DARWIN_ITEM_REMOVED) kind |= XIM_WATCH_DELETE;
-        if (current & XIM_DARWIN_ITEM_RENAMED) kind |= XIM_WATCH_MOVE;
-        if (current & XIM_DARWIN_ITEM_MODIFIED) kind |= XIM_WATCH_MODIFY;
-        if (current & XIM_DARWIN_ITEM_ATTRIB) kind |= XIM_WATCH_ATTRIB;
-        if (kind == 0)
+        if (current & XIM_DARWIN_ITEM_CREATED) record.kind |= XIM_WATCH_CREATE;
+        if (current & XIM_DARWIN_ITEM_REMOVED) record.kind |= XIM_WATCH_DELETE;
+        if (current & XIM_DARWIN_ITEM_RENAMED) record.kind |= XIM_WATCH_MOVE;
+        if (current & XIM_DARWIN_ITEM_MODIFIED) record.kind |= XIM_WATCH_MODIFY;
+        if (current & XIM_DARWIN_ITEM_ATTRIB) record.kind |= XIM_WATCH_ATTRIB;
+        if (record.kind == 0)
             continue;
-        bool directory = (current & XIM_DARWIN_ITEM_IS_DIR) != 0;
-        auto version = stat_version(path, &directory);
-        bytes += path.size() + sizeof(xim_watch_event);
-        if (events.size() >= kMaxBatchPaths || bytes > kMaxBatchBytes)
+        record.directory = (current & XIM_DARWIN_ITEM_IS_DIR) != 0;
+        record.exists = path_identity(record.path, record.current);
+        record.directory = record.directory || record.current.directory;
+        bytes += record.path.size() + sizeof(xim_watch_event);
+        if (records.size() >= kMaxBatchPaths || bytes > kMaxBatchBytes)
         {
             flags |= XIM_WATCH_OVERFLOW;
-            events.clear();
-            owned_paths.clear();
+            records.clear();
             break;
         }
-        owned_paths.push_back(std::move(path));
-        events.push_back({kind, owned_paths.back().c_str(), nullptr,
-                directory ? 1 : 0, version});
+        records.push_back(std::move(record));
+    }
+
+    std::vector<bool> paired(records.size(), false);
+    std::vector<std::string> event_paths;
+    std::vector<std::string> event_others;
+    std::vector<xim_watch_event> events;
+    event_paths.reserve(records.size());
+    event_others.reserve(records.size());
+    events.reserve(records.size());
+    for (std::size_t from = 0; from < records.size(); ++from)
+    {
+        const auto &source = records[from];
+        if ((source.kind & XIM_WATCH_MOVE) == 0 || source.exists
+                || !source.prior_valid)
+            continue;
+        for (std::size_t to = 0; to < records.size(); ++to)
+        {
+            const auto &destination = records[to];
+            if (from == to || paired[to]
+                    || (destination.kind & XIM_WATCH_MOVE) == 0
+                    || !destination.exists
+                    || source.prior.device != destination.current.device
+                    || source.prior.inode != destination.current.inode)
+                continue;
+            event_paths.push_back(destination.path);
+            event_others.push_back(source.path);
+            events.push_back({XIM_WATCH_MOVE, event_paths.back().c_str(),
+                    event_others.back().c_str(),
+                    source.directory || destination.directory ? 1 : 0,
+                    stat_version(destination.path, nullptr)});
+            paired[from] = true;
+            paired[to] = true;
+            break;
+        }
+    }
+    for (std::size_t i = 0; i < records.size(); ++i)
+    {
+        if (paired[i])
+            continue;
+        const auto &record = records[i];
+        event_paths.push_back(record.path);
+        event_others.emplace_back();
+        events.push_back({record.kind, event_paths.back().c_str(), nullptr,
+                record.directory ? 1 : 0,
+                stat_version(record.path, nullptr)});
     }
 
     xim_watch_callback cb;
     void *cb_context;
     {
         std::lock_guard guard(lock);
+        for (std::size_t i = 0; i < records.size(); ++i)
+        {
+            const auto &record = records[i];
+            if (record.exists)
+                known_identities[record.path] = record.current;
+            else if (record.kind & (XIM_WATCH_DELETE | XIM_WATCH_MOVE))
+            {
+                known_identities.erase(record.path);
+                if (record.directory)
+                {
+                    std::vector<int> drop;
+                    for (const auto &[wd, info] : watches)
+                        if (info.path == record.path
+                                || (info.path.starts_with(record.path)
+                                    && info.path.size() > record.path.size()
+                                    && info.path[record.path.size()] == '/'))
+                            drop.push_back(wd);
+                    for (int wd : drop)
+                        remove_watch_locked(wd);
+                }
+            }
+        }
         if (flags & XIM_WATCH_ROOT_LOST)
             set_failure("project root unavailable; refresh required");
         else if (flags & XIM_WATCH_OVERFLOW)
@@ -669,7 +792,7 @@ xim_watch_start_project(const char *path, xim_watch_callback cb, void *context)
     if (!project_root.empty())
         add_watch_locked(project_root, true, {});
 #ifdef __APPLE__
-    update_fsevents_locked();
+    update_fsevents_locked(true);
 #endif
     return 1;
 }
@@ -694,7 +817,7 @@ xim_watch_stop_project(void)
     failure.clear();
     partial = false;
 #ifdef __APPLE__
-    update_fsevents_locked();
+    update_fsevents_locked(true);
 #endif
 }
 
@@ -745,6 +868,11 @@ xim_watch_watch_file(const char *absolute_path)
     set.insert(name);
     bool added = add_watch_locked(parent, false, name);
 #ifdef __APPLE__
+    PathIdentity identity;
+    if (path_identity(path, identity))
+        known_identities[path] = identity;
+    else
+        known_identities.erase(path);
     if (added)
         update_fsevents_locked();
 #endif
@@ -763,6 +891,9 @@ xim_watch_unwatch_file(const char *absolute_path)
     auto names = explicit_names.find(parent);
     if (names == explicit_names.end())
         return;
+#ifdef __APPLE__
+    known_identities.erase(path);
+#endif
     names->second.erase(name);
     auto watched = watch_paths.find(parent);
     if (names->second.empty())
@@ -807,6 +938,8 @@ xim_watch_shutdown(void)
         watches.clear();
         watch_paths.clear();
         explicit_names.clear();
+        known_identities.clear();
+        configured_fsevent_roots.clear();
         project_root.clear();
     }
     return;

@@ -425,6 +425,15 @@ if(NOT XIM_FEATURE_LEVEL STREQUAL "tiny")
         COMMENT "Staging the matching Xim runtime")
     add_dependencies(xim xim_runtime)
 
+    if(WIN32)
+        add_executable(xim_file_identity_win_test testdir/xim_file_identity_win_test.cpp)
+        xim_apply_default_flags(xim_file_identity_win_test)
+        xim_apply_cxx_settings(xim_file_identity_win_test)
+        add_test(NAME xim_file_identity_win COMMAND xim_file_identity_win_test
+            ${CMAKE_BINARY_DIR}/Testing/win-file-identity-fixture)
+        set_tests_properties(xim_file_identity_win PROPERTIES LABELS "xim_native" TIMEOUT 60)
+    endif()
+
     add_executable(xim_file_stat_test testdir/xim_file_stat_test.cpp)
     xim_apply_default_flags(xim_file_stat_test)
     xim_apply_cxx_settings(xim_file_stat_test)

@@ -87,11 +87,11 @@ jobs:
         if: ${{ !cancelled() && runner.os == 'Windows' }}
         shell: pwsh
         run: |
-          cmake --build build/platform-probe --target vim xxd json_test kword_test memfile_test message_test xim_file_identity_win_test --parallel 4
+          cmake --build build/platform-probe --target vim xxd json_test kword_test memfile_test message_test xim_file_identity_win_test xim_commands_test xim_menu_test --parallel 4
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & build/platform-probe/src/vim.exe --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ctest --test-dir build/platform-probe -R '^(vim_unit_(json|kword|memfile|message)|xim_file_identity_win)$' --output-on-failure
+          ctest --test-dir build/platform-probe -R '^(vim_unit_(json|kword|memfile|message)|xim_(file_identity_win|commands|menu))$' --output-on-failure
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Test native editor

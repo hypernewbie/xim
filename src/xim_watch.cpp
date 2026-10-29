@@ -18,7 +18,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef __APPLE__
-#include <CoreServices/CoreServices.h>
+#include "xim_watch_darwin.h"
 #else
 #include <fcntl.h>
 #include <poll.h>
@@ -81,22 +81,19 @@ std::map<std::string, std::set<std::string>> explicit_names;
 std::string project_root;
 std::string failure;
 bool partial = false;
+#ifndef __APPLE__
 int notify_fd = -1;
 int command_pipe[2] = {-1, -1};
 std::thread worker;
 std::atomic<bool> stop_requested{false};
+#endif
 xim_watch_callback callback = nullptr;
 void *callback_context = nullptr;
+#ifndef __APPLE__
 bool root_lost_reported = false;
 unsigned long long project_epoch = 0;
-#ifdef __APPLE__
-std::condition_variable runloop_ready_changed;
-CFRunLoopRef event_runloop = nullptr;
-CFRunLoopSourceRef event_source = nullptr;
-FSEventStreamRef event_stream = nullptr;
-bool runloop_ready = false;
-bool runloop_failed = false;
 #endif
+
 
 std::string parent_path(std::string_view path)
 {
@@ -484,58 +481,56 @@ void watcher_loop()
 #endif
 
 #ifdef __APPLE__
-void fsevent_callback(ConstFSEventStreamRef stream, void *context,
-        std::size_t count, void *paths, const FSEventStreamEventFlags flags[],
-        const FSEventStreamEventId ids[]);
-
-void rebuild_fsevent_stream();
-
-void fsevent_source_perform(void *)
+void update_fsevents_locked()
 {
-    rebuild_fsevent_stream();
-}
-
-void wake_fsevent_source_locked()
-{
-    if (event_source != nullptr && event_runloop != nullptr)
+    std::vector<std::string> roots;
+    if (!project_root.empty())
+        roots.push_back(project_root);
+    for (const auto &[parent, names] : explicit_names)
     {
-        CFRunLoopSourceSignal(event_source);
-        CFRunLoopWakeUp(event_runloop);
+        (void)names;
+        bool inside = !project_root.empty() && (parent == project_root
+            || (parent.starts_with(project_root)
+                && (project_root == "/" || (parent.size() > project_root.size()
+                    && parent[project_root.size()] == '/'))));
+        if (!inside)
+            roots.push_back(parent);
     }
+    std::sort(roots.begin(), roots.end());
+    roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+    std::vector<const char *> paths;
+    paths.reserve(roots.size());
+    for (const auto &root : roots)
+        paths.push_back(root.c_str());
+    if (!xim_darwin_fsevents_set_paths(paths.data(), paths.size()))
+        set_failure("event stream update failed");
 }
 
-void fsevent_callback(ConstFSEventStreamRef, void *, std::size_t count,
-        void *raw_paths, const FSEventStreamEventFlags event_flags[],
-        const FSEventStreamEventId[])
+extern "C" void
+xim_darwin_fsevents_events(std::size_t count, const char *const paths[],
+        const std::uint32_t event_flags[], std::uint32_t stream_flags)
 {
-    char **paths = static_cast<char **>(raw_paths);
     std::vector<std::string> owned_paths;
     std::vector<xim_watch_event> events;
     owned_paths.reserve(std::min(count, kMaxBatchPaths));
     events.reserve(std::min(count, kMaxBatchPaths));
     std::size_t bytes = 0;
-    int flags = 0;
+    int flags = (stream_flags & XIM_DARWIN_STREAM_DROPPED)
+        ? XIM_WATCH_OVERFLOW : 0;
     std::string root;
     {
         std::lock_guard guard(lock);
         root = project_root;
     }
 
-    constexpr FSEventStreamEventFlags dropped =
-        kFSEventStreamEventFlagMustScanSubDirs
-        | kFSEventStreamEventFlagUserDropped
-        | kFSEventStreamEventFlagKernelDropped
-        | kFSEventStreamEventFlagEventIdsWrapped;
     for (std::size_t i = 0; i < count; ++i)
     {
-        auto current_flags = event_flags[i];
-        if (current_flags & dropped)
-            flags |= XIM_WATCH_OVERFLOW;
+        std::uint32_t current = event_flags[i];
         if (paths[i] == nullptr)
             continue;
         std::string path(paths[i]);
         if (!root.empty() && path == root
-                && (current_flags & kFSEventStreamEventFlagRootChanged))
+                && (current & XIM_DARWIN_ROOT_CHANGED))
             flags |= XIM_WATCH_ROOT_LOST;
         bool inside_project = !root.empty() && (path == root
             || (path.starts_with(root)
@@ -554,23 +549,14 @@ void fsevent_callback(ConstFSEventStreamRef, void *, std::size_t count,
             continue;
 
         int kind = 0;
-        if (current_flags & kFSEventStreamEventFlagItemCreated)
-            kind |= XIM_WATCH_CREATE;
-        if (current_flags & kFSEventStreamEventFlagItemRemoved)
-            kind |= XIM_WATCH_DELETE;
-        if (current_flags & kFSEventStreamEventFlagItemRenamed)
-            kind |= XIM_WATCH_MOVE;
-        if (current_flags & kFSEventStreamEventFlagItemModified)
-            kind |= XIM_WATCH_MODIFY;
-        if (current_flags & (kFSEventStreamEventFlagItemInodeMetaMod
-                    | kFSEventStreamEventFlagItemFinderInfoMod
-                    | kFSEventStreamEventFlagItemChangeOwner
-                    | kFSEventStreamEventFlagItemXattrMod))
-            kind |= XIM_WATCH_ATTRIB;
+        if (current & XIM_DARWIN_ITEM_CREATED) kind |= XIM_WATCH_CREATE;
+        if (current & XIM_DARWIN_ITEM_REMOVED) kind |= XIM_WATCH_DELETE;
+        if (current & XIM_DARWIN_ITEM_RENAMED) kind |= XIM_WATCH_MOVE;
+        if (current & XIM_DARWIN_ITEM_MODIFIED) kind |= XIM_WATCH_MODIFY;
+        if (current & XIM_DARWIN_ITEM_ATTRIB) kind |= XIM_WATCH_ATTRIB;
         if (kind == 0)
             continue;
-        bool directory = (current_flags
-                & kFSEventStreamEventFlagItemIsDir) != 0;
+        bool directory = (current & XIM_DARWIN_ITEM_IS_DIR) != 0;
         auto version = stat_version(path, &directory);
         bytes += path.size() + sizeof(xim_watch_event);
         if (events.size() >= kMaxBatchPaths || bytes > kMaxBatchBytes)
@@ -600,167 +586,11 @@ void fsevent_callback(ConstFSEventStreamRef, void *, std::size_t count,
         cb(cb_context, events.data(), events.size(), flags);
 }
 
-void rebuild_fsevent_stream()
-{
-    if (event_stream != nullptr)
-    {
-        FSEventStreamStop(event_stream);
-        FSEventStreamInvalidate(event_stream);
-        FSEventStreamRelease(event_stream);
-        event_stream = nullptr;
-    }
-
-    std::vector<std::string> roots;
-    bool stopping;
-    {
-        std::lock_guard guard(lock);
-        stopping = stop_requested.load();
-        if (!project_root.empty())
-            roots.push_back(project_root);
-        for (const auto &[parent, names] : explicit_names)
-        {
-            (void)names;
-            bool inside = !project_root.empty() && (parent == project_root
-                || (parent.starts_with(project_root)
-                    && (project_root == "/" || (parent.size() > project_root.size()
-                        && parent[project_root.size()] == '/'))));
-            if (!inside)
-                roots.push_back(parent);
-        }
-    }
-    if (stopping)
-    {
-        CFRunLoopStop(CFRunLoopGetCurrent());
-        return;
-    }
-    std::sort(roots.begin(), roots.end());
-    roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
-    if (roots.empty())
-        return;
-
-    CFMutableArrayRef paths = CFArrayCreateMutable(kCFAllocatorDefault, 0,
-            &kCFTypeArrayCallBacks);
-    if (paths == nullptr)
-    {
-        std::lock_guard guard(lock);
-        set_failure("event stream path allocation failed");
-        return;
-    }
-    for (const auto &path : roots)
-    {
-        CFStringRef string = CFStringCreateWithCString(kCFAllocatorDefault,
-                path.c_str(), kCFStringEncodingUTF8);
-        if (string == nullptr)
-        {
-            CFRelease(paths);
-            std::lock_guard guard(lock);
-            set_failure("event stream path encoding failed");
-            return;
-        }
-        CFArrayAppendValue(paths, string);
-        CFRelease(string);
-    }
-    event_stream = FSEventStreamCreate(kCFAllocatorDefault, fsevent_callback,
-            nullptr, paths, kFSEventStreamEventIdSinceNow, 0.05,
-            kFSEventStreamCreateFlagFileEvents
-                | kFSEventStreamCreateFlagWatchRoot
-                | kFSEventStreamCreateFlagNoDefer);
-    CFRelease(paths);
-    if (event_stream == nullptr)
-    {
-        std::lock_guard guard(lock);
-        set_failure("event stream creation failed");
-        return;
-    }
-    FSEventStreamScheduleWithRunLoop(event_stream, event_runloop,
-            kCFRunLoopDefaultMode);
-    if (!FSEventStreamStart(event_stream))
-    {
-        FSEventStreamInvalidate(event_stream);
-        FSEventStreamRelease(event_stream);
-        event_stream = nullptr;
-        std::lock_guard guard(lock);
-        set_failure("event stream start failed");
-    }
-}
-
-void fsevent_worker()
-{
-    CFRunLoopRef loop = CFRunLoopGetCurrent();
-    CFRetain(loop);
-    CFRunLoopSourceContext context{};
-    context.perform = fsevent_source_perform;
-    CFRunLoopSourceRef source = CFRunLoopSourceCreate(kCFAllocatorDefault,
-            0, &context);
-    if (source == nullptr)
-    {
-        {
-            std::lock_guard guard(lock);
-            runloop_failed = true;
-            runloop_ready = true;
-            set_failure("event run loop creation failed");
-        }
-        runloop_ready_changed.notify_all();
-        CFRelease(loop);
-        return;
-    }
-    CFRunLoopAddSource(loop, source, kCFRunLoopDefaultMode);
-    {
-        std::lock_guard guard(lock);
-        event_runloop = loop;
-        event_source = source;
-        runloop_ready = true;
-    }
-    runloop_ready_changed.notify_all();
-    CFRunLoopSourceSignal(source);
-    CFRunLoopWakeUp(loop);
-    CFRunLoopRun();
-    if (event_stream != nullptr)
-    {
-        FSEventStreamStop(event_stream);
-        FSEventStreamInvalidate(event_stream);
-        FSEventStreamRelease(event_stream);
-        event_stream = nullptr;
-    }
-    CFRunLoopRemoveSource(loop, source, kCFRunLoopDefaultMode);
-    {
-        std::lock_guard guard(lock);
-        event_runloop = nullptr;
-        event_source = nullptr;
-    }
-    CFRelease(source);
-    CFRelease(loop);
-}
-
 bool ensure_thread()
 {
-    std::unique_lock guard(lock);
-    if (worker.joinable())
-        return runloop_ready && !runloop_failed;
-    stop_requested.store(false);
-    runloop_ready = false;
-    runloop_failed = false;
-    try
-    {
-        worker = std::thread(fsevent_worker);
-    }
-    catch (...)
-    {
-        set_failure("event worker startup failed");
-        return false;
-    }
-    runloop_ready_changed.wait(guard, [] { return runloop_ready; });
-    bool ready = !runloop_failed;
-    static bool registered = false;
-    if (ready && !registered)
-    {
-        std::atexit(xim_watch_shutdown);
-        registered = true;
-    }
-    guard.unlock();
-    if (!ready && worker.joinable())
-        worker.join();
-    return ready;
+    static std::once_flag registered;
+    std::call_once(registered, [] { std::atexit(xim_watch_shutdown); });
+    return true;
 }
 #else
 bool ensure_thread()
@@ -830,14 +660,16 @@ xim_watch_start_project(const char *path, xim_watch_callback cb, void *context)
     for (auto &[wd, info] : watches)
         info.project = false;
     project_root = path == nullptr ? "" : path;
+#ifndef __APPLE__
     ++project_epoch;
+    root_lost_reported = false;
+#endif
     failure.clear();
     partial = false;
-    root_lost_reported = false;
     if (!project_root.empty())
         add_watch_locked(project_root, true, {});
 #ifdef __APPLE__
-    wake_fsevent_source_locked();
+    update_fsevents_locked();
 #endif
     return 1;
 }
@@ -855,12 +687,14 @@ xim_watch_stop_project(void)
     for (auto &[wd, info] : watches)
         info.project = false;
     project_root.clear();
+#ifndef __APPLE__
     ++project_epoch;
+    root_lost_reported = false;
+#endif
     failure.clear();
     partial = false;
-    root_lost_reported = false;
 #ifdef __APPLE__
-    wake_fsevent_source_locked();
+    update_fsevents_locked();
 #endif
 }
 
@@ -912,7 +746,7 @@ xim_watch_watch_file(const char *absolute_path)
     bool added = add_watch_locked(parent, false, name);
 #ifdef __APPLE__
     if (added)
-        wake_fsevent_source_locked();
+        update_fsevents_locked();
 #endif
     return added ? 1 : 0;
 }
@@ -945,7 +779,7 @@ xim_watch_unwatch_file(const char *absolute_path)
     else if (watched != watch_paths.end())
         watches[watched->second].names.erase(name);
 #ifdef __APPLE__
-    wake_fsevent_source_locked();
+    update_fsevents_locked();
 #endif
 }
 
@@ -961,25 +795,23 @@ xim_watch_status(void)
 extern "C" void
 xim_watch_shutdown(void)
 {
-    stop_requested.store(true);
 #ifdef __APPLE__
     {
         std::lock_guard guard(lock);
-        wake_fsevent_source_locked();
+        callback = nullptr;
+        callback_context = nullptr;
     }
-    if (worker.joinable())
-        worker.join();
+    xim_darwin_fsevents_shutdown();
     {
         std::lock_guard guard(lock);
         watches.clear();
         watch_paths.clear();
         explicit_names.clear();
         project_root.clear();
-        callback = nullptr;
-        callback_context = nullptr;
     }
     return;
 #else
+    stop_requested.store(true);
     if (command_pipe[1] >= 0)
     {
         char byte = 1;

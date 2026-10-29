@@ -521,30 +521,39 @@ void watcher_loop()
 #endif
 
 #ifdef __APPLE__
-void update_fsevents_locked(bool force = false)
+std::mutex fsevents_update_lock;
+
+void update_fsevents(bool force = false)
 {
+    std::lock_guard update_guard(fsevents_update_lock);
     std::vector<std::string> roots;
-    if (!project_root.empty())
-        roots.push_back(project_root);
-    for (const auto &[parent, names] : explicit_names)
     {
-        (void)names;
-        bool inside = !project_root.empty() && (parent == project_root
-            || (parent.starts_with(project_root)
-                && (project_root == "/" || (parent.size() > project_root.size()
-                    && parent[project_root.size()] == '/'))));
-        if (!inside)
-            roots.push_back(parent);
+        std::lock_guard guard(lock);
+        if (!project_root.empty())
+            roots.push_back(project_root);
+        for (const auto &[parent, names] : explicit_names)
+        {
+            (void)names;
+            bool inside = !project_root.empty() && (parent == project_root
+                || (parent.starts_with(project_root)
+                    && (project_root == "/" || (parent.size() > project_root.size()
+                        && parent[project_root.size()] == '/'))));
+            if (!inside)
+                roots.push_back(parent);
+        }
+        std::sort(roots.begin(), roots.end());
+        roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+        if (!force && roots == configured_fsevent_roots)
+            return;
     }
-    std::sort(roots.begin(), roots.end());
-    roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
-    if (!force && roots == configured_fsevent_roots)
-        return;
+
     std::vector<const char *> paths;
     paths.reserve(roots.size());
     for (const auto &root : roots)
         paths.push_back(root.c_str());
-    if (!xim_darwin_fsevents_set_paths(paths.data(), paths.size()))
+    bool updated = xim_darwin_fsevents_set_paths(paths.data(), paths.size()) != 0;
+    std::lock_guard guard(lock);
+    if (!updated)
         set_failure("event stream update failed");
     else
         configured_fsevent_roots = std::move(roots);
@@ -770,29 +779,31 @@ xim_watch_start_project(const char *path, xim_watch_callback cb, void *context)
         partial = true;
         return 0;
     }
-    std::lock_guard guard(lock);
-    callback = cb;
-    callback_context = context;
-    // Drop the old project watches but keep explicit file parents.
-    std::vector<int> drop;
-    for (const auto &[wd, info] : watches)
-        if (info.project && info.names.empty())
-            drop.push_back(wd);
-    for (int wd : drop)
-        remove_watch_locked(wd);
-    for (auto &[wd, info] : watches)
-        info.project = false;
-    project_root = path == nullptr ? "" : path;
+    {
+        std::lock_guard guard(lock);
+        callback = cb;
+        callback_context = context;
+        // Drop the old project watches but keep explicit file parents.
+        std::vector<int> drop;
+        for (const auto &[wd, info] : watches)
+            if (info.project && info.names.empty())
+                drop.push_back(wd);
+        for (int wd : drop)
+            remove_watch_locked(wd);
+        for (auto &[wd, info] : watches)
+            info.project = false;
+        project_root = path == nullptr ? "" : path;
 #ifndef __APPLE__
-    ++project_epoch;
-    root_lost_reported = false;
+        ++project_epoch;
+        root_lost_reported = false;
 #endif
-    failure.clear();
-    partial = false;
-    if (!project_root.empty())
-        add_watch_locked(project_root, true, {});
+        failure.clear();
+        partial = false;
+        if (!project_root.empty())
+            add_watch_locked(project_root, true, {});
+    }
 #ifdef __APPLE__
-    update_fsevents_locked(true);
+    update_fsevents(true);
 #endif
     return 1;
 }
@@ -800,24 +811,26 @@ xim_watch_start_project(const char *path, xim_watch_callback cb, void *context)
 extern "C" void
 xim_watch_stop_project(void)
 {
-    std::lock_guard guard(lock);
-    std::vector<int> drop;
-    for (const auto &[wd, info] : watches)
-        if (info.project && info.names.empty())
-            drop.push_back(wd);
-    for (int wd : drop)
-        remove_watch_locked(wd);
-    for (auto &[wd, info] : watches)
-        info.project = false;
-    project_root.clear();
+    {
+        std::lock_guard guard(lock);
+        std::vector<int> drop;
+        for (const auto &[wd, info] : watches)
+            if (info.project && info.names.empty())
+                drop.push_back(wd);
+        for (int wd : drop)
+            remove_watch_locked(wd);
+        for (auto &[wd, info] : watches)
+            info.project = false;
+        project_root.clear();
 #ifndef __APPLE__
-    ++project_epoch;
-    root_lost_reported = false;
+        ++project_epoch;
+        root_lost_reported = false;
 #endif
-    failure.clear();
-    partial = false;
+        failure.clear();
+        partial = false;
+    }
 #ifdef __APPLE__
-    update_fsevents_locked(true);
+    update_fsevents(true);
 #endif
 }
 
@@ -851,30 +864,35 @@ xim_watch_watch_file(const char *absolute_path)
     std::string name = base_name(path);
     if (name.empty())
         return 0;
-    std::lock_guard guard(lock);
-    auto names = explicit_names.find(parent);
-    if (names == explicit_names.end()
-            && explicit_names.size() >= kMaxExplicitParents)
+    bool added;
     {
-        set_failure("too many watched files");
-        return 0;
-    }
-    auto &set = explicit_names[parent];
-    if (set.size() >= kMaxExplicitNames && !set.contains(name))
-    {
-        set_failure("too many watched files");
-        return 0;
-    }
-    set.insert(name);
-    bool added = add_watch_locked(parent, false, name);
+        std::lock_guard guard(lock);
+        auto names = explicit_names.find(parent);
+        if (names == explicit_names.end()
+                && explicit_names.size() >= kMaxExplicitParents)
+        {
+            set_failure("too many watched files");
+            return 0;
+        }
+        auto &set = explicit_names[parent];
+        if (set.size() >= kMaxExplicitNames && !set.contains(name))
+        {
+            set_failure("too many watched files");
+            return 0;
+        }
+        set.insert(name);
+        added = add_watch_locked(parent, false, name);
 #ifdef __APPLE__
-    PathIdentity identity;
-    if (path_identity(path, identity))
-        known_identities[path] = identity;
-    else
-        known_identities.erase(path);
+        PathIdentity identity;
+        if (path_identity(path, identity))
+            known_identities[path] = identity;
+        else
+            known_identities.erase(path);
+#endif
+    }
+#ifdef __APPLE__
     if (added)
-        update_fsevents_locked();
+        update_fsevents();
 #endif
     return added ? 1 : 0;
 }
@@ -887,30 +905,32 @@ xim_watch_unwatch_file(const char *absolute_path)
     std::string path(absolute_path);
     std::string parent = parent_path(path);
     std::string name = base_name(path);
-    std::lock_guard guard(lock);
-    auto names = explicit_names.find(parent);
-    if (names == explicit_names.end())
-        return;
-#ifdef __APPLE__
-    known_identities.erase(path);
-#endif
-    names->second.erase(name);
-    auto watched = watch_paths.find(parent);
-    if (names->second.empty())
     {
-        explicit_names.erase(names);
-        if (watched != watch_paths.end())
-        {
-            auto &info = watches[watched->second];
-            info.names.erase(name);
-            if (!info.project)
-                remove_watch_locked(watched->second);
-        }
-    }
-    else if (watched != watch_paths.end())
-        watches[watched->second].names.erase(name);
+        std::lock_guard guard(lock);
+        auto names = explicit_names.find(parent);
+        if (names == explicit_names.end())
+            return;
 #ifdef __APPLE__
-    update_fsevents_locked();
+        known_identities.erase(path);
+#endif
+        names->second.erase(name);
+        auto watched = watch_paths.find(parent);
+        if (names->second.empty())
+        {
+            explicit_names.erase(names);
+            if (watched != watch_paths.end())
+            {
+                auto &info = watches[watched->second];
+                info.names.erase(name);
+                if (!info.project)
+                    remove_watch_locked(watched->second);
+            }
+        }
+        else if (watched != watch_paths.end())
+            watches[watched->second].names.erase(name);
+    }
+#ifdef __APPLE__
+    update_fsevents();
 #endif
 }
 

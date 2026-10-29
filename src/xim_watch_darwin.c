@@ -184,8 +184,8 @@ int xim_darwin_fsevents_set_paths(const char *const paths[], size_t count)
         return 0;
     }
     update->generation = ++latest_generation;
-    dispatch_async_f(control_queue, update, apply_update);
     pthread_mutex_unlock(&lock);
+    dispatch_sync_f(control_queue, update, apply_update);
     return 1;
 }
 

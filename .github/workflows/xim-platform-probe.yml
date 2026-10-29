@@ -83,6 +83,17 @@ jobs:
         if: runner.os == 'Linux'
         run: cmake --build build/platform-probe --parallel 4
 
+      - name: Test Windows inherited engine
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          cmake --build build/platform-probe --target vim xxd json_test kword_test memfile_test message_test --parallel 4
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & build/platform-probe/src/vim.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir build/platform-probe -R '^vim_unit_(json|kword|memfile|message)$' --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Test native editor
         run: ctest --test-dir build/platform-probe -L xim_native --output-on-failure
 

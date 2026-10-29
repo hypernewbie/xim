@@ -108,7 +108,7 @@ main
      * Do any system-specific initialisations.  These can NOT use IObuff or
      * NameBuff.  Thus emsg2() cannot be called!
      */
-#  ifdef XIM_NATIVE_ENTRY
+#  if defined(XIM_NATIVE_ENTRY) && !defined(MSWIN)
     xim_prepare_args(&argc, &argv);
 #  endif
     mch_early_init();
@@ -119,6 +119,10 @@ main
      * convert when 'encoding' changes.  Get the unexpanded arguments.
      */
     argc = get_cmd_argsW(&argv);
+#   ifdef XIM_NATIVE_ENTRY
+    if (argc > 0 && argv != NULL)
+	xim_prepare_args(&argc, &argv);
+#   endif
 #  endif
 
     // Many variables are in "params" so that we can pass them to invoked

@@ -9,7 +9,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(_xim_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
 set(_xim_saved_required_link_options ${CMAKE_REQUIRED_LINK_OPTIONS})
-set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -std=c++26")
+if(WIN32)
+    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} /clang:-std=c++26")
+else()
+    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -std=c++26")
+endif()
 check_cxx_source_compiles([=[
     #if __cplusplus < 202400L
     # error "C++26 mode is required"
@@ -29,9 +33,10 @@ endif()
 # Prefer libc++ only after verifying that this Clang can compile, link, and
 # run a C++26 program with it. On hosts without a usable libc++ installation,
 # keep Clang's configured default standard library.
-set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -stdlib=libc++")
-list(APPEND CMAKE_REQUIRED_LINK_OPTIONS -stdlib=libc++)
-check_cxx_source_runs([=[
+if(NOT WIN32)
+    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -stdlib=libc++")
+    list(APPEND CMAKE_REQUIRED_LINK_OPTIONS -stdlib=libc++)
+    check_cxx_source_runs([=[
     #include <string>
     #if __cplusplus < 202400L
     # error "C++26 mode is required"
@@ -47,6 +52,11 @@ check_cxx_source_runs([=[
         return value.size() == 3 ? 0 : 1;
     }
 ]=] XIM_LIBCXX_CXX26_RUNS)
+else()
+    # clang-cl ignores -stdlib=libc++; a successful probe would be a false
+    # positive. Use the Windows ABI's configured MSVC standard library.
+    set(XIM_LIBCXX_CXX26_RUNS FALSE)
+endif()
 
 set(CMAKE_REQUIRED_FLAGS "${_xim_saved_required_flags}")
 set(CMAKE_REQUIRED_LINK_OPTIONS ${_xim_saved_required_link_options})

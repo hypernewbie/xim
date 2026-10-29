@@ -161,7 +161,7 @@ set(VIM_BASIC_SRC
 
 if(WIN32)
     list(REMOVE_ITEM VIM_BASIC_SRC pty.c)
-    list(APPEND VIM_BASIC_SRC os_win32.c os_mswin.c iscygpty.c winclip.c)
+    list(APPEND VIM_BASIC_SRC os_win32.c os_mswin.c iscygpty.c winclip.c strptime.c)
 else()
     list(APPEND VIM_BASIC_SRC os_unix.c)
 endif()
@@ -400,6 +400,9 @@ endif()
 # Main `vim` executable.
 # ----------------------------------------------------------------------------
 add_executable(vim main.c ${VIM_OBJ_MAIN_SRC})
+if(WIN32)
+    target_sources(vim PRIVATE os_w32exe.c)
+endif()
 target_link_libraries(vim PRIVATE vim_core)
 
 # Native input policy is linked only into xim; vim keeps its modal dispatch.
@@ -407,6 +410,9 @@ if(NOT XIM_FEATURE_LEVEL STREQUAL "tiny")
     add_executable(xim main.c ${VIM_OBJ_MAIN_SRC}
         xim_bridge.c xim_controller.cpp xim_commands.cpp xim_menu.cpp xim_project.cpp
         xim_watch.cpp xim_fsops.cpp xim_recent.cpp)
+    if(WIN32)
+        target_sources(xim PRIVATE os_w32exe.c)
+    endif()
     target_compile_definitions(xim PRIVATE XIM_NATIVE_ENTRY)
     target_link_libraries(xim PRIVATE vim_core)
     xim_apply_cxx_settings(xim)

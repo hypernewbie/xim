@@ -11,7 +11,11 @@
 # mechanism (CMAKE_C_FLAGS_INIT).
 
 add_executable(xxd xxd.c)
-target_compile_definitions(xxd PRIVATE UNIX)
+if(WIN32)
+    target_compile_definitions(xxd PRIVATE WIN32)
+else()
+    target_compile_definitions(xxd PRIVATE UNIX)
+endif()
 xim_apply_default_flags(xxd)
 
 # Install alongside the binaries. The full Phase 2 build will install the

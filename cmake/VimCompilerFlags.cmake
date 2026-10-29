@@ -15,9 +15,12 @@
 # - `-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=1` is the reference's choice —
 #   `_FORTIFY_SOURCE=2` interacts badly with some legacy macros in Vim's
 #   older headers, so the build deliberately downgrades to level 1.
-set(XIM_COMPILE_FLAGS -Wall -Wno-deprecated-declarations)
-if(NOT WIN32)
-    list(APPEND XIM_COMPILE_FLAGS
+if(WIN32)
+    # clang-cl interprets -Wall as MSVC /Wall (Clang -Weverything).
+    # Forward the Clang warning policy instead, matching the Unix builds.
+    set(XIM_COMPILE_FLAGS /clang:-Wall /clang:-Wno-deprecated-declarations)
+else()
+    set(XIM_COMPILE_FLAGS -Wall -Wno-deprecated-declarations
         -D_REENTRANT -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=1)
 endif()
 

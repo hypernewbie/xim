@@ -1,17 +1,20 @@
-Xim 0.0.0 Ubuntu candidate
+Xim 0.0.0 for Ubuntu 24.04
+===========================
 
-This archive targets Ubuntu 24.04 on x86-64. It is a candidate, not a published
-release. Keep the bin and share directories together. The binary finds the
-matching runtime in share/xim/runtime.
+This archive is for x86-64 systems that run Ubuntu 24.04. Keep the `bin` and
+`share` directories together. The executable uses the matching runtime in
+`share/xim/runtime`.
 
-Install the runtime libraries:
+Install the required libraries:
 
     sudo apt update
     sudo apt install libc++1-19 libc++abi1-19 libtinfo6
 
-Run the editor:
+Run Xim:
 
     ./bin/xim
 
-The LICENSE file contains the inherited Vim license. The runtime directory
-contains additional documentation and license notices.
+Run `./bin/xim --version` to show the Xim release and Vim engine details.
+
+The `LICENSE` file contains the Vim license. The runtime directory contains
+more documentation and license notices.

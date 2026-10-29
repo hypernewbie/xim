@@ -2592,6 +2592,15 @@ def project_switch_recents(binary, root):
     print("Recent-state, project switch and buffer retention checks passed")
 
 
+def version_reporting(binary):
+    result = subprocess.run([str(binary), "--version"], capture_output=True,
+                            text=True, check=True, timeout=20)
+    output = result.stdout + result.stderr
+    assert output.startswith("Xim 0.0.0\n"), output[:300]
+    assert "VIM - Vi IMproved" in output, "Vim engine details are missing"
+    print("Xim release and Vim engine version checks passed")
+
+
 def runtime_lookup(binary, work):
     """Installed/build runtime lookup resolves PATH and executable symlinks."""
     build_runtime = binary.parent.parent / "runtime"
@@ -2632,6 +2641,7 @@ if __name__ == "__main__":
     parser.add_argument("--theme", type=Path, action="append", default=[])
     args = parser.parse_args()
     args.work.mkdir(parents=True, exist_ok=True)
+    version_reporting(args.binary.resolve())
     runtime_lookup(args.binary.resolve(), args.work.resolve())
     run(args.binary.resolve(), args.work.resolve(), args.theme)
     project_run(args.binary.resolve(), args.work.resolve())

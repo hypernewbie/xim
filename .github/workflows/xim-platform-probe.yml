@@ -1,4 +1,4 @@
-name: Xim native platform probe
+name: Xim Linux and macOS builds
 
 # Build and test the supported release platforms. Windows remains deferred.
 on:
@@ -111,6 +111,42 @@ jobs:
           name: xim-0.0.0-ubuntu24.04-x86_64-candidate
           path: |
             build/packages/xim-0.0.0-ubuntu24.04-x86_64.tar.gz
+            build/packages/SHA256SUMS
+            build/packages/dependencies.txt
+          if-no-files-found: error
+
+      - name: Package macOS candidate
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package=xim-0.0.0-macos15-x86_64
+          mkdir -p build/packages
+          cmake --install build/platform-probe --prefix "$PWD/build/packages/$package"
+          rm "$PWD/build/packages/$package/bin/vim"
+          cp LICENSE "$PWD/build/packages/$package/LICENSE"
+          cp cmake/MACOS_RELEASE.txt "$PWD/build/packages/$package/README.txt"
+          tar -C build/packages -czf "build/packages/$package.tar.gz" "$package"
+          (cd build/packages && shasum -a 256 "$package.tar.gz" > SHA256SUMS)
+          mkdir -p build/package-test
+          tar -C build/package-test -xzf "build/packages/$package.tar.gz"
+          otool -L "build/package-test/$package/bin/xim" | tee build/packages/dependencies.txt
+          if grep -E '/usr/local/|/opt/homebrew/' build/packages/dependencies.txt; then
+            echo 'The macOS package links to a Homebrew library.' >&2
+            exit 1
+          fi
+          python3 cmake/test_xim.py \
+            --binary "$PWD/build/package-test/$package/bin/xim" \
+            --work "$PWD/build/package-test/work"
+          (cd build/packages && shasum -a 256 -c SHA256SUMS)
+
+      - name: Upload macOS candidate
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xim-0.0.0-macos15-x86_64-candidate
+          path: |
+            build/packages/xim-0.0.0-macos15-x86_64.tar.gz
             build/packages/SHA256SUMS
             build/packages/dependencies.txt
           if-no-files-found: error

@@ -16,6 +16,12 @@ compile, link, and run probe succeeds. Inherited `.c` files remain C sources.
 The [portability audit](XIM_PORTABILITY_AUDIT.md) records the native platform
 bring-up and its remaining limits.
 
+The `Xim Linux and macOS builds` workflow builds and tests Ubuntu 24.04 x86-64
+and Intel macOS 15. It packages each executable with its matching runtime and
+runs the extracted package tests. Release instructions are in
+[UBUNTU_RELEASE.txt](UBUNTU_RELEASE.txt) and
+[MACOS_RELEASE.txt](MACOS_RELEASE.txt). Native Windows support is deferred.
+
 For clean-source acceptance, run:
 
 ```sh

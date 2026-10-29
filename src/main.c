@@ -2315,6 +2315,9 @@ command_line_scan(mparm_T *parmp)
 # if defined(FEAT_GUI) && !defined(ALWAYS_USE_GUI) && !defined(VIMDLL)
 		    gui.starting = false; // not starting GUI, will exit
 # endif
+# ifdef XIM_NATIVE_ENTRY
+		    mch_msg("Xim 0.0.0\n");
+# endif
 		    list_version();
 		    msg_putchar('\n');
 		    msg_didout = FALSE;

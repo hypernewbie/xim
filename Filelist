@@ -15,6 +15,7 @@ SRC_ALL =	\
 		.github/workflows/ci-macos.yml \
 		.github/workflows/ci-windows.yml \
 		.github/workflows/ci.yml \
+		.github/workflows/xim-platform-probe.yml \
 		.github/workflows/codeql-analysis.yml \
 		.github/workflows/coverity.yml \
 		.github/workflows/link-check.yml \
@@ -26,6 +27,37 @@ SRC_ALL =	\
 		.clang-format \
 		.codecov.yml \
 		.editorconfig \
+		CMakeLists.txt \
+		CMakePresets.json \
+		cmake/MACOS_RELEASE.txt \
+		cmake/PIXMAN_LICENSE.txt \
+		cmake/PLAN0_CLOSEOUT.md \
+		cmake/PLAN1_VALIDATION.md \
+		cmake/PLAN2_VALIDATION.md \
+		cmake/PLAN3_VALIDATION.md \
+		cmake/PLAN4_VALIDATION.md \
+		cmake/PLAN5_VALIDATION.md \
+		cmake/PLAN6_VALIDATION.md \
+		cmake/README.md \
+		cmake/UBUNTU_RELEASE.txt \
+		cmake/VimCompilerFlags.cmake \
+		cmake/VimConfigChecks.cmake \
+		cmake/VimCpp.cmake \
+		cmake/VimFeatures.cmake \
+		cmake/VimGenerated.cmake \
+		cmake/XIM_INPUT.md \
+		cmake/XIM_PORTABILITY_AUDIT.md \
+		cmake/benchmark_vim.py \
+		cmake/benchmark_xim.py \
+		cmake/benchmark_xim_live.py \
+		cmake/benchmark_xim_project.py \
+		cmake/benchmark_xim_search.py \
+		cmake/check_clean_build.py \
+		cmake/pathdef.c.in \
+		cmake/run_libvterm_tests.sh \
+		cmake/run_vim_tests.sh \
+		cmake/terminal_screen.py \
+		cmake/test_xim.py \
 		ci/config.mk*.sed \
 		ci/gen_testset.py \
 		ci/if_ver*.vim \
@@ -38,6 +70,7 @@ SRC_ALL =	\
 		ci/pinned-pkgs \
 		src/Make_all.mak \
 		src/Make_tags.mak \
+		src/CMakeLists.txt \
 		src/README.md \
 		src/alloc.c \
 		src/alloc.h \
@@ -203,7 +236,39 @@ SRC_ALL =	\
 		src/viminfo.c \
 		src/winclip.c \
 		src/window.c \
+		src/xim_bridge.c \
+		src/xim_commands.cpp \
+		src/xim_commands.h \
+		src/xim_controller.cpp \
+		src/xim_file_identity_win.h \
+		src/xim_file_stat.h \
+		src/xim_fsops.cpp \
+		src/xim_fsops.h \
+		src/xim_input.h \
+		src/xim_menu.cpp \
+		src/xim_menu.h \
+		src/xim_project.cpp \
+		src/xim_project.h \
+		src/xim_recent.cpp \
+		src/xim_recent.h \
+		src/xim_watch.cpp \
+		src/xim_watch.h \
+		src/xim_watch_darwin.c \
+		src/xim_watch_darwin.h \
+		src/xxd/CMakeLists.txt \
 		src/xxd/xxd.c \
+		src/testdir/CMakeLists.txt \
+		src/testdir/cxx_link_smoke.c \
+		src/testdir/cxx_link_smoke.cpp \
+		src/testdir/xim_commands_test.cpp \
+		src/testdir/xim_file_identity_win_test.cpp \
+		src/testdir/xim_file_stat_test.cpp \
+		src/testdir/xim_fsops_test.cpp \
+		src/testdir/xim_menu_test.cpp \
+		src/testdir/xim_project_test.cpp \
+		src/testdir/xim_recent_test.cpp \
+		src/testdir/xim_watch_macos_test.cpp \
+		src/testdir/xim_watch_test.cpp \
 		src/testdir/*.in \
 		src/testdir/*.py \
 		src/testdir/Make_all.mak \

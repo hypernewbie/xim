@@ -27,6 +27,7 @@ int xim_input_blocked(void);
 void xim_accept_paste(const char *text);
 
 /* Engine adapters: main-thread only, borrowed strings valid for the call. */
+int xim_engine_codepoint_cells(int codepoint);
 void xim_engine_move(int key, int select);
 void xim_engine_select_all(void);
 void xim_engine_cancel(void);

@@ -1838,7 +1838,11 @@ std::size_t utf8_next(const std::string &text, std::size_t pos)
 int cell_width_for_codepoint(int codepoint)
 {
     if (codepoint < 0) return 1;
+#ifdef _WIN32
+    int width = xim_engine_codepoint_cells(codepoint);
+#else
     int width = ::wcwidth(static_cast<wchar_t>(codepoint));
+#endif
     if (width < 0) return 1;
     if (width == 0) return 0;
     return width;

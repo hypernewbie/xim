@@ -903,7 +903,7 @@ PlatformId(void)
 #ifdef FEAT_EVAL
     DWORD major = (win_version >> 24) & 0xFF;
     DWORD minor = (win_version >> 16) & 0xFF;
-    vim_snprintf(windowsVersion, sizeof(windowsVersion), "%d.%d", major, minor);
+    vim_snprintf(windowsVersion, sizeof(windowsVersion), "%lu.%lu", major, minor);
 #endif
 
 #ifdef HAVE_ACL

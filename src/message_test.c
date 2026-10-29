@@ -292,16 +292,35 @@ test_vim_snprintf(void)
 
 	// %p format is not tested in Vim script tests Test_printf*()
 	// as it only makes sense in C code.
+#ifdef MSWIN
+	// Windows CRT uses a fixed-width uppercase representation without 0x.
+	// Compare with that CRT because Vim delegates pointer formatting to it.
+	{
+	    char expected[64];
+	    int expected_len = snprintf(expected, sizeof(expected), "%p", ptr);
+
+	    n = vim_snprintf(buf, bsize, "%p", ptr);
+	    assert(n == expected_len);
+	    assert(bsize == 0 || STRNCMP(buf, expected, bsize_int) == 0);
+	    assert(bsize == 0 || buf[MIN(n, bsize_int)] == '\0');
+
+	    expected_len = snprintf(expected, sizeof(expected), fmt_012p, ptr);
+	    n = vim_snprintf(buf, bsize, fmt_012p, ptr);
+	    assert(n == expected_len);
+	    assert(bsize == 0 || STRNCMP(buf, expected, bsize_int) == 0);
+	    assert(bsize == 0 || buf[MIN(n, bsize_int)] == '\0');
+	}
+#else
 	// NOTE: SunOS libc doesn't use the prefix "0x" on %p.
-#ifdef SUN_SYSTEM
+# ifdef SUN_SYSTEM
 # define PREFIX_LEN  0
 # define PREFIX_STR1 ""
 # define PREFIX_STR2 "00"
-#else
+# else
 # define PREFIX_LEN  2
 # define PREFIX_STR1 "0x"
 # define PREFIX_STR2 "0x"
-#endif
+# endif
 	n = vim_snprintf(buf, bsize, "%p", ptr);
 	assert(n == 8 + PREFIX_LEN);
 	assert(bsize == 0
@@ -313,6 +332,7 @@ test_vim_snprintf(void)
 	assert(bsize == 0
 		   || STRNCMP(buf, PREFIX_STR2 "0087654321", bsize_int) == 0);
 	assert(bsize == 0 || buf[MIN(n, bsize_int)] == '\0');
+#endif
 
 	free(buf);
     }

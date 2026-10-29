@@ -42,6 +42,19 @@ typedef struct
 } xim_cell_T;
 static xim_cell_T *overlay_background = NULL;
 
+    int
+xim_engine_codepoint_cells(int codepoint)
+{
+    int width;
+
+    if (codepoint < 0x80)
+	return 1;
+    if (utf_iscomposing(codepoint))
+	return 0;
+    width = utf_char2cells(codepoint);
+    return width <= 2 ? width : 1;
+}
+
     void
 xim_engine_boundary(void)
 {

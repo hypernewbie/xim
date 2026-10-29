@@ -7961,7 +7961,7 @@ create_pty_only(term_T *term, jobopt_T *options)
     if (create_vterm(term, term->tl_rows, term->tl_cols) == FAIL)
 	return FAIL;
 
-    vim_snprintf(in_name, sizeof(in_name), "\\\\.\\pipe\\vim-%d-in-%d",
+    vim_snprintf(in_name, sizeof(in_name), "\\\\.\\pipe\\vim-%lu-in-%d",
 	    GetCurrentProcessId(),
 	    curbuf->b_fnum);
     hPipeIn = CreateNamedPipe(in_name, PIPE_ACCESS_OUTBOUND,
@@ -7971,7 +7971,7 @@ create_pty_only(term_T *term, jobopt_T *options)
     if (hPipeIn == INVALID_HANDLE_VALUE)
 	goto failed;
 
-    vim_snprintf(out_name, sizeof(out_name), "\\\\.\\pipe\\vim-%d-out-%d",
+    vim_snprintf(out_name, sizeof(out_name), "\\\\.\\pipe\\vim-%lu-out-%d",
 	    GetCurrentProcessId(),
 	    curbuf->b_fnum);
     hPipeOut = CreateNamedPipe(out_name, PIPE_ACCESS_INBOUND,

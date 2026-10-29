@@ -2,7 +2,7 @@ Xim 0.0.0 for macOS
 ====================
 
 This package is for Intel Macs with macOS 15 or newer. It contains the Xim
-executable and its matching runtime files.
+executable, its matching runtime files, and the Pixman library for image support.
 
 Extract it. Add its `bin` directory to `PATH`, then run `xim`:
 
@@ -10,8 +10,9 @@ Extract it. Add its `bin` directory to `PATH`, then run `xim`:
     export PATH="$PWD/xim-0.0.0-macos15-x86_64/bin:$PATH"
     xim file.txt
 
-The package uses macOS system libraries. It does not require Homebrew at run
-time. It is not notarized by Apple.
+The package uses macOS system libraries and does not require Homebrew at run
+time. The `lib` directory includes the Pixman license. Apple has not notarized
+this package.
 
 The `LICENSE` file contains the Vim license. Check the provided SHA-256
 checksum before use.

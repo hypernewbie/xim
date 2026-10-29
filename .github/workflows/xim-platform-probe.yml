@@ -126,11 +126,27 @@ jobs:
           rm "$PWD/build/packages/$package/bin/vim"
           cp LICENSE "$PWD/build/packages/$package/LICENSE"
           cp cmake/MACOS_RELEASE.txt "$PWD/build/packages/$package/README.txt"
+          pixman_prefix="$(brew --prefix pixman)"
+          mkdir -p "$PWD/build/packages/$package/lib"
+          cp "$pixman_prefix/lib/libpixman-1.0.dylib" \
+            "$PWD/build/packages/$package/lib/libpixman-1.0.dylib"
+          install_name_tool \
+            -change "$pixman_prefix/lib/libpixman-1.0.dylib" \
+            '@executable_path/../lib/libpixman-1.0.dylib' \
+            "$PWD/build/packages/$package/bin/xim"
+          install_name_tool -id '@rpath/libpixman-1.0.dylib' \
+            "$PWD/build/packages/$package/lib/libpixman-1.0.dylib"
+          pixman_license="$(find "$pixman_prefix/share/doc" -maxdepth 3 \
+            -type f \( -iname COPYING -o -iname LICENSE \) -print -quit)"
+          test -n "$pixman_license"
+          cp "$pixman_license" "$PWD/build/packages/$package/lib/PIXMAN-LICENSE.txt"
           tar -C build/packages -czf "build/packages/$package.tar.gz" "$package"
           (cd build/packages && shasum -a 256 "$package.tar.gz" > SHA256SUMS)
           mkdir -p build/package-test
           tar -C build/package-test -xzf "build/packages/$package.tar.gz"
           otool -L "build/package-test/$package/bin/xim" | tee build/packages/dependencies.txt
+          otool -L "build/package-test/$package/lib/libpixman-1.0.dylib" \
+            | tee -a build/packages/dependencies.txt
           if grep -E '/usr/local/|/opt/homebrew/' build/packages/dependencies.txt; then
             echo 'The macOS package links to a Homebrew library.' >&2
             exit 1

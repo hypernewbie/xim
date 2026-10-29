@@ -181,6 +181,10 @@ enddef
 
 def Test_indent_of_source_files()
   for fname in Get_C_source_files()
+    # Xim sources use the project four-space style, not Vim's tab-only style.
+    if fname =~ '^\.\./xim_'
+      continue
+    endif
     execute 'tabnew ' .. fname
     if &expandtab
       continue

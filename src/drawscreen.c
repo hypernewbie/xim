@@ -462,7 +462,7 @@ update_screen(int type_arg)
     // Native overlays are the final layer of a frame, including resizes
     // and redraws triggered while the input decoder is waiting.
     if (xim_native_mode && xim_redraw_ui != NULL && !xim_drawing_overlay)
-        xim_redraw_ui();
+	xim_redraw_ui();
     term_set_sync_output(TERM_SYNC_OUTPUT_DISABLE);
     if (hid_cursor)
 	cursor_on();

@@ -260,7 +260,7 @@ main
     command_line_scan(&params);
 #  ifdef XIM_NATIVE_ENTRY
     if (exmode_active || silent_mode || !params.want_full_screen)
-        xim_native_mode = FALSE;
+	xim_native_mode = FALSE;
 #  endif
     TIME_MSG("parsing arguments");
 
@@ -475,7 +475,7 @@ main
     // Execute --cmd arguments.
 #  ifdef XIM_NATIVE_ENTRY
     if (xim_native_mode)
-        xim_initialize();
+	xim_initialize();
 #  endif
     exe_pre_commands(&params);
 
@@ -1040,9 +1040,9 @@ vim_main2(void)
 # ifdef XIM_NATIVE_ENTRY
     if (xim_native_mode)
     {
-        restart_edit = 0;
-        need_start_insertmode = FALSE;
-        State = MODE_INSERT;
+	restart_edit = 0;
+	need_start_insertmode = FALSE;
+	State = MODE_INSERT;
     }
 # endif
     main_loop(FALSE, FALSE);
@@ -1663,12 +1663,12 @@ main_loop(
 	    showruler(FALSE);
 
 #ifdef XIM_NATIVE_ENTRY
-            if (!xim_native_mode || !xim_prompt_active())
+	    if (!xim_native_mode || !xim_prompt_active())
 #endif
-            {
-                setcursor();
-                cursor_on();
-            }
+	    {
+		setcursor();
+		cursor_on();
+	    }
 
 	    do_redraw = FALSE;
 
@@ -1714,11 +1714,11 @@ main_loop(
 	 * Otherwise, get and execute a normal mode command.
 	 */
 #ifdef XIM_NATIVE_ENTRY
-        if (xim_native_mode && !cmdwin && !noexmode && !exmode_active)
-        {
-            xim_step();
-            continue;
-        }
+	if (xim_native_mode && !cmdwin && !noexmode && !exmode_active)
+	{
+	    xim_step();
+	    continue;
+	}
 #endif
 	if (exmode_active)
 	{

@@ -5198,8 +5198,8 @@ draw_tabline(void)
 
     if (xim_native_mode && xim_draw_menu_bar_ptr != NULL)
     {
-        xim_draw_menu_bar_ptr();
-        return;
+	xim_draw_menu_bar_ptr();
+	return;
     }
 
 #ifdef FEAT_GUI_TABLINE

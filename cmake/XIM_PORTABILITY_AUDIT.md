@@ -42,26 +42,30 @@ worker ownership boundary.
   `renameatx_np(RENAME_EXCL)`. Both use anchored directory descriptors.
   The tests create a destination after preflight and check both file contents.
   The Darwin operation and file-identity tests pass on a macOS runner.
-- The watcher and project worker now share one file-version calculation.
+- The watcher and project worker share one Unix file-version calculation.
   Linux and Darwin use their respective nanosecond timestamp fields. A fixed
-  vector and nanosecond test guard the boundary. Windows needs an identity
-  adapter with equivalent change detection.
-- The CMake source selection still assumes Unix. Windows needs a real CMake
-  target for the inherited Windows engine, clang-cl and the native adapters.
-  Its input wake, file paths, operations and test harness also need work.
+  vector and nanosecond test guard the boundary. A Windows handle-identity
+  helper and its isolated tests now exist, but the project and watcher workers
+  do not yet use it.
+- CMake now selects Vim's inherited Windows console engine with clang-cl and
+  the Windows ABI. The native Xim target still needs Windows implementations
+  for its watcher, filesystem operations, project scanner, recents and input
+  wake. Its PTY test harness also needs a Windows equivalent.
 - The existing macOS and Windows CI workflows build inherited Vim, not the
   native Xim target. The separate `xim-platform-probe.yml` runs Xim checks.
   Its macOS and Windows jobs remain red until native builds and tests pass.
 
 ## Evidence and limits
 
-GitHub Actions run `40785099782` passed the Ubuntu native and extracted
+GitHub Actions run `40794692110` passed the Ubuntu native and extracted
 archive tests, including a clean Ubuntu container. On macOS it passed the
 independent file-operation and file-identity tests. A keep-going build found
 no other compile failure beyond the inotify source. Linking and runtime tests
-still need the watcher. Windows configuration failed on the Unix
-terminal-library requirement. The Linux development run passed all 23
-registered tests across the two temporary-path groups. A clean tracked-source
+still need the watcher. On Windows the inherited engine built and its focused
+unit tests passed. Windows file identity, native command and menu tests also
+passed. The full Windows native build still failed on the services above.
+The Linux development run passed all 23 registered tests across the two
+temporary-path groups before the Windows changes. A later clean tracked-source
 export passed 14/14. The native ASan/UBSan and TSan suites each passed 8/8.
 The selected builds produced no new warnings.
 

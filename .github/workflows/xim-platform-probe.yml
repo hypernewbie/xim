@@ -1,12 +1,11 @@
 name: Xim native platform probe
 
-# This is a bring-up diagnostic, not a release workflow. A platform must build
-# and pass native tests before it can produce a release artifact.
+# Build and test the supported release platforms. Windows remains deferred.
 on:
   workflow_dispatch:
   push:
     branches:
-      - release/platform-bringup
+      - master
 
 permissions:
   contents: read
@@ -24,8 +23,6 @@ jobs:
             runner: ubuntu-24.04
           - platform: macos-x64
             runner: macos-15-intel
-          - platform: windows-x64
-            runner: windows-2022
     steps:
       - uses: actions/checkout@v4
 
@@ -45,25 +42,6 @@ jobs:
           echo 'CC=clang' >> "$GITHUB_ENV"
           echo 'CXX=clang++' >> "$GITHUB_ENV"
 
-      - name: Set Windows SDK environment
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Set Windows Clang compilers and CMake
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          clang-cl --version
-          python -m pip install 'cmake>=4.2,<5'
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $cmakeBin = python -c "import cmake; print(cmake.CMAKE_BIN_DIR)"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $cmakeBin >> $env:GITHUB_PATH
-          "CC=clang-cl" >> $env:GITHUB_ENV
-          "CXX=clang-cl" >> $env:GITHUB_ENV
-
       - name: Configure
         run: cmake -S . -B build/platform-probe -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 
@@ -75,24 +53,13 @@ jobs:
 
       # Collect independent compile failures in one platform bring-up run.
       # This remains a failing build when any target fails.
-      - name: Build macOS and Windows (report all compile failures)
-        if: runner.os != 'Linux'
+      - name: Build macOS (report all compile failures)
+        if: runner.os == 'macOS'
         run: cmake --build build/platform-probe --parallel 4 -- -k 0
 
       - name: Build
         if: runner.os == 'Linux'
         run: cmake --build build/platform-probe --parallel 4
-
-      - name: Test Windows inherited engine
-        if: ${{ !cancelled() && runner.os == 'Windows' }}
-        shell: pwsh
-        run: |
-          cmake --build build/platform-probe --target vim xxd json_test kword_test memfile_test message_test xim_file_identity_win_test xim_commands_test xim_menu_test --parallel 4
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & build/platform-probe/src/vim.exe --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ctest --test-dir build/platform-probe -R '^(vim_unit_(json|kword|memfile|message)|xim_(file_identity_win|commands|menu))$' --output-on-failure
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Test native editor
         run: ctest --test-dir build/platform-probe -L xim_native --output-on-failure

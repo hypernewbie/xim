@@ -6,9 +6,9 @@
 extern "C" {
 #endif
 
-/* Linux inotify watcher. Project directories and the parent directories of
- * explicitly opened files are watched. All notifications arrive on one
- * watcher thread; the editor is woken through the project wake path. */
+/* Linux inotify and Darwin FSEvents watcher. Project paths and the parent
+ * directories of explicitly opened files are watched. Notifications arrive
+ * off the editor thread through the project wake path. */
 
 enum xim_watch_kind
 {
@@ -38,7 +38,7 @@ typedef void (*xim_watch_callback)(void *context,
         const xim_watch_event *events, size_t count, int flags);
 
 /* Install or replace the project root. The root watch is installed
- * immediately; the scan worker adds one watch per visited directory. */
+ * immediately; the scan worker registers each visited directory. */
 int xim_watch_start_project(const char *root, xim_watch_callback callback,
         void *context);
 /* Remove project watches and keep explicit-file watches. */
